@@ -11,13 +11,24 @@ fn safetensors_file(layers: usize) -> Vec<u8> {
     let mut entries = Vec::new();
     let mut off = 0u64;
     let mut add = |name: String, n: u64, entries: &mut Vec<String>| {
-        entries.push(format!(r#""{name}":{{"dtype":"BF16","shape":[{n}],"data_offsets":[{off},{}]}}"#, off + n * 2));
+        entries.push(format!(
+            r#""{name}":{{"dtype":"BF16","shape":[{n}],"data_offsets":[{off},{}]}}"#,
+            off + n * 2
+        ));
         off += n * 2;
     };
     add("model.embed_tokens.weight".into(), 1000 * 64, &mut entries);
     for l in 0..layers {
-        add(format!("model.layers.{l}.self_attn.q_proj.weight"), 64 * 64, &mut entries);
-        add(format!("model.layers.{l}.mlp.up_proj.weight"), 64 * 128, &mut entries);
+        add(
+            format!("model.layers.{l}.self_attn.q_proj.weight"),
+            64 * 64,
+            &mut entries,
+        );
+        add(
+            format!("model.layers.{l}.mlp.up_proj.weight"),
+            64 * 128,
+            &mut entries,
+        );
     }
     add("model.norm.weight".into(), 64, &mut entries);
     add("lm_head.weight".into(), 1000 * 64, &mut entries);
@@ -68,7 +79,11 @@ fn inspects_remote_repo_with_range_requests() {
                 ("404 Not Found", b"missing".to_vec())
             };
             served2.fetch_add(body.len() as u64, Ordering::SeqCst);
-            let _ = write!(s, "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+            let _ = write!(
+                s,
+                "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
             let _ = s.write_all(&body);
             let _ = s.flush();
             let mut sink = [0u8; 1];
@@ -87,5 +102,9 @@ fn inspects_remote_repo_with_range_requests() {
     assert!(!spec.tie_embeddings);
     // Only the config and the safetensors header crossed the wire.
     let total = served.load(Ordering::SeqCst);
-    assert!(total < (weights.len() as u64) / 10, "downloaded {total} of {} bytes", weights.len());
+    assert!(
+        total < (weights.len() as u64) / 10,
+        "downloaded {total} of {} bytes",
+        weights.len()
+    );
 }
