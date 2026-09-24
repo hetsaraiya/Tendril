@@ -10,7 +10,7 @@ fn main() -> anyhow::Result<()> {
     if !dir.join("model.safetensors").exists() {
         tendril_engine::testing::write_tiny_llama(&dir, 16, 2048, 7, DType::BF16)?;
     }
-    for fmt in [WeightFormat::Native] {
+    for fmt in [WeightFormat::Native, WeightFormat::Q8_0] {
         let t = Instant::now();
         let mut m = LocalModel::load(ModelFiles::new(&dir)?, Device::Cpu, fmt, None)?;
         let load = t.elapsed().as_secs_f64();
