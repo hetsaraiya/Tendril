@@ -76,6 +76,8 @@ $ tendril join 192.168.1.20:7420 --token 7Q2K-9XMP-4HVD-J3FA
 17:56:02 ✓ running layers 22–47 + head (13.9 GiB, Metal) — ready in 41.3 s
 ```
 
+![Tendril web chat with the live pipeline view](docs/images/web-ui.png)
+
 As machines join, Tendril measures each link, re-plans automatically and starts serving
 as soon as the model fits. Then:
 
