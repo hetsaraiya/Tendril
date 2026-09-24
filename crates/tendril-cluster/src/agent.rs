@@ -5,7 +5,10 @@ use crate::shard::{is_complete, shard_path, ShardWriter};
 use crate::worker::StageWorker;
 use crate::{token, wire};
 use anyhow::{bail, Context, Result};
+use std::collections::HashSet;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tendril_engine::config::ModelConfig;
@@ -67,12 +70,58 @@ pub enum AgentEvent {
     },
 }
 
-pub type EventFn = Arc<dyn Fn(AgentEvent) + Send + Sync>;
+/// Called with the model a session serves ("" before the coordinator said) and the event.
+pub type EventFn = Arc<dyn Fn(&str, AgentEvent) + Send + Sync>;
 
 type Active = Arc<Mutex<Option<StageWorker>>>;
 
+/// Models this process already has a session loop for.
+type Sessions = Arc<Mutex<HashSet<String>>>;
+
 pub async fn run(opts: AgentOptions, ev: EventFn) -> Result<()> {
+    // Sessions for different models from this process share one machine id,
+    // so the coordinator splits this machine's memory between them.
+    let machine = rand::random::<u64>() | 1;
+    run_model(
+        opts,
+        None,
+        machine,
+        ev,
+        Arc::new(Mutex::new(HashSet::new())),
+    )
+    .await
+}
+
+fn spawn_sibling(opts: AgentOptions, model: String, machine: u64, ev: EventFn, sessions: Sessions) {
+    let fut: Pin<Box<dyn Future<Output = Result<()>> + Send>> = Box::pin(run_model(
+        opts,
+        Some(model.clone()),
+        machine,
+        ev.clone(),
+        sessions,
+    ));
+    tokio::spawn(async move {
+        if let Err(e) = fut.await {
+            ev(
+                &model,
+                AgentEvent::Failed {
+                    error: format!("{e:#}"),
+                },
+            );
+        }
+    });
+}
+
+/// Serve one model of the pool, reconnecting as needed.
+async fn run_model(
+    opts: AgentOptions,
+    model: Option<String>,
+    machine: u64,
+    ev: EventFn,
+    sessions: Sessions,
+) -> Result<()> {
     let psk = token::psk(&opts.token);
+    let label = model.clone().unwrap_or_default();
     let listener = TcpListener::bind(("0.0.0.0", opts.data_port))
         .await
         .with_context(|| format!("cannot listen on data port {}", opts.data_port))?;
@@ -81,17 +130,33 @@ pub async fn run(opts: AgentOptions, ev: EventFn) -> Result<()> {
     tokio::spawn(data_loop(listener, psk, active.clone()));
     let mut backoff = Duration::from_secs(1);
     loop {
-        ev(AgentEvent::Connecting {
-            addr: opts.coordinator.clone(),
-        });
+        ev(
+            &label,
+            AgentEvent::Connecting {
+                addr: opts.coordinator.clone(),
+            },
+        );
         let started = Instant::now();
-        let r = session(&opts, &psk, data_port, active.clone(), &ev).await;
+        let r = session(
+            &opts,
+            &psk,
+            data_port,
+            active.clone(),
+            &ev,
+            model.as_deref(),
+            machine,
+            &sessions,
+        )
+        .await;
         drop(active.lock().unwrap().take());
         match r {
             Ok(Some(reason)) => {
-                ev(AgentEvent::Rejected {
-                    reason: reason.clone(),
-                });
+                ev(
+                    &label,
+                    AgentEvent::Rejected {
+                        reason: reason.clone(),
+                    },
+                );
                 if opts.once {
                     bail!(reason);
                 }
@@ -104,18 +169,24 @@ pub async fn run(opts: AgentOptions, ev: EventFn) -> Result<()> {
                 }
                 let msg = format!("{e:#}");
                 if msg.contains("wrong cluster token") || msg.contains("authentication") {
-                    ev(AgentEvent::Rejected {
-                        reason: "the coordinator rejected our token — check `--token`".into(),
-                    });
+                    ev(
+                        &label,
+                        AgentEvent::Rejected {
+                            reason: "the coordinator rejected our token — check `--token`".into(),
+                        },
+                    );
                     bail!("wrong cluster token");
                 }
                 if opts.once {
                     return Err(e);
                 }
-                ev(AgentEvent::Disconnected {
-                    reason: msg,
-                    retry_in: backoff,
-                });
+                ev(
+                    &label,
+                    AgentEvent::Disconnected {
+                        reason: msg,
+                        retry_in: backoff,
+                    },
+                );
             }
         }
         tokio::time::sleep(backoff).await;
@@ -130,6 +201,9 @@ async fn session(
     data_port: u16,
     active: Active,
     ev: &EventFn,
+    model: Option<&str>,
+    machine: u64,
+    sessions: &Sessions,
 ) -> Result<Option<String>> {
     let conn = wire::connect(&opts.coordinator, psk).await?;
     let (mut reader, mut writer) = (conn.reader, conn.writer);
@@ -154,13 +228,46 @@ async fn session(
                 .iter()
                 .map(|s| s.to_string())
                 .collect(),
+            model: model.map(String::from),
+            machine,
         })
         .await?;
-    match reader.recv().await? {
-        Msg::Welcome { name, cluster, .. } => ev(AgentEvent::Connected { name, cluster }),
+    let label = match reader.recv().await? {
+        Msg::Welcome {
+            name,
+            cluster,
+            models,
+            ..
+        } => {
+            ev(
+                &cluster,
+                AgentEvent::Connected {
+                    name,
+                    cluster: cluster.clone(),
+                },
+            );
+            // Serve every model of the pool: one session (and stage) each.
+            let mut known = sessions.lock().unwrap();
+            known.insert(cluster.clone());
+            for (i, m) in models.iter().enumerate() {
+                if known.insert(m.clone()) {
+                    let mut o = opts.clone();
+                    if o.data_port != 0 {
+                        o.data_port = o.data_port.saturating_add(i as u16);
+                    }
+                    spawn_sibling(o, m.clone(), machine, ev.clone(), sessions.clone());
+                }
+            }
+            cluster
+        }
         Msg::Reject { reason } => return Ok(Some(reason)),
         other => bail!("unexpected reply {other:?}"),
-    }
+    };
+    let ev: EventFn = {
+        let ev = ev.clone();
+        let label = label.clone();
+        Arc::new(move |_: &str, e| ev(&label, e))
+    };
     let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Msg>();
     let writer_task = tokio::spawn(async move {
         while let Some(m) = out_rx.recv().await {
@@ -233,7 +340,7 @@ async fn session(
                 let mut a = active.lock().unwrap();
                 if a.as_ref().is_some_and(|w| w.epoch == epoch) {
                     a.take();
-                    ev(AgentEvent::Unloaded);
+                    ev(&label, AgentEvent::Unloaded);
                 }
             }
             Msg::Bye { .. } => break Ok(None),
@@ -294,11 +401,14 @@ async fn load_stage(
                                 done: w.written(),
                                 total,
                             });
-                            ev(AgentEvent::Receiving {
-                                spec,
-                                done: w.written(),
-                                total,
-                            });
+                            ev(
+                                "",
+                                AgentEvent::Receiving {
+                                    spec,
+                                    done: w.written(),
+                                    total,
+                                },
+                            );
                         }
                     }
                     Some(Msg::WeightsDone { epoch: e }) if e == epoch => break,
@@ -306,11 +416,14 @@ async fn load_stage(
                     None => bail!("coordinator disconnected while sending weights"),
                 }
             }
-            ev(AgentEvent::Receiving {
-                spec,
-                done: w.written(),
-                total,
-            });
+            ev(
+                "",
+                AgentEvent::Receiving {
+                    spec,
+                    done: w.written(),
+                    total,
+                },
+            );
             w.finish()?;
         } else {
             out.send(Msg::NeedWeights {
@@ -318,7 +431,7 @@ async fn load_stage(
                 names: vec![],
             })?;
         }
-        ev(AgentEvent::Loading { spec, cached });
+        ev("", AgentEvent::Loading { spec, cached });
         let _ = out.send(Msg::LoadProgress {
             epoch,
             phase: "loading".into(),
@@ -370,20 +483,26 @@ async fn load_stage(
             load_ms,
             device: device.clone(),
         })?;
-        ev(AgentEvent::Ready {
-            spec,
-            weight_bytes,
-            load_ms,
-            device,
-        });
+        ev(
+            "",
+            AgentEvent::Ready {
+                spec,
+                weight_bytes,
+                load_ms,
+                device,
+            },
+        );
         Ok(())
     }
     .await;
     if let Err(e) = r {
         let error = format!("{e:#}");
-        ev(AgentEvent::Failed {
-            error: error.clone(),
-        });
+        ev(
+            "",
+            AgentEvent::Failed {
+                error: error.clone(),
+            },
+        );
         let _ = out.send(Msg::LoadFailed { epoch, error });
     }
 }

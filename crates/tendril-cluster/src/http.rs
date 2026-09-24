@@ -1,7 +1,8 @@
 //! OpenAI-compatible HTTP API, status endpoints and the built-in web UI.
 
-use crate::coordinator::{Coordinator, GenOut, GenRequest, ServeError};
-use axum::extract::State;
+use crate::coordinator::{Coordinator, GenOut, GenRequest, ServeError, Status};
+use crate::pool::Pool;
+use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
 use axum::response::{Html, IntoResponse, Response};
@@ -10,16 +11,47 @@ use axum::{Json, Router};
 use futures::Stream;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tendril_engine::sampler::SamplingParams;
 use tendril_engine::tokenizer::ChatMessage;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub coord: Coordinator,
+    pub pool: Arc<Pool>,
     pub join_command: String,
-    pub model_id: String,
+}
+
+/// A coordinator picked by the request's `model`, and the name to report.
+struct Target {
+    coord: Coordinator,
+    model: String,
+}
+
+fn target(s: &AppState, model: Option<&str>) -> Result<Target, Response> {
+    match s.pool.get(model) {
+        Ok(c) => Ok(Target {
+            coord: c.clone(),
+            model: c.inner.opts.model_name.clone(),
+        }),
+        Err(m) => Err(err(StatusCode::NOT_FOUND, "model_not_found", m)),
+    }
+}
+
+fn model_field(body: &Value) -> Option<&str> {
+    body.get("model").and_then(|m| m.as_str())
+}
+
+fn state_word(st: &Status) -> &'static str {
+    match st {
+        Status::Starting => "starting",
+        Status::Waiting { .. } => "waiting",
+        Status::Loading { .. } => "loading",
+        Status::Ready { .. } => "ready",
+        Status::Failed { .. } => "failed",
+    }
 }
 
 pub fn router(state: AppState) -> Router {
@@ -61,8 +93,12 @@ fn serve_err(e: ServeError) -> Response {
     }
 }
 
-async fn status(State(s): State<AppState>) -> Json<Value> {
-    let c = &s.coord;
+async fn status(State(s): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
+    let t = match target(&s, q.get("model").map(String::as_str)) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    let c = &t.coord;
     let plan = c.last_plan().and_then(|r| r.selected).map(|p| {
         json!({
             "label": p.label(),
@@ -93,9 +129,36 @@ async fn status(State(s): State<AppState>) -> Json<Value> {
             })).collect::<Vec<_>>(),
         })
     });
+    let shares = s.pool.shares();
+    let models: Vec<Value> = s
+        .pool
+        .models()
+        .iter()
+        .map(|m| {
+            let name = m.inner.opts.model_name.clone();
+            let share = shares.iter().find(|x| x.model == name);
+            let mm = m.metrics();
+            json!({
+                "id": name,
+                "state": state_word(&m.status()),
+                "params": m.inner.spec.total_params(),
+                "active": mm.active,
+                "requests": mm.requests,
+                "placed": share.map(|x| x.placed),
+                "reason": share.and_then(|x| x.reason.clone()),
+                "machines": share.map(|x| x.machines.iter().map(|(n, b)| json!({"name": n, "budget": b})).collect::<Vec<_>>()),
+            })
+        })
+        .collect();
+    let events = if s.pool.is_multi() {
+        s.pool.history()
+    } else {
+        c.history()
+    };
     Json(json!({
         "telemetry": telemetry,
-        "model": s.model_id,
+        "model": t.model,
+        "models": models,
         "architecture": c.inner.spec.arch.label(),
         "params": c.inner.spec.total_params(),
         "weights": c.inner.spec.weight_bytes().0,
@@ -107,17 +170,18 @@ async fn status(State(s): State<AppState>) -> Json<Value> {
         "plan": plan,
         "nodes": c.nodes(),
         "metrics": m,
-        "events": c.history(),
+        "events": events,
         "join": s.join_command,
         "uptime_s": c.uptime().as_secs(),
         "version": env!("CARGO_PKG_VERSION"),
     }))
+    .into_response()
 }
 
 async fn events(
     State(s): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
-    let mut rx = s.coord.subscribe();
+    let mut rx = s.pool.subscribe();
     let stream = async_stream::stream! {
         loop {
             match rx.recv().await {
@@ -132,7 +196,11 @@ async fn events(
 
 /// `{"prompt": "..."}` or `{"messages": [...]}` → token count and ids.
 async fn tokenize(State(s): State<AppState>, Json(body): Json<Value>) -> Response {
-    let tok = &s.coord.inner.tok;
+    let t = match target(&s, model_field(&body)) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    let tok = &t.coord.inner.tok;
     let ids = if let Some(p) = body.get("prompt").and_then(|p| p.as_str()) {
         tok.encode_prompt(p)
     } else if let Some(m) = body.get("messages").and_then(|m| m.as_array()) {
@@ -153,7 +221,7 @@ async fn tokenize(State(s): State<AppState>, Json(body): Json<Value>) -> Respons
     };
     match ids {
         Ok(ids) => Json(
-            json!({"count": ids.len(), "tokens": ids, "max_model_len": s.coord.inner.opts.context}),
+            json!({"count": ids.len(), "tokens": ids, "max_model_len": t.coord.inner.opts.context, "model": t.model}),
         )
         .into_response(),
         Err(e) => err(
@@ -165,9 +233,18 @@ async fn tokenize(State(s): State<AppState>, Json(body): Json<Value>) -> Respons
 }
 
 async fn models(State(s): State<AppState>) -> Json<Value> {
-    Json(
-        json!({"object": "list", "data": [{"id": s.model_id, "object": "model", "created": 0, "owned_by": "tendril"}]}),
-    )
+    let data: Vec<Value> = s
+        .pool
+        .models()
+        .iter()
+        .map(|c| {
+            json!({
+                "id": c.inner.opts.model_name, "object": "model", "created": 0, "owned_by": "tendril",
+                "max_model_len": c.inner.opts.context, "status": state_word(&c.status()),
+            })
+        })
+        .collect();
+    Json(json!({"object": "list", "data": data}))
 }
 
 #[derive(Deserialize)]
@@ -313,7 +390,11 @@ async fn chat(State(s): State<AppState>, Json(body): Json<Value>) -> Response {
             "`messages` is empty",
         );
     }
-    let prompt = match s.coord.inner.tok.encode_chat(&messages) {
+    let t = match target(&s, model_field(&body)) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    let prompt = match t.coord.inner.tok.encode_chat(&messages) {
         Ok(p) => p,
         Err(e) => {
             return err(
@@ -323,7 +404,7 @@ async fn chat(State(s): State<AppState>, Json(body): Json<Value>) -> Response {
             )
         }
     };
-    run(s, prompt, params, true).await
+    run(t, prompt, params, true).await
 }
 
 async fn completions(State(s): State<AppState>, Json(body): Json<Value>) -> Response {
@@ -348,7 +429,11 @@ async fn completions(State(s): State<AppState>, Json(body): Json<Value>) -> Resp
             )
         }
     };
-    let prompt = match s.coord.inner.tok.encode_prompt(&text) {
+    let t = match target(&s, model_field(&body)) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+    let prompt = match t.coord.inner.tok.encode_prompt(&text) {
         Ok(p) => p,
         Err(e) => {
             return err(
@@ -358,10 +443,10 @@ async fn completions(State(s): State<AppState>, Json(body): Json<Value>) -> Resp
             )
         }
     };
-    run(s, prompt, params, false).await
+    run(t, prompt, params, false).await
 }
 
-async fn run(s: AppState, prompt: Vec<u32>, params: CommonParams, chat: bool) -> Response {
+async fn run(s: Target, prompt: Vec<u32>, params: CommonParams, chat: bool) -> Response {
     let prompt_tokens = prompt.len();
     let req = GenRequest {
         prompt,
@@ -380,7 +465,7 @@ async fn run(s: AppState, prompt: Vec<u32>, params: CommonParams, chat: bool) ->
     };
     let id = new_id(if chat { "chatcmpl" } else { "cmpl" });
     let created = unix();
-    let model = s.model_id.clone();
+    let model = s.model.clone();
     let object = if chat {
         "chat.completion"
     } else {

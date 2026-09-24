@@ -76,6 +76,9 @@ pub struct Event {
     pub at: String,
     pub level: &'static str,
     pub text: String,
+    /// The model this is about, when several share the machines.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -218,6 +221,8 @@ struct RemoteNode {
 
 struct Node {
     id: u32,
+    /// Which physical machine (shared by its sessions for other models).
+    machine: u64,
     profile: NodeProfile,
     remote: Option<Arc<RemoteNode>>,
     rtt_ms: Option<f64>,
@@ -314,8 +319,35 @@ impl Telemetry {
     }
 }
 
+/// The machine id of the coordinator's own machine.
+pub const LOCAL_MACHINE: u64 = 0;
+
+/// This coordinator's share of a machine pool it serves together with other
+/// models (see `pool.rs`).
+pub struct PoolLink {
+    /// Position among the pool's models; the first reports membership events.
+    pub index: usize,
+    /// Every model in the pool (sent to joining machines).
+    pub models: Vec<String>,
+    /// Memory this model may use on each machine. None until the pool has
+    /// allocated; a machine missing from the map is not used for this model.
+    pub budgets: StdMutex<Option<HashMap<u64, Bytes>>>,
+    /// Why the pool could not give this model room (shown while waiting).
+    pub note: StdMutex<Option<String>>,
+    /// Wakes the pool when this model's machines change.
+    pub changed: Arc<Notify>,
+}
+
+/// What an agent announced in its Hello.
+pub(crate) struct HelloInfo {
+    pub profile: NodeProfile,
+    pub data_port: u16,
+    pub machine: u64,
+}
+
 pub struct Inner {
     pub opts: ServeOptions,
+    pub pool: Option<Arc<PoolLink>>,
     pub cfg: Arc<ModelConfig>,
     config_json: String,
     pub tok: Arc<Tok>,
@@ -359,6 +391,15 @@ pub fn clock() -> String {
 impl Coordinator {
     /// Open the model and start listening. Planning starts immediately.
     pub async fn start(opts: ServeOptions) -> Result<Coordinator> {
+        Self::start_with(opts, None).await
+    }
+
+    /// Start as one model of a pool: the pool owns the control port and
+    /// hands agent sessions over, and memory comes from the pool's budgets.
+    pub async fn start_with(
+        opts: ServeOptions,
+        pool: Option<Arc<PoolLink>>,
+    ) -> Result<Coordinator> {
         let dir = opts.model_dir.clone();
         let cfg = Arc::new(ModelConfig::from_file(&dir.join("config.json"))?);
         let config_json = std::fs::read_to_string(dir.join("config.json"))?;
@@ -377,6 +418,7 @@ impl Coordinator {
         let inner = Arc::new(Inner {
             psk: token::psk(&opts.token),
             opts,
+            pool,
             cfg,
             config_json,
             tok,
@@ -414,22 +456,24 @@ impl Coordinator {
                 p.recompute_usable();
             }
             apply_memory_cap(&mut p, c.inner.opts.max_memory);
-            c.add_node(p, None);
+            c.add_node(p, None, LOCAL_MACHINE);
         }
 
-        let control = TcpListener::bind(("0.0.0.0", c.inner.opts.control_port))
-            .await
-            .with_context(|| {
-                format!(
-                    "cannot listen on port {} (is another Tendril running?)",
-                    c.inner.opts.control_port
-                )
-            })?;
+        if c.inner.pool.is_none() {
+            let control = TcpListener::bind(("0.0.0.0", c.inner.opts.control_port))
+                .await
+                .with_context(|| {
+                    format!(
+                        "cannot listen on port {} (is another Tendril running?)",
+                        c.inner.opts.control_port
+                    )
+                })?;
+            tokio::spawn(c.clone().control_loop(control));
+        }
         let data = TcpListener::bind(("0.0.0.0", c.inner.opts.data_port)).await?;
         c.inner
             .data_port
             .store(data.local_addr()?.port() as usize, Ordering::Relaxed);
-        tokio::spawn(c.clone().control_loop(control));
         tokio::spawn(c.clone().data_loop(data));
         tokio::spawn(c.clone().planner_loop());
         tokio::spawn(c.clone().heartbeat_loop());
@@ -442,10 +486,20 @@ impl Coordinator {
     }
 
     pub fn event(&self, level: &'static str, text: impl Into<String>) {
+        let model = self
+            .inner
+            .pool
+            .as_ref()
+            .map(|_| self.inner.opts.model_name.clone());
+        self.emit(level, text.into(), model);
+    }
+
+    fn emit(&self, level: &'static str, text: String, model: Option<String>) {
         let e = Event {
             at: now(),
             level,
-            text: text.into(),
+            text,
+            model,
         };
         tracing::info!("{}", e.text);
         {
@@ -456,6 +510,25 @@ impl Coordinator {
             }
         }
         let _ = self.inner.events.send(e);
+    }
+
+    /// Machines joining and leaving: in a pool every model sees the same
+    /// machine, so only the first model reports it.
+    fn member_event(&self, level: &'static str, text: impl Into<String>) {
+        if self.inner.pool.as_ref().is_none_or(|p| p.index == 0) {
+            self.emit(level, text.into(), None);
+        }
+    }
+
+    fn machines_changed(&self) {
+        if let Some(p) = &self.inner.pool {
+            p.changed.notify_one();
+        }
+    }
+
+    /// Re-plan now (the pool changed this model's budgets).
+    pub fn replan(&self) {
+        self.inner.replan.notify_one();
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
@@ -540,7 +613,12 @@ impl Coordinator {
             .collect()
     }
 
-    fn add_node(&self, mut profile: NodeProfile, remote: Option<Arc<RemoteNode>>) -> (u32, String) {
+    fn add_node(
+        &self,
+        mut profile: NodeProfile,
+        remote: Option<Arc<RemoteNode>>,
+        machine: u64,
+    ) -> (u32, String) {
         let mut nodes = self.inner.nodes.lock().unwrap();
         let base = profile.name.clone();
         let mut name = base.clone();
@@ -553,6 +631,7 @@ impl Coordinator {
         let id = self.inner.next_node.fetch_add(1, Ordering::Relaxed) as u32;
         nodes.push(Node {
             id,
+            machine,
             profile,
             remote,
             rtt_ms: None,
@@ -589,35 +668,25 @@ impl Coordinator {
         };
         let peer_ip = conn.peer.ip();
         let (mut reader, mut writer) = (conn.reader, conn.writer);
-        let (profile, data_port) = match tokio::time::timeout(
-            Duration::from_secs(10),
-            reader.recv(),
-        )
-        .await??
-        {
-            Msg::Hello {
-                protocol,
-                profile,
-                data_port,
-                version,
-                ..
-            } => {
-                if protocol != PROTOCOL {
-                    let reason = format!(
-                        "protocol mismatch: this coordinator speaks v{PROTOCOL} (tendril {}), you run tendril {version}",
-                        env!("CARGO_PKG_VERSION")
-                    );
-                    writer
-                        .send(&Msg::Reject {
-                            reason: reason.clone(),
-                        })
-                        .await?;
-                    bail!(reason);
-                }
-                (profile, data_port)
-            }
-            other => bail!("expected Hello, got {other:?}"),
-        };
+        let (hello, _) = read_hello(&mut reader, &mut writer).await?;
+        self.serve_agent(reader, writer, peer_ip, local_ip, hello)
+            .await
+    }
+
+    /// Run one agent's control session after its Hello.
+    pub(crate) async fn serve_agent(
+        &self,
+        mut reader: wire::Reader,
+        mut writer: wire::Writer,
+        peer_ip: IpAddr,
+        local_ip: IpAddr,
+        hello: HelloInfo,
+    ) -> Result<()> {
+        let HelloInfo {
+            profile,
+            data_port,
+            machine,
+        } = hello;
         let (tx, mut rx) = mpsc::channel::<Msg>(16);
         let remote = Arc::new(RemoteNode {
             tx: tx.clone(),
@@ -627,14 +696,19 @@ impl Coordinator {
             inbox: StdMutex::new(None),
             pongs: StdMutex::new(HashMap::new()),
         });
-        let (id, name) = self.add_node(profile.clone(), Some(remote.clone()));
+        let (id, name) = self.add_node(profile.clone(), Some(remote.clone()), machine);
         writer
             .send(&Msg::Welcome {
                 node_id: id,
                 name: name.clone(),
                 cluster: self.inner.opts.model_name.clone(),
+                models: match &self.inner.pool {
+                    Some(p) => p.models.clone(),
+                    None => vec![self.inner.opts.model_name.clone()],
+                },
             })
             .await?;
+        self.machines_changed();
         let writer_task = tokio::spawn(async move {
             while let Some(m) = rx.recv().await {
                 if writer.send(&m).await.is_err() {
@@ -673,7 +747,7 @@ impl Coordinator {
             })
         };
 
-        self.event(
+        self.member_event(
             "ok",
             format!(
                 "{name} joined — {} · {} backend · {} for models",
@@ -709,7 +783,8 @@ impl Coordinator {
                         let rtt = self.node_rtt(id).unwrap_or(0.0) / 1000.0;
                         let gbps = (len as f64 * 8.0) / (secs - rtt / 2.0).max(1e-4) / 1e9;
                         self.update_node(id, |n| n.bandwidth_gbps = Some(gbps));
-                        self.event(
+                        self.machines_changed();
+                        self.member_event(
                             "info",
                             format!(
                                 "Link to {name}: {} round trip, {:.1} Gb/s measured",
@@ -771,6 +846,7 @@ impl Coordinator {
 
     async fn remove_node(&self, id: u32, name: &str, why: String) {
         self.inner.nodes.lock().unwrap().retain(|n| n.id != id);
+        self.machines_changed();
         let in_use = self
             .inner
             .pipeline
@@ -789,7 +865,7 @@ impl Coordinator {
             );
             self.teardown(&format!("{name} disconnected")).await;
         } else {
-            self.event("warn", format!("{name} left the cluster"));
+            self.member_event("warn", format!("{name} left the cluster"));
         }
         self.inner.replan.notify_one();
     }
@@ -852,7 +928,38 @@ impl Coordinator {
     // ------------------------------------------------------------------
     // Planning
 
+    /// The machines this model may use, each limited to the pool's budget.
     fn cluster_snapshot(&self) -> (Cluster, Vec<u32>) {
+        let (mut c, ids, machines) = self.raw_snapshot();
+        let Some(pool) = &self.inner.pool else {
+            return (c, ids);
+        };
+        let budgets = pool.budgets.lock().unwrap();
+        let empty = HashMap::new();
+        let budgets = budgets.as_ref().unwrap_or(&empty);
+        let mut keep_nodes = Vec::new();
+        let mut keep_ids = Vec::new();
+        for ((mut p, id), m) in c.nodes.drain(..).zip(ids).zip(machines) {
+            match budgets.get(&m) {
+                Some(b) if b.0 > 0 => {
+                    if *b < p.usable_memory {
+                        p.usable_memory = *b;
+                        p.usable_reason =
+                            format!("{b} of this machine is this model's share of the pool");
+                    }
+                    keep_nodes.push(p);
+                    keep_ids.push(id);
+                }
+                _ => {}
+            }
+        }
+        c.nodes = keep_nodes;
+        (c, keep_ids)
+    }
+
+    /// Every machine connected for this model with its full memory, plus
+    /// their machine ids (for the pool's allocator).
+    pub fn raw_snapshot(&self) -> (Cluster, Vec<u32>, Vec<u64>) {
         let nodes = self.inner.nodes.lock().unwrap();
         let cal = self.inner.calibration.lock().unwrap();
         let profiles: Vec<NodeProfile> = nodes
@@ -865,6 +972,7 @@ impl Coordinator {
             .collect();
         drop(cal);
         let ids: Vec<u32> = nodes.iter().map(|n| n.id).collect();
+        let machines: Vec<u64> = nodes.iter().map(|n| n.machine).collect();
         let default = self
             .inner
             .opts
@@ -909,10 +1017,40 @@ impl Coordinator {
                 }
             }
         }
-        (c, ids)
+        (c, ids, machines)
     }
 
-    fn workload(&self) -> Workload {
+    /// Some(reason) if the running pipeline uses more of a machine than this
+    /// model's current share of the pool.
+    async fn pipeline_over_budget(&self, cluster: &Cluster, ids: &[u32]) -> Option<String> {
+        self.inner.pool.as_ref()?;
+        let g = self.inner.pipeline.read().await;
+        let p = g.as_ref()?;
+        for (slot, st) in p.slots.iter().zip(&p.plan.stages) {
+            let Some(i) = ids.iter().position(|&id| id == slot.node_id) else {
+                return Some(format!("{} is now used by another model", st.node_name));
+            };
+            let have = cluster.nodes[i].usable_memory;
+            if st.mem.peak > have {
+                return Some(format!(
+                    "{} now has {have} for this model, the running split needs {}",
+                    st.node_name, st.mem.peak
+                ));
+            }
+        }
+        None
+    }
+
+    pub fn plan_options(&self) -> PlanOptions {
+        PlanOptions {
+            goal: self.inner.opts.goal,
+            safety_frac: self.inner.opts.safety,
+            min_stages: self.inner.opts.min_stages.max(1),
+            ..Default::default()
+        }
+    }
+
+    pub fn workload(&self) -> Workload {
         let mut w = Workload::new(
             self.inner.opts.context as u64,
             self.inner.opts.concurrency as u64,
@@ -937,9 +1075,23 @@ impl Coordinator {
 
     async fn replan_once(&self) -> Result<()> {
         let (cluster, ids) = self.cluster_snapshot();
+        // A pool may have shrunk this model's share below what it runs on.
+        if let Some(why) = self.pipeline_over_budget(&cluster, &ids).await {
+            self.event("info", format!("Making room for the other models: {why}"));
+            self.teardown("the pool reassigned memory").await;
+        }
         if cluster.nodes.is_empty() {
+            let reason = match &self.inner.pool {
+                Some(p) if !self.inner.nodes.lock().unwrap().is_empty() => p
+                    .note
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap_or_else(|| "Sharing out the machines between the models…".into()),
+                _ => "No machines yet. Join one with the command above.".into(),
+            };
             self.set_status(Status::Waiting {
-                reason: "No machines yet. Join one with the command above.".into(),
+                reason,
                 advice: vec![],
             });
             return Ok(());
@@ -963,16 +1115,25 @@ impl Coordinator {
             }
             return Ok(());
         }
-        let opts = PlanOptions {
-            goal: self.inner.opts.goal,
-            safety_frac: self.inner.opts.safety,
-            min_stages: self.inner.opts.min_stages.max(1),
-            ..Default::default()
-        };
+        let opts = self.plan_options();
         let w = self.workload();
         let result = planner::plan(&self.inner.spec, &cluster, &w, &opts);
         *self.inner.last_plan.lock().unwrap() = Some(result.clone());
         let Some(best) = result.selected.clone() else {
+            if let Some(note) = self
+                .inner
+                .pool
+                .as_ref()
+                .and_then(|p| p.note.lock().unwrap().clone())
+            {
+                if self.inner.pipeline.read().await.is_none() {
+                    self.set_status(Status::Waiting {
+                        reason: note,
+                        advice: vec![],
+                    });
+                }
+                return Ok(());
+            }
             let advice = tendril_core::advice::advise(
                 &self.inner.spec,
                 &cluster,
@@ -2152,6 +2313,46 @@ impl Coordinator {
             });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Read and check an agent's Hello. Also returns the model it asked for.
+pub(crate) async fn read_hello(
+    reader: &mut wire::Reader,
+    writer: &mut wire::Writer,
+) -> Result<(HelloInfo, Option<String>)> {
+    match tokio::time::timeout(Duration::from_secs(10), reader.recv()).await?? {
+        Msg::Hello {
+            protocol,
+            profile,
+            data_port,
+            version,
+            model,
+            machine,
+            ..
+        } => {
+            if protocol != PROTOCOL {
+                let reason = format!(
+                    "version mismatch: this coordinator runs tendril {} (protocol v{PROTOCOL}), this machine runs tendril {version} — install the same version on both",
+                    env!("CARGO_PKG_VERSION")
+                );
+                writer
+                    .send(&Msg::Reject {
+                        reason: reason.clone(),
+                    })
+                    .await?;
+                bail!(reason);
+            }
+            Ok((
+                HelloInfo {
+                    profile,
+                    data_port,
+                    machine,
+                },
+                model,
+            ))
+        }
+        other => bail!("expected Hello, got {other:?}"),
     }
 }
 

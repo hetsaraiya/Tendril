@@ -5,7 +5,7 @@ use tendril_core::NodeProfile;
 use tendril_engine::model::StageSpec;
 use tendril_engine::sampler::SamplingParams;
 
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 /// Activation tensors on the wire (raw little-endian bytes).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -87,11 +87,18 @@ pub enum Msg {
         profile: NodeProfile,
         data_port: u16,
         backends: Vec<String>,
+        /// Which of the pool's models this session serves (None = the first).
+        model: Option<String>,
+        /// Random per-process id: sessions from one machine share it, so the
+        /// pool can split that machine's memory between models.
+        machine: u64,
     },
     Welcome {
         node_id: u32,
         name: String,
         cluster: String,
+        /// Every model the pool serves; the agent opens one session per model.
+        models: Vec<String>,
     },
     Reject {
         reason: String,

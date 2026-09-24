@@ -59,7 +59,10 @@ fn spawn_agent(
         once: false,
         max_memory: None,
     };
-    tokio::spawn(agent::run(opts, Arc::new(|e| eprintln!("agent: {e:?}"))))
+    tokio::spawn(agent::run(
+        opts,
+        Arc::new(|m: &str, e| eprintln!("agent[{m}]: {e:?}")),
+    ))
 }
 
 async fn wait_ready(c: &Coordinator) {

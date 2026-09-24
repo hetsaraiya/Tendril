@@ -4,7 +4,8 @@
 #![allow(
     clippy::too_many_arguments,
     clippy::needless_range_loop,
-    clippy::large_enum_variant
+    clippy::large_enum_variant,
+    clippy::result_large_err
 )]
 
 pub mod agent;
@@ -12,6 +13,7 @@ pub mod calibration;
 pub mod coordinator;
 pub mod discovery;
 pub mod http;
+pub mod pool;
 pub mod prefix;
 pub mod proto;
 pub mod shard;

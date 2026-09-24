@@ -6,6 +6,7 @@ pub mod cluster;
 pub mod hardware;
 pub mod model;
 pub mod planner;
+pub mod pool;
 pub mod presets;
 pub mod units;
 
