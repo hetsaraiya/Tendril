@@ -351,16 +351,28 @@ impl Pool {
             let specs: Vec<_> = self
                 .models
                 .iter()
-                .map(|c| (c.inner.spec.clone(), c.workload(), c.plan_options()))
+                .zip(&last)
+                .map(|(c, prev)| {
+                    let current: Vec<usize> = (0..machines.len())
+                        .filter(|&j| prev.contains_key(&machines[j]))
+                        .collect();
+                    (
+                        c.inner.spec.clone(),
+                        c.workload(),
+                        c.plan_options(),
+                        current,
+                    )
+                })
                 .collect();
             let cl = cluster.clone();
             let alloc = match tokio::task::spawn_blocking(move || {
                 let pm: Vec<PoolModel> = specs
                     .iter()
-                    .map(|(s, w, o)| PoolModel {
+                    .map(|(s, w, o, cur)| PoolModel {
                         spec: s,
                         workload: w.clone(),
                         opts: o.clone(),
+                        current: cur.clone(),
                     })
                     .collect();
                 allocate(&pm, &cl)
@@ -395,38 +407,6 @@ impl Pool {
                 continue;
             }
             first = false;
-            // Shrink first so memory is free before another model loads into it.
-            let shrinks = |i: usize| {
-                last[i]
-                    .iter()
-                    .any(|(m, b)| next[i].get(m).is_none_or(|nb| nb < b))
-            };
-            let (shrinking, rest): (Vec<usize>, Vec<usize>) =
-                (0..self.models.len()).partition(|&i| shrinks(i));
-            let apply = |i: usize| {
-                let placed = alloc.placements[i].plan.is_some();
-                *self.links[i].note.lock().unwrap() = if placed {
-                    None
-                } else {
-                    Some(
-                        alloc.placements[i]
-                            .reason
-                            .clone()
-                            .unwrap_or_else(|| "not enough memory in the pool".into()),
-                    )
-                };
-                *self.links[i].budgets.lock().unwrap() = Some(next[i].clone());
-                self.models[i].replan();
-            };
-            for &i in &shrinking {
-                apply(i);
-            }
-            if !shrinking.is_empty() && !rest.is_empty() {
-                tokio::time::sleep(Duration::from_millis(1500)).await;
-            }
-            for &i in &rest {
-                apply(i);
-            }
             if !cluster.nodes.is_empty() {
                 let parts: Vec<String> = shares
                     .iter()
@@ -462,6 +442,38 @@ impl Pool {
                         parts.join(" · ")
                     ),
                 );
+            }
+            // Shrink first so memory is free before another model loads into it.
+            let shrinks = |i: usize| {
+                last[i]
+                    .iter()
+                    .any(|(m, b)| next[i].get(m).is_none_or(|nb| nb < b))
+            };
+            let (shrinking, rest): (Vec<usize>, Vec<usize>) =
+                (0..self.models.len()).partition(|&i| shrinks(i));
+            let apply = |i: usize| {
+                let placed = alloc.placements[i].plan.is_some();
+                *self.links[i].note.lock().unwrap() = if placed {
+                    None
+                } else {
+                    Some(
+                        alloc.placements[i]
+                            .reason
+                            .clone()
+                            .unwrap_or_else(|| "not enough memory in the pool".into()),
+                    )
+                };
+                *self.links[i].budgets.lock().unwrap() = Some(next[i].clone());
+                self.models[i].replan();
+            };
+            for &i in &shrinking {
+                apply(i);
+            }
+            if !shrinking.is_empty() && !rest.is_empty() {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+            }
+            for &i in &rest {
+                apply(i);
             }
             last = next;
         }

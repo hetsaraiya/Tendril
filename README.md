@@ -86,7 +86,8 @@ as soon as the model fits. Then:
 
 - open the **web chat** (conversation + live view of the pipeline, memory, links and throughput),
 - chat from a terminal with `tendril chat`,
-- point any OpenAI client at `http://<coordinator>:8080/v1`,
+- point any OpenAI client at `http://<coordinator>:8080/v1` (serve several models at once:
+  `tendril serve modelA modelB`, below),
 - watch the cluster with `tendril status`.
 
 What happens under the hood:
@@ -130,6 +131,40 @@ Useful flags: `--context 32k`, `--concurrency 8`, `--quantize q8_0|q4_k`,
 `--goal latency|throughput|memory`, `--max-memory 8gb` (cap what Tendril may use on a
 machine, on `serve` or `join`), `--min-machines 2` (force a split, e.g. to measure its
 cost), `--no-local` (coordinate only), `--kv-disk 16gb` / `--no-prefix-cache`.
+
+### Several models on the same machines
+
+Give `serve` more than one model and they share the machines:
+
+```text
+$ tendril serve Qwen/Qwen2.5-7B-Instruct Qwen/Qwen2.5-Coder-1.5B-Instruct
+
+Tendril · serving Qwen/Qwen2.5-7B-Instruct + Qwen/Qwen2.5-Coder-1.5B-Instruct
+17:02:11 ! Sharing 1 machine(s): Qwen2.5-7B-Instruct → studio (17.2 GiB) · Qwen2.5-Coder-1.5B-Instruct waits
+         (fits on its own, but not next to Qwen2.5-7B-Instruct — add a machine (`tendril join`) or serve fewer models)
+17:02:40 ✓ laptop joined — Apple M4 · Metal backend · 10.7 GiB for models
+17:02:41 · Sharing 2 machine(s): Qwen2.5-7B-Instruct → studio (17.2 GiB) · Qwen2.5-Coder-1.5B-Instruct → laptop (4.1 GiB)
+```
+
+- **One join serves them all.** A joining machine opens a session per model and can host
+  a slice of several models at once.
+- **Tendril divides every machine's memory between the models.** It tries each placement
+  order and keeps the one that places the most models (listed order breaks ties: list your
+  main model first), then the fastest. Each model then plans inside its own share of
+  memory, like it would on a smaller machine.
+- **Stable.** A running model moves only when the new placement is ≥25% faster. When
+  shares change, a model gives memory back before another model loads into it, and its
+  in-flight requests resume on the new placement (see recovery above).
+- **The API routes by `model`.** Tendril accepts the exact id, any case, the name without
+  the org (`Qwen2.5-Coder-1.5B-Instruct`) or a unique part of the name (`coder`). If you
+  leave `model` out, you get the first model. An unknown name gets a 404 that lists the
+  served models. `/v1/models` lists every model with its state.
+- **The web chat has a model menu.** The cluster panel shows each model's state and share,
+  one conversation can hop between models, and each reply is labelled with the model
+  that wrote it. `tendril chat -m coder` (or `/model coder` inside the chat) and
+  `tendril status` work the same way.
+
+![Two models sharing two machines](docs/images/pool-web-ui.png)
 
 ### Measure it
 

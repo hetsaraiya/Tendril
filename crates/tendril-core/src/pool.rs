@@ -22,7 +22,14 @@ pub struct PoolModel<'a> {
     pub spec: &'a ModelSpec,
     pub workload: Workload,
     pub opts: PlanOptions,
+    /// Machines (cluster indices) the model runs on now. It stays there
+    /// unless moving is clearly faster, so a joining machine doesn't reload
+    /// every model for a marginal gain.
+    pub current: Vec<usize>,
 }
+
+/// How much faster a new placement must be to move a running model.
+pub const MOVE_GAIN: f64 = 1.25;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Placement {
@@ -85,7 +92,28 @@ fn place_in_order(models: &[PoolModel], cluster: &Cluster, order: &[usize]) -> A
             continue;
         }
         let r = plan(pm.spec, &sub, &pm.workload, &pm.opts);
-        match r.selected {
+        let mut selected = r.selected.clone();
+        // Prefer staying on the current machines.
+        let cur: Vec<usize> = idx
+            .iter()
+            .enumerate()
+            .filter(|(_, full)| pm.current.contains(full))
+            .map(|(k, _)| k)
+            .collect();
+        if !cur.is_empty() && cur.len() < sub.nodes.len() {
+            let mut stay = sub.clone();
+            stay.nodes = cur.iter().map(|&k| sub.nodes[k].clone()).collect();
+            if let Some(mut p) = plan(pm.spec, &stay, &pm.workload, &pm.opts).selected {
+                let best = selected.as_ref().map(|b| b.tokens_per_sec).unwrap_or(0.0);
+                if best < p.tokens_per_sec * MOVE_GAIN {
+                    for st in &mut p.stages {
+                        st.node = cur[st.node];
+                    }
+                    selected = Some(p);
+                }
+            }
+        }
+        match selected {
             Some(mut p) => {
                 for st in &mut p.stages {
                     let full = idx[st.node];
@@ -198,7 +226,7 @@ pub fn allocate(models: &[PoolModel], cluster: &Cluster) -> Allocation {
                 .is_some();
             if alone {
                 p.reason = Some(format!(
-                    "fits on these machines alone, but not next to {} — add a machine or stop a model",
+                    "fits on its own, but not next to {} — add a machine (`tendril join`) or serve fewer models",
                     placed.join(", ")
                 ));
             }
@@ -229,7 +257,28 @@ mod tests {
             spec,
             workload: Workload::new(4096, 2),
             opts: PlanOptions::default(),
+            current: vec![],
         }
+    }
+
+    #[test]
+    fn running_models_stay_put_for_small_gains() {
+        let a = catalog::lookup("qwen2.5-0.5b").unwrap().spec();
+        // Two identical machines: nothing to gain by moving.
+        let c = cluster(&[("old", "m4:32"), ("new", "m4:32")]);
+        let mut m = pm(&a);
+        m.current = vec![0];
+        let r = allocate(&[m], &c);
+        let p = r.placements[0].plan.as_ref().unwrap();
+        assert!(p.stages.iter().all(|s| s.node == 0), "{:?}", p.label());
+        assert_eq!(r.placements[0].budgets[1], Bytes(0));
+        // A much faster machine is worth moving to.
+        let c = cluster(&[("old", "m4:32"), ("fast", "m4-max:128")]);
+        let mut m = pm(&a);
+        m.current = vec![0];
+        let r = allocate(&[m], &c);
+        let p = r.placements[0].plan.as_ref().unwrap();
+        assert!(p.stages.iter().all(|s| s.node == 1), "{:?}", p.label());
     }
 
     #[test]

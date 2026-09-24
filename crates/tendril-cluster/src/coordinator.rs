@@ -1028,7 +1028,10 @@ impl Coordinator {
         let p = g.as_ref()?;
         for (slot, st) in p.slots.iter().zip(&p.plan.stages) {
             let Some(i) = ids.iter().position(|&id| id == slot.node_id) else {
-                return Some(format!("{} is now used by another model", st.node_name));
+                return Some(format!(
+                    "the pool gave its place on {} to another model or a faster machine",
+                    st.node_name
+                ));
             };
             let have = cluster.nodes[i].usable_memory;
             if st.mem.peak > have {
@@ -1077,7 +1080,7 @@ impl Coordinator {
         let (cluster, ids) = self.cluster_snapshot();
         // A pool may have shrunk this model's share below what it runs on.
         if let Some(why) = self.pipeline_over_budget(&cluster, &ids).await {
-            self.event("info", format!("Making room for the other models: {why}"));
+            self.event("info", format!("Re-placing this model: {why}"));
             self.teardown("the pool reassigned memory").await;
         }
         if cluster.nodes.is_empty() {

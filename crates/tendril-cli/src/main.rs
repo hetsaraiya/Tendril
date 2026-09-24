@@ -29,6 +29,7 @@ use clap::{Parser, Subcommand};
         tendril run qwen2.5-0.5b                       chat with a small model on this machine\n  \
         tendril serve Qwen/Qwen2.5-7B-Instruct         serve it; other machines can join\n  \
         tendril join --token XXXX-XXXX-XXXX-XXXX      (on another machine) contribute it\n  \
+        tendril serve llama-3.2-3b qwen2.5-1.5b       several models sharing the same machines\n  \
         tendril plan gemma-2-9b --node air=m4:16 --node mini=m5:16 --link thunderbolt\n  \
         tendril fit llama-3.1-70b --node studio=m2-ultra:192\n  \
         tendril doctor"
