@@ -674,6 +674,28 @@ fn attention(
     let first_key_pos = kv.offset;
     debug_assert_eq!(first_key_pos + total, pos + seq);
 
+    // CPU: stream attention straight out of the cache buffers.
+    if x.device().is_cpu() && q.dtype() == DType::F32 {
+        if let (Some(kbuf), Some(vbuf)) = (kv.k.as_ref(), kv.v.as_ref()) {
+            let params = crate::attention::AttnParams {
+                heads: nh,
+                kv_heads: nkv,
+                head_dim: hd,
+                seq,
+                pos,
+                key_offset: first_key_pos,
+                len: kv.len,
+                cap: kbuf.dim(2)?,
+                scale: cfg.attn_scale() as f32,
+                softcap: cfg.attn_softcap.map(|c| c as f32),
+                window: l.window,
+            };
+            let out = crate::attention::attend(&q.contiguous()?, kbuf, vbuf, &params)?;
+            let out = Tensor::from_vec(out, (b, seq, nh * hd), x.device())?;
+            return l.attn.o.forward(&out);
+        }
+    }
+
     // Grouped-query attention without copying K/V: fold query groups into rows.
     let groups = nh / nkv;
     let q = (q.contiguous()? * cfg.attn_scale())?;

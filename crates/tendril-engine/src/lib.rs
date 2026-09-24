@@ -2,6 +2,7 @@
 
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 
+pub mod attention;
 pub mod config;
 pub mod cpu_kernels;
 pub mod device;
