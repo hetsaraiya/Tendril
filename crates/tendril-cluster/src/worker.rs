@@ -35,9 +35,13 @@ pub struct StageWorker {
 impl StageWorker {
     pub fn spawn(stage: Stage, index: u32, epoch: u64, out: UnboundedSender<Msg>) -> StageWorker {
         let (tx, rx) = mpsc::channel::<Work>();
+        // Unique per worker: one process can run several stages (several
+        // models, or tests), and each removes its directory when it stops.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let kv_dir = crate::shard::default_cache()
             .join("kv")
-            .join(format!("{}-{epoch}-{index}", std::process::id()));
+            .join(format!("{}-{n}-{epoch}-{index}", std::process::id()));
         let handle = std::thread::Builder::new()
             .name(format!("tendril-stage-{index}"))
             .spawn(move || {
