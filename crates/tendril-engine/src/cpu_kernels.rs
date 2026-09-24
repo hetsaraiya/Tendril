@@ -500,6 +500,16 @@ pub fn matmul(x: &[f32], m: usize, k: usize, w: &CpuWeights, n: usize, out: &mut
     });
 }
 
+/// f32 dot product with the best available SIMD.
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() {
+        // SAFETY: feature checked at runtime.
+        return unsafe { x86::dot_f32(a, b) };
+    }
+    dot_f32(a, b)
+}
+
 /// Widen one row to f32 (embedding lookup).
 pub fn row_f32(w: &CpuWeights, row: usize, k: usize, out: &mut [f32]) {
     widen_row(w, row, k, out)

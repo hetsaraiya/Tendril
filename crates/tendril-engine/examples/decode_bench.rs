@@ -10,11 +10,15 @@ fn main() -> anyhow::Result<()> {
     if !dir.join("model.safetensors").exists() {
         tendril_engine::testing::write_tiny_llama(&dir, 16, 2048, 7, DType::BF16)?;
     }
-    for fmt in [WeightFormat::Native, WeightFormat::Q8_0] {
+    for fmt in [WeightFormat::Native] {
         let t = Instant::now();
         let mut m = LocalModel::load(ModelFiles::new(&dir)?, Device::Cpu, fmt, None)?;
         let load = t.elapsed().as_secs_f64();
-        let prompt: Vec<u32> = (0..200).map(|i| 5 + (i * 7 % 250) as u32).collect();
+        let plen: usize = std::env::var("PROMPT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(200);
+        let prompt: Vec<u32> = (0..plen).map(|i| 5 + (i * 7 % 250) as u32).collect();
         let timing = m.generate(
             GenerateRequest {
                 prompt,
