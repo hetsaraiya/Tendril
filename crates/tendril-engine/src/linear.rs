@@ -142,8 +142,8 @@ impl Linear {
             }
             let dtype = raw.map(|r| r.0).or(native_hint).unwrap_or(S::F32);
             let as_u16 = |b: &[u8]| -> Vec<u16> {
-                b.chunks_exact(2)
-                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                (0..b.len() / 2)
+                    .map(|i| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]))
                     .collect()
             };
             return Ok(Kind::Cpu(match (dtype, raw) {
