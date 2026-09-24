@@ -275,3 +275,52 @@ fn batch_equals_sequential() {
     ]);
     assert!(r[0].is_err() && r[1].is_ok());
 }
+
+/// Truncating to a shared prefix, or spilling to disk and restoring, must
+/// continue exactly as if the prefix had been recomputed.
+#[test]
+fn prefix_reuse_and_spill_are_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    tendril_engine::testing::write_tiny_llama(dir.path(), 3, 64, 11, candle_core::DType::F32)
+        .unwrap();
+    let cfg = Arc::new(ModelConfig::from_file(&dir.path().join("config.json")).unwrap());
+    let ws = WeightStore::open_dir(dir.path()).unwrap();
+    let opts = LoadOptions {
+        format: WeightFormat::Native,
+        device: candle_core::Device::Cpu,
+        dtype: candle_core::DType::F32,
+    };
+    let mut s = Stage::load(cfg.clone(), &ws, StageSpec::whole(&cfg), &opts).unwrap();
+    let logits = |o: StageOutput| match o {
+        StageOutput::Logits(l) => l,
+        _ => panic!(),
+    };
+    // Reference: fresh prefill of the second turn.
+    let turn2: Vec<u32> = (5..60).collect();
+    let want = logits(
+        s.forward(1, 0, StageInput::Tokens(turn2.clone()), true)
+            .unwrap(),
+    );
+    // Turn 1 shares the first 40 tokens, then diverges.
+    let mut turn1: Vec<u32> = (5..45).collect();
+    turn1.extend([200, 201, 202]);
+    s.forward(2, 0, StageInput::Tokens(turn1), true).unwrap();
+    s.truncate(2, 40).unwrap();
+    let got = logits(
+        s.forward(2, 40, StageInput::Tokens(turn2[40..].to_vec()), true)
+            .unwrap(),
+    );
+    assert!(got.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-5));
+    // Spill and restore.
+    let f = dir.path().join("kv/2.kv");
+    s.spill(2, &f).unwrap();
+    assert!(!s.has_seq(2));
+    s.restore(2, &f).unwrap();
+    s.truncate(2, 40).unwrap();
+    let again = logits(
+        s.forward(2, 40, StageInput::Tokens(turn2[40..].to_vec()), true)
+            .unwrap(),
+    );
+    assert!(again.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-5));
+    assert!(s.truncate(2, 1000).is_err());
+}

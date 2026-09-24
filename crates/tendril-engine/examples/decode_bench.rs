@@ -25,6 +25,7 @@ fn main() -> anyhow::Result<()> {
                 params: SamplingParams::greedy(),
                 max_tokens: 64,
                 stop: vec![],
+                ignore_eos: false,
             },
             |_| true,
         )?;

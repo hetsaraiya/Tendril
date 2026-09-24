@@ -102,13 +102,19 @@ What happens under the hood:
   chunks — in one pass, reading every weight once per batch instead of once per request.
   Attention and KV stay per conversation, and batched results are identical to
   one-at-a-time results. Tokens no longer wait behind other people's prompts.
+- **Prefix caching.** Chat clients re-send the whole conversation every turn. Tendril
+  keeps each finished conversation's KV parked on the machines (inside the memory the
+  plan already reserved), so the next turn only computes the new tokens — measured 1.9 s
+  → 130 ms time-to-first-token at 1K tokens of history. Idle conversations spill to each
+  machine's disk (`--kv-disk 8gb`) and come back when needed. Reuse is exact: output is
+  identical to recomputing. OpenAI clients see `usage.prompt_tokens_details.cached_tokens`.
 - **Splitting is exact.** Pipeline execution is bit-identical to running the model on one
   machine (`tendril verify <model>` checks this for any model).
 
 Useful flags: `--context 32k`, `--concurrency 8`, `--quantize q8_0|q4_k`,
 `--goal latency|throughput|memory`, `--max-memory 8gb` (cap what Tendril may use on a
 machine, on `serve` or `join`), `--min-machines 2` (force a split, e.g. to measure its
-cost), `--no-local` (coordinate only).
+cost), `--no-local` (coordinate only), `--kv-disk 16gb` / `--no-prefix-cache`.
 
 ### Measure it
 
@@ -116,6 +122,7 @@ cost), `--no-local` (coordinate only).
 tendril bench                       # against a running `tendril serve`
 tendril bench qwen2.5-1.5b          # or load a model in-process and measure it
 tendril bench --concurrency 1,2,4,8 --prompt-tokens 128,2048 --output-tokens 256 --runs 5
+tendril bench --turns 5             # add a multi-turn chat: watch the prefix cache work
 ```
 
 `tendril bench` runs a fixed protocol — warm-up, prompt-length × concurrency sweep,

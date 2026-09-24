@@ -38,6 +38,9 @@ impl FinishReason {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Timing {
     pub prompt_tokens: usize,
+    /// Prompt tokens served from the prefix cache (not recomputed).
+    #[serde(default)]
+    pub cached_tokens: usize,
     pub completion_tokens: usize,
     pub queue_ms: f64,
     pub ttft_ms: f64,
@@ -158,6 +161,8 @@ pub struct GenerateRequest {
     pub params: SamplingParams,
     pub max_tokens: usize,
     pub stop: Vec<String>,
+    /// Keep going past end-of-sequence tokens.
+    pub ignore_eos: bool,
 }
 
 pub enum GenEvent<'a> {
@@ -274,7 +279,7 @@ impl LocalModel {
                 timing.ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
             }
             timing.completion_tokens += 1;
-            if self.tok.is_stop(tok) {
+            if self.tok.is_stop(tok) && !req.ignore_eos {
                 reason = FinishReason::Stop;
                 break;
             }
@@ -350,6 +355,7 @@ mod tests {
                     params: SamplingParams::greedy(),
                     max_tokens: 12,
                     stop: vec![],
+                    ignore_eos: false,
                 },
                 |e| {
                     if let GenEvent::Text(s) = e {
@@ -389,6 +395,7 @@ mod tests {
                 params: SamplingParams::greedy(),
                 max_tokens: 12,
                 stop: vec![],
+                ignore_eos: false,
             },
             |e| {
                 if let GenEvent::Text(s) = e {

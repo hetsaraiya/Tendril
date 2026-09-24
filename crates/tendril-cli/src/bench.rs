@@ -42,6 +42,9 @@ pub struct BenchArgs {
     /// Print results as JSON.
     #[arg(long)]
     pub json: bool,
+    /// Also run a multi-turn conversation of this many turns (shows prefix caching).
+    #[arg(long, default_value_t = 0)]
+    pub turns: usize,
     /// Weight format when benchmarking a model in-process.
     #[arg(long, short = 'q', default_value = "native")]
     pub quantize: String,
@@ -50,6 +53,8 @@ pub struct BenchArgs {
 #[derive(Clone, Debug, Serialize)]
 struct Sample {
     prompt_tokens: usize,
+    cached_tokens: usize,
+    text: String,
     completion_tokens: usize,
     ttft_ms: f64,
     itl_ms: Vec<f64>,
@@ -157,6 +162,8 @@ async fn one(
     let mut last = 0.0;
     let mut itl = Vec::new();
     let mut usage = (0usize, 0usize);
+    let mut cached = 0usize;
+    let mut text = String::new();
     while let Some(chunk) = stream.next().await {
         buf.push_str(&String::from_utf8_lossy(&chunk?));
         while let Some(i) = buf.find("\n\n") {
@@ -173,6 +180,9 @@ async fn one(
                     bail!("{}", e["message"].as_str().unwrap_or("error"));
                 }
                 let now = t0.elapsed().as_secs_f64() * 1000.0;
+                if let Some(t) = v["choices"][0]["text"].as_str() {
+                    text.push_str(t);
+                }
                 if v["choices"][0]["text"]
                     .as_str()
                     .is_some_and(|t| !t.is_empty())
@@ -188,6 +198,9 @@ async fn one(
                         u["prompt_tokens"].as_u64().unwrap_or(0) as usize,
                         u["completion_tokens"].as_u64().unwrap_or(0) as usize,
                     );
+                    cached = u["prompt_tokens_details"]["cached_tokens"]
+                        .as_u64()
+                        .unwrap_or(0) as usize;
                 }
             }
         }
@@ -206,6 +219,8 @@ async fn one(
     let itl: Vec<f64> = itl.iter().map(|g| g / per).collect();
     Ok(Sample {
         prompt_tokens: usage.0,
+        cached_tokens: cached,
+        text,
         completion_tokens: usage.1,
         ttft_ms: ttft,
         itl_ms: itl,
@@ -366,6 +381,37 @@ async fn bench(a: &BenchArgs, url: &str) -> Result<()> {
             rows.push(row);
         }
     }
+    let mut conversation = Vec::new();
+    if a.turns > 0 {
+        if !a.json {
+            heading("Multi-turn conversation");
+        }
+        let mut history = make_prompt(a.prompt_tokens.first().copied().unwrap_or(256), 4242, wpt);
+        for turn in 1..=a.turns {
+            let s = one(
+                &client,
+                url,
+                history.clone(),
+                a.output_tokens,
+                7 + turn as u64,
+            )
+            .await?;
+            if !a.json {
+                println!(
+                    "  {} turn {turn}: prompt {:>5} tok · {:>5} reused from cache · first token {}",
+                    ok_mark(),
+                    s.prompt_tokens,
+                    s.cached_tokens,
+                    fmt_ms(s.ttft_ms)
+                );
+            }
+            history.push_str(&s.text);
+            history.push_str(&format!(
+                "\nUser: tell me more about part {turn}.\nAssistant:"
+            ));
+            conversation.push(json!({"turn": turn, "prompt_tokens": s.prompt_tokens, "cached_tokens": s.cached_tokens, "ttft_ms": s.ttft_ms}));
+        }
+    }
     let after: Value = client
         .get(format!("{url}/api/status"))
         .send()
@@ -378,7 +424,7 @@ async fn bench(a: &BenchArgs, url: &str) -> Result<()> {
         println!(
             "{}",
             serde_json::to_string_pretty(
-                &json!({"model": model, "plan": plan, "rows": rows, "telemetry": tel})
+                &json!({"model": model, "plan": plan, "rows": rows, "telemetry": tel, "conversation": conversation})
             )?
         );
         return Ok(());

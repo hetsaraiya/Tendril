@@ -7,7 +7,7 @@
 //! (continuous batching). The last stage samples tokens itself so only a token
 //! id crosses the network.
 
-use crate::proto::{Msg, Payload, SampleSetup, StageTime, WireTensor};
+use crate::proto::{KvOpKind, Msg, Payload, SampleSetup, StageTime, WireTensor};
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc;
 use std::time::Instant;
@@ -35,9 +35,15 @@ pub struct StageWorker {
 impl StageWorker {
     pub fn spawn(stage: Stage, index: u32, epoch: u64, out: UnboundedSender<Msg>) -> StageWorker {
         let (tx, rx) = mpsc::channel::<Work>();
+        let kv_dir = crate::shard::default_cache()
+            .join("kv")
+            .join(format!("{}-{epoch}-{index}", std::process::id()));
         let handle = std::thread::Builder::new()
             .name(format!("tendril-stage-{index}"))
-            .spawn(move || run(stage, index, epoch, rx, out))
+            .spawn(move || {
+                run(stage, index, epoch, rx, out, &kv_dir);
+                let _ = std::fs::remove_dir_all(&kv_dir);
+            })
             .expect("spawn stage thread");
         StageWorker {
             tx,
@@ -83,6 +89,7 @@ fn run(
     epoch: u64,
     rx: mpsc::Receiver<Work>,
     out: UnboundedSender<Msg>,
+    kv_dir: &std::path::Path,
 ) {
     let mut samplers: HashMap<u64, Sampler> = HashMap::new();
     let mut queue: VecDeque<(Msg, Instant)> = VecDeque::new();
@@ -109,7 +116,7 @@ fn run(
         };
         if !matches!(front, Msg::Forward { .. }) {
             let (m, _) = queue.pop_front().unwrap();
-            control(&mut stage, &mut samplers, m, &out);
+            control(&mut stage, &mut samplers, m, &out, kv_dir);
             continue;
         }
         // Form a batch: consecutive forwards, one item per sequence, within budget.
@@ -172,8 +179,48 @@ fn control(
     samplers: &mut HashMap<u64, Sampler>,
     m: Msg,
     out: &UnboundedSender<Msg>,
+    kv_dir: &std::path::Path,
 ) {
     match m {
+        Msg::KvOp {
+            epoch,
+            seq,
+            op,
+            ok,
+            error,
+        } => {
+            let path = kv_dir.join(format!("{seq}.kv"));
+            let r: anyhow::Result<()> = if !ok {
+                // An earlier stage failed: keep this stage consistent by dropping it.
+                stage.release(seq);
+                Ok(())
+            } else {
+                match op {
+                    KvOpKind::Truncate { len } => stage.truncate(seq, len as usize),
+                    KvOpKind::Spill => stage.spill(seq, &path).map(|_| ()),
+                    KvOpKind::Restore => stage
+                        .restore(seq, &path)
+                        .and_then(|_| std::fs::remove_file(&path).map_err(Into::into)),
+                    KvOpKind::Drop => {
+                        stage.release(seq);
+                        let _ = std::fs::remove_file(&path);
+                        Ok(())
+                    }
+                }
+            };
+            samplers.remove(&seq);
+            let (ok, error) = match r {
+                Ok(()) => (ok, error),
+                Err(e) => (false, Some(format!("stage: {e:#}"))),
+            };
+            let _ = out.send(Msg::KvOp {
+                epoch,
+                seq,
+                op,
+                ok,
+                error,
+            });
+        }
         Msg::Release { epoch, seq } => {
             stage.release(seq);
             samplers.remove(&seq);
