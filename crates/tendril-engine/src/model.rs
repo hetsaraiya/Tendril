@@ -900,6 +900,15 @@ fn tensor_bytes(t: &Tensor) -> Result<(u32, Vec<u8>)> {
     })
 }
 
+/// `b` as little-endian N-byte words.
+fn le_words<const N: usize>(b: &[u8]) -> impl Iterator<Item = [u8; N]> + '_ {
+    (0..b.len() / N).map(move |i| {
+        let mut w = [0u8; N];
+        w.copy_from_slice(&b[i * N..i * N + N]);
+        w
+    })
+}
+
 fn tensor_from_bytes(
     code: u32,
     b: &[u8],
@@ -909,22 +918,20 @@ fn tensor_from_bytes(
     let n = shape.0 * shape.1 * shape.2 * shape.3;
     Ok(match code {
         0 if b.len() == n * 4 => Tensor::from_vec(
-            b.chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect::<Vec<_>>(),
+            le_words::<4>(b).map(f32::from_le_bytes).collect::<Vec<_>>(),
             shape,
             dev,
         )?,
         1 if b.len() == n * 2 => Tensor::from_vec(
-            b.chunks_exact(2)
-                .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+            le_words::<2>(b)
+                .map(|c| half::bf16::from_bits(u16::from_le_bytes(c)))
                 .collect::<Vec<_>>(),
             shape,
             dev,
         )?,
         2 if b.len() == n * 2 => Tensor::from_vec(
-            b.chunks_exact(2)
-                .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+            le_words::<2>(b)
+                .map(|c| half::f16::from_bits(u16::from_le_bytes(c)))
                 .collect::<Vec<_>>(),
             shape,
             dev,
