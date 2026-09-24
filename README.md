@@ -97,6 +97,11 @@ What happens under the hood:
   token). A machine without the token can't join, read activations or inject work.
 - **Failures are explicit.** If a machine leaves, in-flight requests end with a clear
   error, the cluster re-plans with who's left, and resumes when it fits again.
+- **Continuous batching.** When several conversations are active, each machine runs
+  whatever work is waiting — decode steps from different conversations and prefill
+  chunks — in one pass, reading every weight once per batch instead of once per request.
+  Attention and KV stay per conversation, and batched results are identical to
+  one-at-a-time results. Tokens no longer wait behind other people's prompts.
 - **Splitting is exact.** Pipeline execution is bit-identical to running the model on one
   machine (`tendril verify <model>` checks this for any model).
 

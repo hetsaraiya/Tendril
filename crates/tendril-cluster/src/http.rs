@@ -89,6 +89,7 @@ async fn status(State(s): State<AppState>) -> Json<Value> {
                 "predicted_ms": st.decode_ms,
                 "compute_ms": t.compute_ms.get(i).copied().unwrap_or(0.0),
                 "queue_ms": t.queue_ms.get(i).copied().unwrap_or(0.0),
+                "batch": t.batch.get(i).copied().unwrap_or(1.0),
             })).collect::<Vec<_>>(),
         })
     });

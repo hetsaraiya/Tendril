@@ -539,76 +539,217 @@ impl Stage {
         input: StageInput,
         want_logits: bool,
     ) -> Result<StageOutput> {
+        self.forward_batch(vec![BatchItem {
+            seq,
+            pos,
+            input,
+            want_logits,
+        }])
+        .pop()
+        .expect("one result per item")
+    }
+
+    /// Run several sequences through this stage in one pass: every weight is
+    /// read once for the whole batch, while attention and KV stay per sequence.
+    /// Items may be decode steps or prefill chunks; a sequence may appear once.
+    pub fn forward_batch(&mut self, items: Vec<BatchItem>) -> Vec<Result<StageOutput>> {
+        let n = items.len();
+        let mut results: Vec<Option<Result<StageOutput>>> = (0..n).map(|_| None).collect();
         let n_layers = self.layers.len();
-        let state = self.seqs.entry(seq).or_insert_with(|| SeqState {
-            kv: (0..n_layers).map(|_| LayerKv::new()).collect(),
-            pos: 0,
-        });
-        if state.pos != pos {
-            bail!("sequence {seq}: expected position {}, got {pos} (out-of-order or duplicate message)", state.pos);
+        // Validate and take each sequence's state out of the map.
+        let mut taken: Vec<(usize, u64, SeqState)> = Vec::new();
+        let mut inputs: Vec<(usize, StageInput, bool)> = Vec::new();
+        for (i, it) in items.into_iter().enumerate() {
+            if taken.iter().any(|(_, s, _)| *s == it.seq) {
+                results[i] = Some(Err(anyhow::anyhow!(
+                    "sequence {} appears twice in one batch",
+                    it.seq
+                )));
+                continue;
+            }
+            let state = self.seqs.remove(&it.seq).unwrap_or_else(|| SeqState {
+                kv: (0..n_layers).map(|_| LayerKv::new()).collect(),
+                pos: 0,
+            });
+            if state.pos != it.pos {
+                let expected = state.pos;
+                if expected > 0 {
+                    self.seqs.insert(it.seq, state);
+                }
+                results[i] = Some(Err(anyhow::anyhow!(
+                    "sequence {}: expected position {expected}, got {} (out-of-order or duplicate message)",
+                    it.seq,
+                    it.pos
+                )));
+                continue;
+            }
+            taken.push((i, it.seq, state));
+            inputs.push((i, it.input, it.want_logits));
         }
-        let cfg = self.cfg.clone();
-        let mut x = match input {
-            StageInput::Tokens(ids) => {
-                let e = self
-                    .embed
-                    .as_ref()
-                    .context("this stage does not own the embeddings")?;
-                let t = e.rows(&ids, &self.device, self.dtype)?.unsqueeze(0)?;
-                if cfg.gemma_norm {
-                    let s = Tensor::new((cfg.hidden_size as f32).sqrt(), &self.device)?
-                        .to_dtype(self.dtype)?;
-                    t.broadcast_mul(&s)?
-                } else {
-                    t
+        if !taken.is_empty() {
+            match self.run_batch(&mut taken, inputs) {
+                Ok(outs) => {
+                    for (i, o) in outs {
+                        results[i] = Some(Ok(o));
+                    }
+                    for (_, seq, st) in taken {
+                        self.seqs.insert(seq, st);
+                    }
+                }
+                Err(e) => {
+                    // KV may be partially updated: these sequences are lost.
+                    let msg = format!("{e:#}");
+                    for (i, _, _) in taken {
+                        results[i] = Some(Err(anyhow::anyhow!("{msg}")));
+                    }
                 }
             }
-            StageInput::Hidden(h) => h.to_device(&self.device)?.to_dtype(self.dtype)?,
+        }
+        results
+            .into_iter()
+            .map(|r| r.expect("every item gets a result"))
+            .collect()
+    }
+
+    fn run_batch(
+        &mut self,
+        taken: &mut [(usize, u64, SeqState)],
+        inputs: Vec<(usize, StageInput, bool)>,
+    ) -> Result<Vec<(usize, StageOutput)>> {
+        let cfg = self.cfg.clone();
+        // Concatenate every item's tokens (or hidden rows) along the sequence axis.
+        let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(inputs.len()); // (pos, start, len)
+        let mut want = Vec::with_capacity(inputs.len());
+        let mut start = 0;
+        let first_is_tokens = matches!(inputs.first().map(|x| &x.1), Some(StageInput::Tokens(_)));
+        let mut ids: Vec<u32> = Vec::new();
+        let mut hidden: Vec<Tensor> = Vec::new();
+        for ((_, _, st), (_, input, w)) in taken.iter().zip(inputs) {
+            let len = match input {
+                StageInput::Tokens(t) => {
+                    if !first_is_tokens {
+                        bail!("cannot mix token and hidden-state inputs in one batch");
+                    }
+                    let l = t.len();
+                    ids.extend(t);
+                    l
+                }
+                StageInput::Hidden(h) => {
+                    if first_is_tokens {
+                        bail!("cannot mix token and hidden-state inputs in one batch");
+                    }
+                    let h = h.to_device(&self.device)?.to_dtype(self.dtype)?;
+                    let l = h.dim(1)?;
+                    hidden.push(h);
+                    l
+                }
+            };
+            if len == 0 {
+                bail!("empty input");
+            }
+            spans.push((st.pos, start, len));
+            want.push(w);
+            start += len;
+        }
+        let mut x = if first_is_tokens {
+            let e = self
+                .embed
+                .as_ref()
+                .context("this stage does not own the embeddings")?;
+            let t = e.rows(&ids, &self.device, self.dtype)?.unsqueeze(0)?;
+            if cfg.gemma_norm {
+                let s = Tensor::new((cfg.hidden_size as f32).sqrt(), &self.device)?
+                    .to_dtype(self.dtype)?;
+                t.broadcast_mul(&s)?
+            } else {
+                t
+            }
+        } else if hidden.len() == 1 {
+            hidden.pop().unwrap()
+        } else {
+            Tensor::cat(&hidden, 1)?
         };
-        let seq_len = x.dim(1)?;
-        let state = self.seqs.get_mut(&seq).unwrap();
         for (li, layer) in self.layers.iter().enumerate() {
             let rope = if layer.local_rope {
                 self.rope_local.as_mut().unwrap()
             } else {
                 &mut self.rope
             };
-            x = layer_forward(layer, &cfg, rope, &mut state.kv[li], &x, pos)?;
+            let mut kvs: Vec<&mut LayerKv> =
+                taken.iter_mut().map(|(_, _, st)| &mut st.kv[li]).collect();
+            x = layer_forward(layer, &cfg, rope, &mut kvs, &x, &spans)?;
         }
-        state.pos += seq_len;
-
+        for ((_, _, st), (_, _, len)) in taken.iter_mut().zip(&spans) {
+            st.pos += len;
+        }
+        let idx: Vec<usize> = taken.iter().map(|(i, _, _)| *i).collect();
         if !self.spec.head {
-            return Ok(StageOutput::Hidden(x));
+            let mut out = Vec::with_capacity(spans.len());
+            for (k, &(_, s, len)) in spans.iter().enumerate() {
+                out.push((idx[k], StageOutput::Hidden(x.narrow(1, s, len)?)));
+            }
+            return Ok(out);
         }
-        if !want_logits {
-            return Ok(StageOutput::Nothing);
+        // Output head only on the last row of items that need logits.
+        let rows: Vec<u32> = spans
+            .iter()
+            .zip(&want)
+            .filter(|(_, w)| **w)
+            .map(|((_, s, len), _)| (s + len - 1) as u32)
+            .collect();
+        let mut logits_rows: Vec<Vec<f32>> = Vec::new();
+        if !rows.is_empty() {
+            let sel = Tensor::new(rows.as_slice(), &self.device)?;
+            let last = x.index_select(&sel, 1)?;
+            let h = self.norm.as_ref().unwrap().forward(&last)?;
+            let mut logits = self
+                .head
+                .as_ref()
+                .unwrap()
+                .forward(&h)?
+                .to_dtype(DType::F32)?;
+            if let Some(cap) = cfg.final_softcap {
+                logits = ((logits / cap)?.tanh()? * cap)?;
+            }
+            logits_rows = logits.squeeze(0)?.to_vec2()?;
         }
-        let last = x.narrow(1, seq_len - 1, 1)?;
-        let h = self.norm.as_ref().unwrap().forward(&last)?;
-        let mut logits = self
-            .head
-            .as_ref()
-            .unwrap()
-            .forward(&h)?
-            .to_dtype(DType::F32)?;
-        if let Some(cap) = cfg.final_softcap {
-            logits = ((logits / cap)?.tanh()? * cap)?;
-        }
-        Ok(StageOutput::Logits(logits.flatten_all()?.to_vec1()?))
+        let mut lr = logits_rows.into_iter();
+        Ok(idx
+            .into_iter()
+            .zip(want)
+            .map(|(i, w)| {
+                (
+                    i,
+                    if w {
+                        StageOutput::Logits(lr.next().unwrap_or_default())
+                    } else {
+                        StageOutput::Nothing
+                    },
+                )
+            })
+            .collect())
     }
+}
+
+/// One sequence's work in a batched stage call.
+pub struct BatchItem {
+    pub seq: u64,
+    pub pos: usize,
+    pub input: StageInput,
+    pub want_logits: bool,
 }
 
 fn layer_forward(
     l: &Layer,
     cfg: &ModelConfig,
     rope: &mut Rope,
-    kv: &mut LayerKv,
+    kvs: &mut [&mut LayerKv],
     x: &Tensor,
-    pos: usize,
+    spans: &[(usize, usize, usize)],
 ) -> Result<Tensor> {
     let residual = x;
     let h = l.input_norm.forward(x)?;
-    let a = attention(l, cfg, rope, kv, &h, pos)?;
+    let a = attention(l, cfg, rope, kvs, &h, spans)?;
     let x = if cfg.sandwich_norm {
         (residual + l.post_attn_norm.forward(&a)?)?
     } else {
@@ -642,13 +783,13 @@ fn attention(
     l: &Layer,
     cfg: &ModelConfig,
     rope: &mut Rope,
-    kv: &mut LayerKv,
+    kvs: &mut [&mut LayerKv],
     x: &Tensor,
-    pos: usize,
+    spans: &[(usize, usize, usize)],
 ) -> Result<Tensor> {
-    let (b, seq, _) = x.dims3()?;
     let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
-    let (q, k, v) = match &l.attn.qkv {
+    // Projections for every token of every sequence in one matmul.
+    let (q_all, k_all_new, v_all_new) = match &l.attn.qkv {
         Qkv::Fused(f) => {
             let y = f.forward(x)?;
             (
@@ -659,6 +800,36 @@ fn attention(
         }
         Qkv::Split(q, k, v) => (q.forward(x)?, k.forward(x)?, v.forward(x)?),
     };
+    let mut outs = Vec::with_capacity(spans.len());
+    for (kv, &(pos, start, seq)) in kvs.iter_mut().zip(spans) {
+        let q = q_all.narrow(1, start, seq)?;
+        let k = k_all_new.narrow(1, start, seq)?;
+        let v = v_all_new.narrow(1, start, seq)?;
+        outs.push(attend_one(l, cfg, rope, kv, &q, &k, &v, pos)?);
+    }
+    let out = if outs.len() == 1 {
+        outs.pop().unwrap()
+    } else {
+        Tensor::cat(&outs, 1)?
+    };
+    l.attn.o.forward(&out)
+}
+
+/// Attention for one sequence's rows: q/k/v are [1, seq, heads*hd] projections.
+/// Returns [1, seq, heads*hd] before the output projection.
+fn attend_one(
+    l: &Layer,
+    cfg: &ModelConfig,
+    rope: &mut Rope,
+    kv: &mut LayerKv,
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    pos: usize,
+) -> Result<Tensor> {
+    let (b, seq, _) = q.dims3()?;
+    let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
+    let x = q;
     let q = q.reshape((b, seq, nh, hd))?.transpose(1, 2)?;
     let k = k.reshape((b, seq, nkv, hd))?.transpose(1, 2)?;
     let v = v.reshape((b, seq, nkv, hd))?.transpose(1, 2)?;
@@ -692,7 +863,7 @@ fn attention(
             };
             let out = crate::attention::attend(&q.contiguous()?, kbuf, vbuf, &params)?;
             let out = Tensor::from_vec(out, (b, seq, nh * hd), x.device())?;
-            return l.attn.o.forward(&out);
+            return Ok(out);
         }
     }
 
@@ -733,5 +904,5 @@ fn attention(
         .reshape((b, nh, seq, hd))?
         .transpose(1, 2)?
         .reshape((b, seq, nh * hd))?;
-    l.attn.o.forward(&out)
+    Ok(out)
 }

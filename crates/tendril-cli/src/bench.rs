@@ -443,6 +443,7 @@ async fn bench(a: &BenchArgs, url: &str) -> Result<()> {
                 fmt_ms(s["predicted_ms"].as_f64().unwrap_or(0.0)),
                 fmt_ms(s["compute_ms"].as_f64().unwrap_or(0.0)),
                 fmt_ms(s["queue_ms"].as_f64().unwrap_or(0.0)),
+                format!("{:.1}", s["batch"].as_f64().unwrap_or(1.0)),
             ]);
         }
         t.row(vec![

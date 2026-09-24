@@ -398,6 +398,7 @@ function renderStatus(s) {
   ordered.forEach(({ g, n }, i) => {
     const pct = Math.min(100, Math.round(g.peak / g.usable * 100));
     const measured = tel?.stages?.[i]?.compute_ms;
+    const batch = tel?.stages?.[i]?.batch;
     if (i > 0) {
       const link = n.local ? byName[ordered[i - 1].n.name] : n;
       html += `<div class="link">${link?.rtt_ms != null ? fmtMs(link.rtt_ms) + ' · ' + (link.bandwidth_gbps || 0).toFixed(1) + ' Gb/s' : 'activations'} ↓</div>`;
@@ -405,7 +406,7 @@ function renderStatus(s) {
     html += `<div class="node active"><div class="top"><span class="name">${esc(n.name)}${n.local ? ' <span class="tag">this server</span>' : ''}</span><span class="chip">${esc(shortChip(n.chip))} · ${n.backend}</span></div>
       <div class="role">${esc(g.components)}</div>
       <div class="bar ${pct > 90 ? 'warn' : ''}"><div style="width:${pct}%"></div></div>
-      <div class="chip">${fmtBytes(g.peak)} of ${fmtBytes(g.usable)} · ${measured != null ? `${fmtMs(measured)}/token measured (${fmtMs(g.decode_ms)} predicted)` : `${fmtMs(g.decode_ms)}/token predicted`}${n.on_battery ? ' · on battery' : ''}</div></div>`;
+      <div class="chip">${fmtBytes(g.peak)} of ${fmtBytes(g.usable)} · ${measured != null ? `${fmtMs(measured)}/token measured (${fmtMs(g.decode_ms)} predicted)` : `${fmtMs(g.decode_ms)}/token predicted`}${batch > 1.05 ? ` · batching ×${batch.toFixed(1)}` : ''}${n.on_battery ? ' · on battery' : ''}</div></div>`;
   });
   idle.forEach(n => {
     html += `<div class="node" style="margin-top:10px"><div class="top"><span class="name">${esc(n.name)}</span><span class="chip">${esc(shortChip(n.chip))} · ${n.backend}</span></div>
