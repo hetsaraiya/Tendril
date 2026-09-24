@@ -155,24 +155,30 @@ mod x86 {
         hsum(acc)
     }
 
+    // The half-precision kernels widen to f32 and accumulate in exactly the
+    // same order as `dot_f32`, so a row computed alone (decode) and the same row
+    // computed in a batch (widened, then `dot_f32`) give bit-identical results.
+
     #[target_feature(enable = "avx2,fma,f16c")]
     pub unsafe fn dot_f16(w: &[u16], x: &[f32]) -> f32 {
-        let n = w.len() / 16 * 16;
-        let mut a0 = _mm256_setzero_ps();
-        let mut a1 = _mm256_setzero_ps();
+        let n = w.len() / 32 * 32;
+        let mut a = [_mm256_setzero_ps(); 4];
         let mut i = 0;
         while i < n {
-            let h0 = _mm_loadu_si128(w.as_ptr().add(i) as *const __m128i);
-            let h1 = _mm_loadu_si128(w.as_ptr().add(i + 8) as *const __m128i);
-            a0 = _mm256_fmadd_ps(_mm256_cvtph_ps(h0), _mm256_loadu_ps(x.as_ptr().add(i)), a0);
-            a1 = _mm256_fmadd_ps(
-                _mm256_cvtph_ps(h1),
-                _mm256_loadu_ps(x.as_ptr().add(i + 8)),
-                a1,
-            );
-            i += 16;
+            for (l, acc) in a.iter_mut().enumerate() {
+                let h = _mm_loadu_si128(w.as_ptr().add(i + l * 8) as *const __m128i);
+                *acc = _mm256_fmadd_ps(
+                    _mm256_cvtph_ps(h),
+                    _mm256_loadu_ps(x.as_ptr().add(i + l * 8)),
+                    *acc,
+                );
+            }
+            i += 32;
         }
-        let mut s = hsum(_mm256_add_ps(a0, a1));
+        let mut s = hsum(_mm256_add_ps(
+            _mm256_add_ps(a[0], a[1]),
+            _mm256_add_ps(a[2], a[3]),
+        ));
         for j in n..w.len() {
             s += super::f16_to_f32(w[j]) * x[j];
         }
@@ -181,20 +187,21 @@ mod x86 {
 
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn dot_bf16(w: &[u16], x: &[f32]) -> f32 {
-        let n = w.len() / 16 * 16;
-        let mut a0 = _mm256_setzero_ps();
-        let mut a1 = _mm256_setzero_ps();
+        let n = w.len() / 32 * 32;
+        let mut a = [_mm256_setzero_ps(); 4];
         let mut i = 0;
         while i < n {
-            let h0 = _mm_loadu_si128(w.as_ptr().add(i) as *const __m128i);
-            let h1 = _mm_loadu_si128(w.as_ptr().add(i + 8) as *const __m128i);
-            let f0 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h0), 16));
-            let f1 = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h1), 16));
-            a0 = _mm256_fmadd_ps(f0, _mm256_loadu_ps(x.as_ptr().add(i)), a0);
-            a1 = _mm256_fmadd_ps(f1, _mm256_loadu_ps(x.as_ptr().add(i + 8)), a1);
-            i += 16;
+            for (l, acc) in a.iter_mut().enumerate() {
+                let h = _mm_loadu_si128(w.as_ptr().add(i + l * 8) as *const __m128i);
+                let f = _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(h), 16));
+                *acc = _mm256_fmadd_ps(f, _mm256_loadu_ps(x.as_ptr().add(i + l * 8)), *acc);
+            }
+            i += 32;
         }
-        let mut s = hsum(_mm256_add_ps(a0, a1));
+        let mut s = hsum(_mm256_add_ps(
+            _mm256_add_ps(a[0], a[1]),
+            _mm256_add_ps(a[2], a[3]),
+        ));
         for j in n..w.len() {
             s += super::bf16_to_f32(w[j]) * x[j];
         }

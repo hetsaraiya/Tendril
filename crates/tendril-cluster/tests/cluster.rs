@@ -40,6 +40,7 @@ fn serve_opts(dir: &std::path::Path, port: u16, local: bool, min_stages: usize) 
         kv_disk: tendril_core::Bytes::mib(64.0),
         speculate: true,
         draft_tokens: 6,
+        recovery_timeout: Duration::from_secs(30),
     }
 }
 
@@ -350,5 +351,70 @@ async fn speculation_is_exact_and_accepts_repetitive_text() {
         m.spec_steps, m.accepted_tokens, m.drafted_tokens
     );
     assert!(m.accepted_tokens > 0, "{m:?}");
+    c.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+// The rejoin task hands back the new agent's handle so it stays alive.
+#[allow(clippy::async_yields_async)]
+async fn request_survives_a_machine_leaving_mid_generation() {
+    let dir = tempfile::tempdir().unwrap();
+    tendril_engine::testing::write_tiny_llama(dir.path(), 6, 128, 13, candle_core::DType::F32)
+        .unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let mut opts = serve_opts(dir.path(), port, true, 2);
+    opts.speculate = false; // keep steps deterministic for the comparison
+    let c = Coordinator::start(opts).await.unwrap();
+    let a = spawn_agent(port, "helper", cache.path());
+    wait_ready(&c).await;
+    let prompt: Vec<u32> = (0..40).map(|i| 5 + (i * 17 % 180) as u32).collect();
+    let want = reference_ignore_eos(dir.path(), &prompt, 300);
+    let mut rx = c
+        .generate(GenRequest {
+            prompt: prompt.clone(),
+            params: SamplingParams::greedy(),
+            max_tokens: 300,
+            stop: vec![],
+            ignore_eos: true,
+        })
+        .await
+        .unwrap();
+    let mut text = String::new();
+    let mut chunks = 0;
+    let mut agent = Some(a);
+    let mut rejoined = None;
+    let done = loop {
+        match rx.recv().await {
+            Some(GenOut::Text(t)) => {
+                text.push_str(&t);
+                chunks += 1;
+                if chunks == 25 {
+                    // The helper disappears mid-generation...
+                    agent.take().unwrap().abort();
+                    let port2 = port;
+                    let cache2 = cache.path().to_path_buf();
+                    // ...and comes back a moment later (its shard is cached).
+                    rejoined = Some(tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_millis(800)).await;
+                        spawn_agent(port2, "helper", &cache2)
+                    }));
+                }
+            }
+            Some(GenOut::Done { timing, .. }) => break timing,
+            Some(GenOut::Error(e)) => panic!(
+                "request failed instead of recovering: {e}\n{:#?}",
+                c.history()
+            ),
+            None => panic!("stream ended"),
+        }
+    };
+    assert!(
+        rejoined.is_some(),
+        "the machine should have been removed mid-stream"
+    );
+    assert_eq!(done.completion_tokens, 300);
+    assert_eq!(c.metrics().recoveries, 1, "{:#?}", c.history());
+    assert_eq!(text, want, "no lost or duplicated text across the recovery");
     c.shutdown().await;
 }

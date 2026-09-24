@@ -10,6 +10,7 @@
 pub mod agent;
 pub mod calibration;
 pub mod coordinator;
+pub mod discovery;
 pub mod http;
 pub mod prefix;
 pub mod proto;

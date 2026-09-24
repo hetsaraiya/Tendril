@@ -61,6 +61,9 @@ pub struct ServeArgs {
     /// Name this machine in the cluster.
     #[arg(long)]
     pub name: Option<String>,
+    /// Seconds in-flight requests wait for the cluster to recover when a machine leaves.
+    #[arg(long, default_value_t = 180, value_name = "SECONDS")]
+    pub recovery_timeout: u64,
     /// Don't draft tokens from the conversation to speed up decoding.
     #[arg(long)]
     pub no_speculate: bool,
@@ -79,8 +82,8 @@ pub struct ServeArgs {
 
 #[derive(Args, Debug)]
 pub struct JoinArgs {
-    /// Coordinator address shown by `tendril serve` (host or host:port).
-    pub address: String,
+    /// Coordinator address (host or host:port). Omit to find it on the local network.
+    pub address: Option<String>,
     /// Cluster token shown by `tendril serve`.
     #[arg(long, env = "TENDRIL_TOKEN")]
     pub token: String,
@@ -159,6 +162,7 @@ pub fn serve(a: ServeArgs) -> Result<()> {
         prefix_cache: !a.no_prefix_cache,
         speculate: !a.no_speculate,
         draft_tokens: a.draft_tokens.clamp(1, 16),
+        recovery_timeout: Duration::from_secs(a.recovery_timeout),
         kv_disk: Bytes::parse(&a.kv_disk)
             .ok_or_else(|| anyhow::anyhow!("cannot parse --kv-disk '{}'", a.kv_disk))?,
     };
@@ -168,7 +172,39 @@ pub fn serve(a: ServeArgs) -> Result<()> {
     rt.block_on(async move {
         let coord = Coordinator::start(opts).await?;
         let ip = lan_ip();
-        let join = format!("tendril join {ip}:{} --token {token}", a.cluster_port);
+        let join = format!("tendril join --token {token}");
+        let join_direct = format!("tendril join {ip}:{} --token {token}", a.cluster_port);
+        // Let machines on the LAN find this cluster by its token fingerprint.
+        {
+            let c = coord.clone();
+            let fp = tendril_cluster::discovery::fingerprint(&token);
+            let model = name.clone();
+            let host = ip.clone();
+            let cport = a.cluster_port;
+            tokio::spawn(async move {
+                tendril_cluster::discovery::announce(tendril_cluster::discovery::DISCOVERY_PORT, move || {
+                    tendril_cluster::discovery::Beacon {
+                        app: "tendril".into(),
+                        protocol: tendril_cluster::proto::PROTOCOL,
+                        version: env!("CARGO_PKG_VERSION").into(),
+                        model: model.clone(),
+                        host: host.clone(),
+                        control_port: cport,
+                        fingerprint: fp.clone(),
+                        machines: c.nodes().len(),
+                        state: match c.status() {
+                            Status::Ready { .. } => "ready",
+                            Status::Loading { .. } => "loading",
+                            Status::Waiting { .. } => "waiting for machines",
+                            Status::Failed { .. } => "failed",
+                            Status::Starting => "starting",
+                        }
+                        .into(),
+                    }
+                })
+                .await
+            });
+        }
         let state = AppState { coord: coord.clone(), join_command: join.clone(), model_id: name.clone() };
         let app = router(state);
         let listener = tokio::net::TcpListener::bind((a.host.as_str(), a.port))
@@ -179,8 +215,9 @@ pub fn serve(a: ServeArgs) -> Result<()> {
         println!("{} {}", bold("Tendril · serving"), bold(cyan(&name)));
         println!("  {}  {}", dim("Web chat "), bold(format!("http://{shown_host}:{}", a.port)));
         println!("  {}  http://{shown_host}:{}/v1  {}", dim("API      "), a.port, dim("(OpenAI-compatible)"));
-        println!("  {}  run this on another machine to add it:", dim("Add more "));
+        println!("  {}  run this on another machine on your network to add it:", dim("Add more "));
         println!("             {}", cyan(&join));
+        println!("             {}", dim(format!("(if your network blocks discovery: {join_direct})")));
         println!();
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -251,10 +288,10 @@ fn chrono_now() -> String {
 }
 
 pub fn join(a: JoinArgs) -> Result<()> {
-    let address = if a.address.contains(':') {
-        a.address.clone()
-    } else {
-        format!("{}:{CONTROL_PORT}", a.address)
+    let address = match &a.address {
+        Some(addr) if addr.contains(':') => addr.clone(),
+        Some(addr) => format!("{addr}:{CONTROL_PORT}"),
+        None => find_cluster(&a.token)?,
     };
     let max_memory = match &a.max_memory {
         Some(m) => Some(
@@ -393,6 +430,7 @@ pub async fn start_local_for_bench(
         kv_disk: Bytes::gib(1.0),
         speculate: true,
         draft_tokens: 6,
+        recovery_timeout: Duration::from_secs(60),
     };
     let coord = Coordinator::start(opts).await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -420,4 +458,96 @@ pub async fn start_local_for_bench(
         }
     }
     anyhow::bail!("timed out loading the model")
+}
+
+/// Find the cluster whose token matches on the local network.
+fn find_cluster(token: &str) -> Result<String> {
+    use tendril_cluster::discovery::{discover, fingerprint, DISCOVERY_PORT};
+    let fp = fingerprint(token);
+    eprint!(
+        "{} Looking for your cluster on the local network… ",
+        dim("·")
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    for attempt in 0..10 {
+        let found = rt.block_on(discover(DISCOVERY_PORT, Duration::from_secs(3)))?;
+        if let Some((addr, b)) = found.iter().find(|(_, b)| b.fingerprint == fp) {
+            eprintln!(
+                "{} found {} serving {} ({})",
+                ok_mark(),
+                addr.ip(),
+                bold(&b.model),
+                b.state
+            );
+            return Ok(addr.to_string());
+        }
+        if attempt == 0 {
+            if found.is_empty() {
+                eprintln!(
+                    "{}",
+                    dim("nothing yet — is `tendril serve` running on this network? Still looking…")
+                );
+            } else {
+                eprintln!(
+                    "{}",
+                    dim(format!(
+                        "{} cluster(s) found, none with this token (check --token). Still looking…",
+                        found.len()
+                    ))
+                );
+            }
+        }
+    }
+    anyhow::bail!(
+        "no Tendril cluster with this token answered on the local network.\n  If the coordinator is on another subnet or your network blocks broadcast, pass its address:\n  tendril join <coordinator-ip> --token {token}"
+    )
+}
+
+#[derive(Args, Debug)]
+pub struct DiscoverArgs {
+    /// Seconds to listen for clusters.
+    #[arg(long, default_value_t = 3)]
+    pub wait: u64,
+}
+
+/// `tendril discover`: list Tendril clusters on the local network.
+pub fn discover_cmd(a: DiscoverArgs) -> Result<()> {
+    use tendril_cluster::discovery::{discover, fingerprint, DISCOVERY_PORT};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    eprintln!(
+        "{} Listening for Tendril clusters for {} s…",
+        dim("·"),
+        a.wait
+    );
+    let found = rt.block_on(discover(DISCOVERY_PORT, Duration::from_secs(a.wait)))?;
+    if found.is_empty() {
+        println!("{} No clusters answered. Start one with `tendril serve <model>` (discovery needs broadcast on the LAN).", warn_mark());
+        return Ok(());
+    }
+    let mine = tendril_cluster::token::load_or_create()
+        .ok()
+        .map(|t| fingerprint(&t));
+    let mut t = crate::ui::Table::new(&["ADDRESS", "MODEL", "MACHINES", "STATE", ""]);
+    for (addr, b) in &found {
+        t.row(vec![
+            bold(addr.to_string()),
+            b.model.clone(),
+            b.machines.to_string(),
+            b.state.clone(),
+            if mine.as_deref() == Some(b.fingerprint.as_str()) {
+                green("your saved token")
+            } else {
+                String::new()
+            },
+        ]);
+    }
+    println!();
+    t.print();
+    println!();
+    println!("{}", dim("Join one with: tendril join --token <its token>   (the token is printed by `tendril serve`)"));
+    Ok(())
 }

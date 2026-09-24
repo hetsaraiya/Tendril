@@ -61,16 +61,19 @@ $ tendril serve Qwen/Qwen2.5-14B-Instruct
 Tendril · serving Qwen/Qwen2.5-14B-Instruct
   Web chat   http://192.168.1.20:8080
   API        http://192.168.1.20:8080/v1  (OpenAI-compatible)
-  Add more   run this on another machine to add it:
-             tendril join 192.168.1.20:7420 --token 7Q2K-9XMP-4HVD-J3FA
+  Add more   run this on another machine on your network to add it:
+             tendril join --token 7Q2K-9XMP-4HVD-J3FA
+             (if your network blocks discovery: tendril join 192.168.1.20:7420 --token 7Q2K-9XMP-4HVD-J3FA)
 
 17:55:13 ! Qwen2.5-14B doesn't fit on the 1 machine here yet: needs 29.4 GiB, m4-air allows 10.7 GiB …
 ```
 
-On every other machine, paste the join command:
+On every other machine, paste the join command — no address needed on the same network
+(the cluster is found by a fingerprint of its token; the token itself is never broadcast):
 
 ```text
-$ tendril join 192.168.1.20:7420 --token 7Q2K-9XMP-4HVD-J3FA
+$ tendril join --token 7Q2K-9XMP-4HVD-J3FA
+· Looking for your cluster on the local network… ✓ found 192.168.1.20 serving Qwen/Qwen2.5-14B-Instruct
 17:55:20 ✓ joined as m5-air — serving Qwen/Qwen2.5-14B-Instruct
 17:55:21 ↓ receiving weights for layers 22–47 + head: 6.1 GiB/13.9 GiB (44%)
 17:56:02 ✓ running layers 22–47 + head (13.9 GiB, Metal) — ready in 41.3 s
@@ -95,8 +98,12 @@ What happens under the hood:
   machine boundary and a single token id back — a few KB, not the model.
 - **Every link is authenticated and encrypted** (Noise protocol, pre-shared cluster
   token). A machine without the token can't join, read activations or inject work.
-- **Failures are explicit.** If a machine leaves, in-flight requests end with a clear
-  error, the cluster re-plans with who's left, and resumes when it fits again.
+- **Machines can come and go mid-answer.** If a machine leaves while a response is
+  streaming, the request pauses instead of failing: the cluster re-plans with who's left
+  (or waits for the machine to come back — its weights are cached, so rejoining takes a
+  second), replays the tokens already committed, and the stream continues. No text is
+  lost or repeated; on CPU the continuation is bit-identical. Results from the old plan
+  are rejected by epoch. Requests give up only after `--recovery-timeout` (180 s).
 - **Continuous batching.** When several conversations are active, each machine runs
   whatever work is waiting — decode steps from different conversations and prefill
   chunks — in one pass, reading every weight once per batch instead of once per request.

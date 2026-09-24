@@ -66,6 +66,8 @@ pub struct ServeOptions {
     pub speculate: bool,
     /// Most tokens drafted per step.
     pub draft_tokens: usize,
+    /// How long in-flight requests wait for the cluster to recover.
+    pub recovery_timeout: Duration,
 }
 
 /// Human-readable log of what the cluster is doing.
@@ -147,6 +149,8 @@ pub struct Metrics {
     pub spec_steps: u64,
     pub drafted_tokens: u64,
     pub accepted_tokens: u64,
+    /// Requests that survived a machine leaving mid-generation.
+    pub recoveries: u64,
     /// Conversations parked in memory / on disk right now.
     pub parked_ram: usize,
     pub parked_disk: usize,
@@ -252,6 +256,9 @@ impl Entry {
     }
 }
 
+/// A request's event channel, tagged with the plan epoch it currently follows.
+type Route = (u64, mpsc::UnboundedSender<(u64, SeqEvent)>);
+
 enum SeqEvent {
     Token(u32, Vec<StageTime>),
     /// Speculative verification result: accepted drafts + one new token.
@@ -261,6 +268,8 @@ enum SeqEvent {
         ok: bool,
         error: Option<String>,
     },
+    /// The pipeline went away (a machine left); the request should resume.
+    Lost(String),
 }
 
 /// Measured per-token timings of the running pipeline (decode steps only).
@@ -321,7 +330,8 @@ pub struct Inner {
     events: broadcast::Sender<Event>,
     history: StdMutex<VecDeque<Event>>,
     pipeline: RwLock<Option<Arc<Pipeline>>>,
-    router: StdMutex<HashMap<u64, mpsc::UnboundedSender<SeqEvent>>>,
+    /// Sequence → (plan epoch it runs on, event channel).
+    router: StdMutex<HashMap<u64, Route>>,
     local_worker: StdMutex<Option<(u64, Arc<StageWorker>)>>,
     next_seq: AtomicU64,
     epoch: AtomicU64,
@@ -769,7 +779,14 @@ impl Coordinator {
             .as_ref()
             .is_some_and(|p| p.slots.iter().any(|s| s.node_id == id));
         if in_use {
-            self.event("error", format!("{name} left the cluster ({why}) — it was running part of the model; replanning"));
+            let active = self.inner.router.lock().unwrap().len();
+            self.event(
+                "error",
+                format!(
+                    "{name} left the cluster ({why}) — it was running part of the model; replanning{}",
+                    if active > 0 { format!(". {active} in-flight request(s) will resume when the model is running again") } else { String::new() }
+                ),
+            );
             self.teardown(&format!("{name} disconnected")).await;
         } else {
             self.event("warn", format!("{name} left the cluster"));
@@ -801,11 +818,17 @@ impl Coordinator {
     async fn teardown(&self, why: &str) {
         let old = self.inner.pipeline.write().await.take();
         if let Some(p) = old {
-            let routes: Vec<_> = self.inner.router.lock().unwrap().drain().collect();
-            for (_, tx) in routes {
-                let _ = tx.send(SeqEvent::Error(format!(
-                    "the cluster lost a machine mid-request ({why}); please retry"
-                )));
+            // In-flight requests pause and resume on the next pipeline.
+            let routes: Vec<_> = self
+                .inner
+                .router
+                .lock()
+                .unwrap()
+                .values()
+                .map(|r| r.1.clone())
+                .collect();
+            for tx in routes {
+                let _ = tx.send((p.epoch, SeqEvent::Lost(why.to_string())));
             }
             for s in &p.slots {
                 if let Some(r) = self.remote(s.node_id) {
@@ -1478,22 +1501,43 @@ impl Coordinator {
     }
 
     fn route(&self, m: Msg) {
-        let (seq, ev) = match m {
+        let (epoch, seq, ev) = match m {
             Msg::Token {
-                seq, token, trace, ..
-            } => (seq, SeqEvent::Token(token, trace)),
+                epoch,
+                seq,
+                token,
+                trace,
+                ..
+            } => (epoch, seq, SeqEvent::Token(token, trace)),
             Msg::StageError {
-                seq, stage, error, ..
+                epoch,
+                seq,
+                stage,
+                error,
+                ..
             } => (
+                epoch,
                 seq,
                 SeqEvent::Error(format!("stage {} failed: {error}", stage + 1)),
             ),
-            Msg::KvOp { seq, ok, error, .. } => (seq, SeqEvent::KvAck { ok, error }),
-            Msg::Tokens { seq, tokens, .. } => (seq, SeqEvent::Tokens(tokens)),
+            Msg::KvOp {
+                epoch,
+                seq,
+                ok,
+                error,
+                ..
+            } => (epoch, seq, SeqEvent::KvAck { ok, error }),
+            Msg::Tokens {
+                epoch, seq, tokens, ..
+            } => (epoch, seq, SeqEvent::Tokens(tokens)),
             _ => return,
         };
-        if let Some(tx) = self.inner.router.lock().unwrap().get(&seq) {
-            let _ = tx.send(ev);
+        // Results from a plan the request no longer runs on (a late message from a
+        // machine that just left) must never be mistaken for current output.
+        if let Some((e, tx)) = self.inner.router.lock().unwrap().get(&seq) {
+            if *e == epoch {
+                let _ = tx.send((epoch, ev));
+            }
         }
     }
 
@@ -1563,7 +1607,11 @@ impl Coordinator {
             None => self.inner.next_seq.fetch_add(1, Ordering::Relaxed),
         };
         let (stx, srx) = mpsc::unbounded_channel();
-        self.inner.router.lock().unwrap().insert(seq, stx);
+        self.inner
+            .router
+            .lock()
+            .unwrap()
+            .insert(seq, (p.epoch, stx));
         let c = self.clone();
         tokio::spawn(async move {
             let queue_ms = queued_at.elapsed().as_secs_f64() * 1000.0;
@@ -1585,12 +1633,12 @@ impl Coordinator {
     #[allow(clippy::too_many_arguments)]
     async fn drive(
         &self,
-        p: Arc<Pipeline>,
-        _permit: OwnedSemaphorePermit,
+        mut p: Arc<Pipeline>,
+        mut _permit: OwnedSemaphorePermit,
         seq: u64,
         hit: Option<Hit>,
         req: GenRequest,
-        mut srx: mpsc::UnboundedReceiver<SeqEvent>,
+        mut srx: mpsc::UnboundedReceiver<(u64, SeqEvent)>,
         out: mpsc::Sender<GenOut>,
         queue_ms: f64,
     ) {
@@ -1605,7 +1653,7 @@ impl Coordinator {
             queue_ms,
             ..Default::default()
         };
-        let epoch = p.epoch;
+        let mut epoch = p.epoch;
         let mut pos = 0usize;
         if let Some(h) = hit {
             match self.resume(&p, seq, &h, &mut srx).await {
@@ -1666,7 +1714,10 @@ impl Coordinator {
         let mut in_flight: usize = 0;
         'decode: loop {
             let ev = match tokio::time::timeout(Duration::from_secs(300), srx.recv()).await {
-                Ok(Some(e)) => e,
+                // Ignore anything from a plan this request no longer runs on
+                // (late results, or a second notice about a loss already handled).
+                Ok(Some((e, _))) if e != epoch => continue,
+                Ok(Some((_, e))) => e,
                 Ok(None) => {
                     error = Some("the pipeline stopped".into());
                     break;
@@ -1725,6 +1776,37 @@ impl Coordinator {
                     break;
                 }
                 SeqEvent::KvAck { .. } => continue,
+                SeqEvent::Lost(why) => {
+                    // A machine left. Wait for the cluster to re-form, replay the
+                    // committed tokens, and carry on: the client just sees a pause.
+                    self.event("warn", format!("A request paused mid-generation ({why}); it will resume when the cluster recovers"));
+                    let t_lost = Instant::now();
+                    match self.recover(p.epoch, seq, &fed, &req.params).await {
+                        Ok((np, permit)) => {
+                            p = np;
+                            _permit = permit;
+                            epoch = p.epoch;
+                            pos = fed.len();
+                            in_flight = 0;
+                            pending_draft.clear();
+                            step_sent = None;
+                            self.inner.metrics.lock().unwrap().recoveries += 1;
+                            self.event(
+                                "ok",
+                                format!(
+                                    "Resumed a request after {:.1} s (replayed {} committed tokens)",
+                                    t_lost.elapsed().as_secs_f64(),
+                                    fed.len()
+                                ),
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            error = Some(e);
+                            break;
+                        }
+                    }
+                }
             };
             let n_new = toks.len();
             let mut last_tok = 0;
@@ -1852,6 +1934,68 @@ impl Coordinator {
         }
     }
 
+    /// Wait for a new pipeline after a machine left, then replay `fed` (every
+    /// token the old pipeline had accepted) so generation can continue.
+    async fn recover(
+        &self,
+        old_epoch: u64,
+        seq: u64,
+        fed: &[u32],
+        params: &SamplingParams,
+    ) -> Result<(Arc<Pipeline>, OwnedSemaphorePermit), String> {
+        let deadline = Instant::now() + self.inner.opts.recovery_timeout;
+        let p = loop {
+            if let Some(p) = self.inner.pipeline.read().await.clone() {
+                if p.epoch != old_epoch {
+                    break p;
+                }
+            }
+            if Instant::now() > deadline {
+                return Err(format!(
+                    "a machine left mid-request and the cluster did not recover within {} s",
+                    self.inner.opts.recovery_timeout.as_secs()
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        let permit = p
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| "the cluster is shutting down".to_string())?;
+        // From now on only the new plan's results belong to this request.
+        if let Some(r) = self.inner.router.lock().unwrap().get_mut(&seq) {
+            r.0 = p.epoch;
+        }
+        let setup = SampleSetup {
+            params: params.clone(),
+            history: fed.to_vec(),
+        };
+        let mut pos = 0;
+        let mut first = true;
+        while pos < fed.len() {
+            // Small chunks use the same kernels (and summation order) as decoding,
+            // so on CPU the replayed KV is bit-identical to the lost one.
+            let n = prefill_chunk(&self.inner.cfg, pos)
+                .min(64)
+                .min(fed.len() - pos);
+            p.entry.send(Msg::Forward {
+                epoch: p.epoch,
+                seq,
+                pos: pos as u32,
+                payload: Payload::Tokens(fed[pos..pos + n].to_vec()),
+                want_logits: pos + n == fed.len(),
+                sample: if first { Some(setup.clone()) } else { None },
+                trace: Vec::new(),
+                draft: None,
+            });
+            first = false;
+            pos += n;
+        }
+        Ok((p, permit))
+    }
+
     /// Bring a parked conversation back: restore from disk and/or cut it back to
     /// the shared prefix, waiting for every stage to confirm.
     async fn resume(
@@ -1859,7 +2003,7 @@ impl Coordinator {
         p: &Pipeline,
         seq: u64,
         h: &Hit,
-        srx: &mut mpsc::UnboundedReceiver<SeqEvent>,
+        srx: &mut mpsc::UnboundedReceiver<(u64, SeqEvent)>,
     ) -> Result<(), String> {
         let mut ops = Vec::new();
         if h.restore {
@@ -1880,11 +2024,12 @@ impl Coordinator {
             });
             loop {
                 match tokio::time::timeout(Duration::from_secs(60), srx.recv()).await {
-                    Ok(Some(SeqEvent::KvAck { ok: true, .. })) => break,
-                    Ok(Some(SeqEvent::KvAck { error, .. })) => {
+                    Ok(Some((e, _))) if e != p.epoch => continue,
+                    Ok(Some((_, SeqEvent::KvAck { ok: true, .. }))) => break,
+                    Ok(Some((_, SeqEvent::KvAck { error, .. }))) => {
                         return Err(error.unwrap_or_else(|| "failed".into()))
                     }
-                    Ok(Some(SeqEvent::Error(e))) => return Err(e),
+                    Ok(Some((_, SeqEvent::Error(e)))) => return Err(e),
                     Ok(Some(_)) => continue,
                     _ => return Err("no answer from the stages".into()),
                 }
