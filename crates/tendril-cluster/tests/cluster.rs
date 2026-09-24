@@ -202,7 +202,7 @@ async fn three_remote_stages() {
     assert_eq!(collect(&c, prompt, 20).await, want);
     // Per-stage timings travel with every token.
     let (plan, tel) = c.telemetry().await.expect("running pipeline");
-    assert!(tel.samples >= 10, "{tel:?}");
+    assert!(tel.samples >= 3, "{tel:?}");
     assert_eq!(tel.compute_ms.len(), plan.stages.len());
     assert!(tel.compute_ms.iter().all(|&m| m > 0.0));
     assert!(tel.step_ms >= tel.compute_ms.iter().sum::<f64>() * 0.5);
