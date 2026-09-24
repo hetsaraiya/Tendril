@@ -81,12 +81,12 @@ pub fn spec_from_config(id: &str, origin: &str, raw: &Value) -> Result<ModelSpec
             Arch::Mistral => attention
                 .iter_mut()
                 .for_each(|a| *a = Attention::Sliding(w)),
-            Arch::Qwen2 | Arch::Qwen3 => {
-                if cfg.get("use_sliding_window").and_then(|v| v.as_bool()) == Some(true) {
-                    attention
-                        .iter_mut()
-                        .for_each(|a| *a = Attention::Sliding(w));
-                }
+            Arch::Qwen2 | Arch::Qwen3
+                if cfg.get("use_sliding_window").and_then(|v| v.as_bool()) == Some(true) =>
+            {
+                attention
+                    .iter_mut()
+                    .for_each(|a| *a = Attention::Sliding(w));
             }
             _ => {}
         }
