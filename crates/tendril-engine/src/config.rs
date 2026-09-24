@@ -195,13 +195,13 @@ impl ModelConfig {
                         .for_each(|i| layer_window[i] = Some(w));
                 }
                 Arch::Mistral => layer_window.iter_mut().for_each(|x| *x = Some(w)),
-                Arch::Qwen2 | Arch::Qwen3 => {
-                    if c.get("use_sliding_window").and_then(|v| v.as_bool()) == Some(true) {
-                        let max_window_layers = u(c, "max_window_layers").unwrap_or(layers);
-                        (0..layers)
-                            .filter(|&i| i >= max_window_layers)
-                            .for_each(|i| layer_window[i] = Some(w));
-                    }
+                Arch::Qwen2 | Arch::Qwen3
+                    if c.get("use_sliding_window").and_then(|v| v.as_bool()) == Some(true) =>
+                {
+                    let max_window_layers = u(c, "max_window_layers").unwrap_or(layers);
+                    (0..layers)
+                        .filter(|&i| i >= max_window_layers)
+                        .for_each(|i| layer_window[i] = Some(w));
                 }
                 _ => {}
             }

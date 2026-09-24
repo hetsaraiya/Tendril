@@ -179,6 +179,16 @@ pub enum Msg {
 }
 
 impl WireTensor {
+    /// The payload as little-endian N-byte words.
+    fn words<const N: usize>(&self) -> impl Iterator<Item = [u8; N]> + '_ {
+        let d = &self.data;
+        (0..d.len() / N).map(move |i| {
+            let mut w = [0u8; N];
+            w.copy_from_slice(&d[i * N..i * N + N]);
+            w
+        })
+    }
+
     pub fn from_tensor(t: &candle_core::Tensor) -> anyhow::Result<WireTensor> {
         use candle_core::DType;
         let shape = t.dims().to_vec();
@@ -232,26 +242,20 @@ impl WireTensor {
         }
         let t = match self.dtype.as_str() {
             "f32" => {
-                let v: Vec<f32> = self
-                    .data
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                    .collect();
+                let v: Vec<f32> = self.words::<4>().map(f32::from_le_bytes).collect();
                 Tensor::from_vec(v, self.shape.clone(), device)?
             }
             "bf16" => {
                 let v: Vec<half::bf16> = self
-                    .data
-                    .chunks_exact(2)
-                    .map(|c| half::bf16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+                    .words::<2>()
+                    .map(|c| half::bf16::from_bits(u16::from_le_bytes(c)))
                     .collect();
                 Tensor::from_vec(v, self.shape.clone(), device)?
             }
             _ => {
                 let v: Vec<half::f16> = self
-                    .data
-                    .chunks_exact(2)
-                    .map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+                    .words::<2>()
+                    .map(|c| half::f16::from_bits(u16::from_le_bytes(c)))
                     .collect();
                 Tensor::from_vec(v, self.shape.clone(), device)?
             }
