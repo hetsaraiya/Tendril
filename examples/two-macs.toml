@@ -1,0 +1,13 @@
+# Two 16 GB Macs connected with a Thunderbolt cable.
+#   tendril plan gemma-2-9b --cluster examples/two-macs.toml
+link = "thunderbolt"
+
+[[node]]
+name = "m4-air"
+hardware = "m4"
+memory = "16gb"
+
+[[node]]
+name = "m5-air"
+hardware = "m5"
+memory = "16gb"
