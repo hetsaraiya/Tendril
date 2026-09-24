@@ -1,0 +1,33 @@
+[package]
+name = "tendril-cluster"
+description = "Tendril cluster: encrypted transport, agents, coordinator and OpenAI-compatible serving"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tendril-core.workspace = true
+tendril-engine = { path = "../tendril-engine" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+tokio = { version = "1", features = ["full"] }
+snow = "0.10"
+postcard = { version = "1", features = ["use-std"] }
+serde_bytes = "0.11"
+sha2 = "0.10"
+rand = "0.9"
+tracing = "0.1"
+candle-core = "0.11"
+half = "2"
+axum = { version = "0.8", features = ["macros"] }
+futures = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+async-stream = "0.3"
+local-ip-address = "0.6"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }

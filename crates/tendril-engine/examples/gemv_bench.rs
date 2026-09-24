@@ -25,20 +25,38 @@ fn main() -> anyhow::Result<()> {
     let ms = time(&mut || {
         lin.forward(&x).unwrap();
     });
-    println!("candle f32        {ms:7.2} ms  {:6.1} GB/s", (n * k * 4) as f64 / ms / 1e6);
+    println!(
+        "candle f32        {ms:7.2} ms  {:6.1} GB/s",
+        (n * k * 4) as f64 / ms / 1e6
+    );
     let qm = QMatMul::from_qtensor(QTensor::quantize(&w, GgmlDType::Q8_0)?)?;
     let ms = time(&mut || {
         qm.forward(&x).unwrap();
     });
-    println!("candle q8_0       {ms:7.2} ms  {:6.1} GB/s", (n * k) as f64 * 1.0625 / ms / 1e6);
+    println!(
+        "candle q8_0       {ms:7.2} ms  {:6.1} GB/s",
+        (n * k) as f64 * 1.0625 / ms / 1e6
+    );
     for cw in [
         CpuWeights::F32(wv.clone()),
-        CpuWeights::Bf16(wv.iter().map(|v| half::bf16::from_f32(*v).to_bits()).collect()),
-        CpuWeights::F16(wv.iter().map(|v| half::f16::from_f32(*v).to_bits()).collect()),
+        CpuWeights::Bf16(
+            wv.iter()
+                .map(|v| half::bf16::from_f32(*v).to_bits())
+                .collect(),
+        ),
+        CpuWeights::F16(
+            wv.iter()
+                .map(|v| half::f16::from_f32(*v).to_bits())
+                .collect(),
+        ),
         CpuWeights::Q8(quantize_q8(&wv)),
     ] {
         let ms = time(&mut || matmul(&xv, 1, k, &cw, n, &mut out));
-        println!("tendril {:<9} {ms:7.2} ms  {:6.1} GB/s", cw.label(), cw.bytes() as f64 / ms / 1e6);
+        println!(
+            "tendril {:<9} {ms:7.2} ms  {:6.1} GB/s",
+            cw.label(),
+            cw.bytes() as f64 / ms / 1e6
+        );
     }
     Ok(())
 }

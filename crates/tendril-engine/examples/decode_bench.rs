@@ -16,7 +16,12 @@ fn main() -> anyhow::Result<()> {
         let load = t.elapsed().as_secs_f64();
         let prompt: Vec<u32> = (0..200).map(|i| 5 + (i * 7 % 250) as u32).collect();
         let timing = m.generate(
-            GenerateRequest { prompt, params: SamplingParams::greedy(), max_tokens: 64, stop: vec![] },
+            GenerateRequest {
+                prompt,
+                params: SamplingParams::greedy(),
+                max_tokens: 64,
+                stop: vec![],
+            },
             |_| true,
         )?;
         let gb = m.weight_bytes() as f64 / 1e9;

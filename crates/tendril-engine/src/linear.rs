@@ -71,19 +71,43 @@ impl Linear {
             bail!("{name}: expected a 2-D weight, got {shape:?}");
         }
         let (n, k) = (shape[0], shape[1]);
-        let kind = Self::make_kind(Some((dt, data)), None, n, k, device, act, fmt, || ws.tensor(name, &Device::Cpu, DType::F32))?;
+        // GPUs keep native precision: load straight to the device, no f32 detour.
+        let kind = if !device.is_cpu() && fmt == WeightFormat::Native {
+            Kind::Dense(ws.tensor(name, device, act)?)
+        } else {
+            Self::make_kind(Some((dt, data)), None, n, k, device, act, fmt, || {
+                ws.tensor(name, &Device::Cpu, DType::F32)
+            })?
+        };
         let bias = match bias {
             Some(b) if ws.has(b) => Some(ws.tensor(b, device, act)?),
             _ => None,
         };
-        Ok(Linear { kind, bias, out_features: n, in_features: k })
+        Ok(Linear {
+            kind,
+            bias,
+            out_features: n,
+            in_features: k,
+        })
     }
 
     /// Build from an f32 CPU tensor (used when splitting fused projections).
-    pub fn from_f32(w: &Tensor, bias: Option<Tensor>, device: &Device, act: DType, fmt: WeightFormat, native: safetensors::Dtype) -> Result<Linear> {
+    pub fn from_f32(
+        w: &Tensor,
+        bias: Option<Tensor>,
+        device: &Device,
+        act: DType,
+        fmt: WeightFormat,
+        native: safetensors::Dtype,
+    ) -> Result<Linear> {
         let (n, k) = w.dims2()?;
         let kind = Self::make_kind(None, Some(native), n, k, device, act, fmt, || Ok(w.clone()))?;
-        Ok(Linear { kind, bias, out_features: n, in_features: k })
+        Ok(Linear {
+            kind,
+            bias,
+            out_features: n,
+            in_features: k,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -105,34 +129,50 @@ impl Linear {
             WeightFormat::Q6K => Some(GgmlDType::Q6K),
         };
         if device.is_cpu() {
-            if fmt == WeightFormat::Q8_0 && k % Q8_BLOCK == 0 {
+            if fmt == WeightFormat::Q8_0 && k.is_multiple_of(Q8_BLOCK) {
                 let w: Vec<f32> = f32_tensor()?.flatten_all()?.to_vec1()?;
                 return Ok(Kind::Cpu(CpuWeights::Q8(quantize_q8(&w))));
             }
             if let Some(q) = quant {
-                if k % q.block_size() == 0 {
+                if k.is_multiple_of(q.block_size()) {
                     let qt = QTensor::quantize(&f32_tensor()?, q)?;
                     return Ok(Kind::Quant(QMatMul::from_qtensor(qt)?));
                 }
             }
             let dtype = raw.map(|r| r.0).or(native_hint).unwrap_or(S::F32);
-            let as_u16 = |b: &[u8]| -> Vec<u16> { b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect() };
+            let as_u16 = |b: &[u8]| -> Vec<u16> {
+                b.chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect()
+            };
             return Ok(Kind::Cpu(match (dtype, raw) {
                 (S::BF16, Some((_, b))) => CpuWeights::Bf16(as_u16(b)),
                 (S::F16, Some((_, b))) => CpuWeights::F16(as_u16(b)),
                 (S::BF16, None) => {
-                    let v: Vec<u16> = f32_tensor()?.to_dtype(DType::BF16)?.flatten_all()?.to_vec1::<half::bf16>()?.into_iter().map(|x| x.to_bits()).collect();
+                    let v: Vec<u16> = f32_tensor()?
+                        .to_dtype(DType::BF16)?
+                        .flatten_all()?
+                        .to_vec1::<half::bf16>()?
+                        .into_iter()
+                        .map(|x| x.to_bits())
+                        .collect();
                     CpuWeights::Bf16(v)
                 }
                 (S::F16, None) => {
-                    let v: Vec<u16> = f32_tensor()?.to_dtype(DType::F16)?.flatten_all()?.to_vec1::<half::f16>()?.into_iter().map(|x| x.to_bits()).collect();
+                    let v: Vec<u16> = f32_tensor()?
+                        .to_dtype(DType::F16)?
+                        .flatten_all()?
+                        .to_vec1::<half::f16>()?
+                        .into_iter()
+                        .map(|x| x.to_bits())
+                        .collect();
                     CpuWeights::F16(v)
                 }
                 _ => CpuWeights::F32(f32_tensor()?.flatten_all()?.to_vec1()?),
             }));
         }
         if let Some(q) = quant {
-            if k % q.block_size() == 0 {
+            if k.is_multiple_of(q.block_size()) {
                 let qt = QTensor::quantize_onto(&f32_tensor()?, q, device)?;
                 return Ok(Kind::Quant(QMatMul::from_qtensor(qt)?));
             }
@@ -171,18 +211,46 @@ impl Linear {
             });
             let first = it.next().unwrap();
             let fused = it.fold(first, |acc, w| match (acc, w) {
-                (CpuWeights::F32(mut a), CpuWeights::F32(b)) => { a.extend(b); CpuWeights::F32(a) }
-                (CpuWeights::Bf16(mut a), CpuWeights::Bf16(b)) => { a.extend(b); CpuWeights::Bf16(a) }
-                (CpuWeights::F16(mut a), CpuWeights::F16(b)) => { a.extend(b); CpuWeights::F16(a) }
-                (CpuWeights::Q8(mut a), CpuWeights::Q8(b)) => { a.extend(b); CpuWeights::Q8(a) }
+                (CpuWeights::F32(mut a), CpuWeights::F32(b)) => {
+                    a.extend(b);
+                    CpuWeights::F32(a)
+                }
+                (CpuWeights::Bf16(mut a), CpuWeights::Bf16(b)) => {
+                    a.extend(b);
+                    CpuWeights::Bf16(a)
+                }
+                (CpuWeights::F16(mut a), CpuWeights::F16(b)) => {
+                    a.extend(b);
+                    CpuWeights::F16(a)
+                }
+                (CpuWeights::Q8(mut a), CpuWeights::Q8(b)) => {
+                    a.extend(b);
+                    CpuWeights::Q8(a)
+                }
                 _ => unreachable!(),
             });
-            return Ok(Linear { kind: Kind::Cpu(fused), bias, out_features: n, in_features: k });
+            return Ok(Linear {
+                kind: Kind::Cpu(fused),
+                bias,
+                out_features: n,
+                in_features: k,
+            });
         }
         if all_dense {
-            let ts: Vec<Tensor> = parts.iter().map(|p| match &p.kind { Kind::Dense(t) => t.clone(), _ => unreachable!() }).collect();
+            let ts: Vec<Tensor> = parts
+                .iter()
+                .map(|p| match &p.kind {
+                    Kind::Dense(t) => t.clone(),
+                    _ => unreachable!(),
+                })
+                .collect();
             if let Ok(t) = Tensor::cat(&ts, 0) {
-                return Ok(Linear { kind: Kind::Dense(t), bias, out_features: n, in_features: k });
+                return Ok(Linear {
+                    kind: Kind::Dense(t),
+                    bias,
+                    out_features: n,
+                    in_features: k,
+                });
             }
         }
         Err(parts)
@@ -194,7 +262,9 @@ impl Linear {
             Kind::Cpu(w) => w.bytes(),
             Kind::Dense(t) => t.elem_count() * t.dtype().size_in_bytes(),
             Kind::Quant(QMatMul::QTensor(q)) => q.storage_size_in_bytes(),
-            Kind::Quant(QMatMul::Tensor(t)) | Kind::Quant(QMatMul::TensorF16(t)) => t.elem_count() * t.dtype().size_in_bytes(),
+            Kind::Quant(QMatMul::Tensor(t)) | Kind::Quant(QMatMul::TensorF16(t)) => {
+                t.elem_count() * t.dtype().size_in_bytes()
+            }
         }
     }
 
@@ -260,7 +330,10 @@ impl Linear {
                 for (i, &id) in ids.iter().enumerate() {
                     let id = id as usize;
                     if id >= self.out_features {
-                        bail!("token id {id} is outside the vocabulary ({})", self.out_features);
+                        bail!(
+                            "token id {id} is outside the vocabulary ({})",
+                            self.out_features
+                        );
                     }
                     cpu_kernels::row_f32(w, id, k, &mut out[i * k..i * k + k]);
                 }
@@ -285,7 +358,14 @@ impl Linear {
 }
 
 /// Large-batch CPU matmul: widen weight bands to f32 and use candle's GEMM.
-fn gemm_banded(x: &[f32], m: usize, k: usize, w: &CpuWeights, n: usize, dev: &Device) -> Result<Tensor> {
+fn gemm_banded(
+    x: &[f32],
+    m: usize,
+    k: usize,
+    w: &CpuWeights,
+    n: usize,
+    dev: &Device,
+) -> Result<Tensor> {
     let xt = Tensor::from_slice(x, (m, k), dev)?;
     if let CpuWeights::F32(v) = w {
         let wt = Tensor::from_slice(v, (n, k), dev)?;

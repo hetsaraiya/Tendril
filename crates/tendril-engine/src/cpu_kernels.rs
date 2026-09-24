@@ -165,7 +165,11 @@ mod x86 {
             let h0 = _mm_loadu_si128(w.as_ptr().add(i) as *const __m128i);
             let h1 = _mm_loadu_si128(w.as_ptr().add(i + 8) as *const __m128i);
             a0 = _mm256_fmadd_ps(_mm256_cvtph_ps(h0), _mm256_loadu_ps(x.as_ptr().add(i)), a0);
-            a1 = _mm256_fmadd_ps(_mm256_cvtph_ps(h1), _mm256_loadu_ps(x.as_ptr().add(i + 8)), a1);
+            a1 = _mm256_fmadd_ps(
+                _mm256_cvtph_ps(h1),
+                _mm256_loadu_ps(x.as_ptr().add(i + 8)),
+                a1,
+            );
             i += 16;
         }
         let mut s = hsum(_mm256_add_ps(a0, a1));
@@ -212,7 +216,10 @@ mod x86 {
             }
             i += 32;
         }
-        let mut s = hsum(_mm256_add_ps(_mm256_add_ps(a[0], a[1]), _mm256_add_ps(a[2], a[3])));
+        let mut s = hsum(_mm256_add_ps(
+            _mm256_add_ps(a[0], a[1]),
+            _mm256_add_ps(a[2], a[3]),
+        ));
         for j in n..w.len() {
             s += w[j] * x[j];
         }
@@ -236,7 +243,10 @@ pub fn quantize_q8(src: &[f32]) -> Vec<BlockQ8> {
             for (q, &x) in qs.iter_mut().zip(blk) {
                 *q = (x * id).round().clamp(-127.0, 127.0) as i8;
             }
-            BlockQ8 { d: f16::from_f32(d).to_bits(), qs }
+            BlockQ8 {
+                d: f16::from_f32(d).to_bits(),
+                qs,
+            }
         })
         .collect()
 }
@@ -331,7 +341,17 @@ fn widen_row(w: &CpuWeights, row: usize, k: usize, buf: &mut [f32]) {
 /// Compute rows [r0, r1) of the output for all `m` inputs.
 /// `out` is laid out as `m × n`; this writes a column band.
 #[inline(always)]
-fn band(x: &[f32], xq: Option<&QuantX>, m: usize, k: usize, n: usize, w: &CpuWeights, r0: usize, r1: usize, out_band: &mut [f32]) {
+fn band(
+    x: &[f32],
+    xq: Option<&QuantX>,
+    m: usize,
+    k: usize,
+    n: usize,
+    w: &CpuWeights,
+    r0: usize,
+    r1: usize,
+    out_band: &mut [f32],
+) {
     // out_band: m × (r1 - r0), transposed back by the caller.
     let width = r1 - r0;
     if m == 1 {
@@ -391,7 +411,17 @@ fn band(x: &[f32], xq: Option<&QuantX>, m: usize, k: usize, n: usize, w: &CpuWei
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
-unsafe fn band_avx2(x: &[f32], xq: Option<&QuantX>, m: usize, k: usize, n: usize, w: &CpuWeights, r0: usize, r1: usize, out: &mut [f32]) {
+unsafe fn band_avx2(
+    x: &[f32],
+    xq: Option<&QuantX>,
+    m: usize,
+    k: usize,
+    n: usize,
+    w: &CpuWeights,
+    r0: usize,
+    r1: usize,
+    out: &mut [f32],
+) {
     band(x, xq, m, k, n, w, r0, r1, out)
 }
 
@@ -400,7 +430,9 @@ fn has_avx2() -> bool {
     {
         static F: OnceLock<bool> = OnceLock::new();
         *F.get_or_init(|| {
-            is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") && is_x86_feature_detected!("f16c")
+            is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("fma")
+                && is_x86_feature_detected!("f16c")
         })
     }
     #[cfg(not(target_arch = "x86_64"))]
@@ -409,7 +441,17 @@ fn has_avx2() -> bool {
     }
 }
 
-fn run_band(x: &[f32], xq: Option<&QuantX>, m: usize, k: usize, n: usize, w: &CpuWeights, r0: usize, r1: usize, out: &mut [f32]) {
+fn run_band(
+    x: &[f32],
+    xq: Option<&QuantX>,
+    m: usize,
+    k: usize,
+    n: usize,
+    w: &CpuWeights,
+    r0: usize,
+    r1: usize,
+    out: &mut [f32],
+) {
     #[cfg(target_arch = "x86_64")]
     if has_avx2() {
         // SAFETY: guarded by runtime feature detection.
@@ -466,14 +508,18 @@ pub fn row_f32(w: &CpuWeights, row: usize, k: usize, out: &mut [f32]) {
 /// Widen rows [s, e) to f32.
 pub fn rows_f32(w: &CpuWeights, s: usize, e: usize, k: usize) -> Vec<f32> {
     let mut out = vec![0f32; (e - s) * k];
-    out.par_chunks_mut(k).enumerate().for_each(|(j, row)| widen_row(w, s + j, k, row));
+    out.par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(j, row)| widen_row(w, s + j, k, row));
     out
 }
 
 /// Dequantize/widen all rows to f32 (used for large prefill batches).
 pub fn to_f32(w: &CpuWeights, n: usize, k: usize) -> Vec<f32> {
     let mut out = vec![0f32; n * k];
-    out.par_chunks_mut(k).enumerate().for_each(|(j, row)| widen_row(w, j, k, row));
+    out.par_chunks_mut(k)
+        .enumerate()
+        .for_each(|(j, row)| widen_row(w, j, k, row));
     out
 }
 
@@ -507,7 +553,10 @@ mod tests {
         let x = rnd(m * k, 1);
         let wf = rnd(n * k, 2);
         let exp = reference(&x, m, k, &wf, n);
-        let bf: Vec<u16> = wf.iter().map(|v| half::bf16::from_f32(*v).to_bits()).collect();
+        let bf: Vec<u16> = wf
+            .iter()
+            .map(|v| half::bf16::from_f32(*v).to_bits())
+            .collect();
         let hf: Vec<u16> = wf.iter().map(|v| f16::from_f32(*v).to_bits()).collect();
         for (w, tol) in [
             (CpuWeights::F32(wf.clone()), 1e-4),

@@ -7,7 +7,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 fn byte_chars() -> Vec<char> {
-    let mut bs: Vec<u32> = (b'!' as u32..=b'~' as u32).chain(0xA1..=0xAC).chain(0xAE..=0xFF).collect();
+    let mut bs: Vec<u32> = (b'!' as u32..=b'~' as u32)
+        .chain(0xA1..=0xAC)
+        .chain(0xAE..=0xFF)
+        .collect();
     let mut cs = bs.clone();
     let mut n = 0;
     for b in 0..256u32 {
@@ -54,12 +57,21 @@ pub fn write_tokenizer(dir: &Path) -> Result<()> {
         "bos_token": "<s>", "eos_token": "<|im_end|>", "pad_token": "<pad>", "add_bos_token": false,
         "chat_template": crate::tokenizer::CHATML,
     });
-    std::fs::write(dir.join("tokenizer_config.json"), serde_json::to_vec_pretty(&tc)?)?;
+    std::fs::write(
+        dir.join("tokenizer_config.json"),
+        serde_json::to_vec_pretty(&tc)?,
+    )?;
     Ok(())
 }
 
 /// Write a random Llama-architecture model: config.json, model.safetensors, tokenizer.
-pub fn write_tiny_llama(dir: &Path, layers: usize, hidden: usize, seed: u64, dtype: DType) -> Result<()> {
+pub fn write_tiny_llama(
+    dir: &Path,
+    layers: usize,
+    hidden: usize,
+    seed: u64,
+    dtype: DType,
+) -> Result<()> {
     std::fs::create_dir_all(dir)?;
     let vocab = 384usize;
     let heads = 4usize;
@@ -89,20 +101,45 @@ pub fn write_tiny_llama(dir: &Path, layers: usize, hidden: usize, seed: u64, dty
             .collect()
     };
     let mut t: HashMap<String, Tensor> = HashMap::new();
-    let r = |shape: (usize, usize), std: f32| -> Result<Tensor> { Ok(Tensor::from_vec(normal(shape.0 * shape.1, std, 0.0), shape, &dev)?.to_dtype(dtype)?) };
-    let ones = |n: usize| -> Result<Tensor> { Ok(Tensor::from_vec(normal(n, 0.1, 1.0), n, &dev)?.to_dtype(dtype)?) };
+    let r = |shape: (usize, usize), std: f32| -> Result<Tensor> {
+        Ok(Tensor::from_vec(normal(shape.0 * shape.1, std, 0.0), shape, &dev)?.to_dtype(dtype)?)
+    };
+    let ones = |n: usize| -> Result<Tensor> {
+        Ok(Tensor::from_vec(normal(n, 0.1, 1.0), n, &dev)?.to_dtype(dtype)?)
+    };
     t.insert("model.embed_tokens.weight".into(), r((vocab, hidden), 1.0)?);
     for i in 0..layers {
         let p = format!("model.layers.{i}");
-        t.insert(format!("{p}.self_attn.q_proj.weight"), r((heads * hd, hidden), 0.08)?);
-        t.insert(format!("{p}.self_attn.k_proj.weight"), r((kv * hd, hidden), 0.08)?);
-        t.insert(format!("{p}.self_attn.v_proj.weight"), r((kv * hd, hidden), 0.08)?);
-        t.insert(format!("{p}.self_attn.o_proj.weight"), r((hidden, heads * hd), 0.08)?);
-        t.insert(format!("{p}.mlp.gate_proj.weight"), r((inter, hidden), 0.08)?);
+        t.insert(
+            format!("{p}.self_attn.q_proj.weight"),
+            r((heads * hd, hidden), 0.08)?,
+        );
+        t.insert(
+            format!("{p}.self_attn.k_proj.weight"),
+            r((kv * hd, hidden), 0.08)?,
+        );
+        t.insert(
+            format!("{p}.self_attn.v_proj.weight"),
+            r((kv * hd, hidden), 0.08)?,
+        );
+        t.insert(
+            format!("{p}.self_attn.o_proj.weight"),
+            r((hidden, heads * hd), 0.08)?,
+        );
+        t.insert(
+            format!("{p}.mlp.gate_proj.weight"),
+            r((inter, hidden), 0.08)?,
+        );
         t.insert(format!("{p}.mlp.up_proj.weight"), r((inter, hidden), 0.08)?);
-        t.insert(format!("{p}.mlp.down_proj.weight"), r((hidden, inter), 0.08)?);
+        t.insert(
+            format!("{p}.mlp.down_proj.weight"),
+            r((hidden, inter), 0.08)?,
+        );
         t.insert(format!("{p}.input_layernorm.weight"), ones(hidden)?);
-        t.insert(format!("{p}.post_attention_layernorm.weight"), ones(hidden)?);
+        t.insert(
+            format!("{p}.post_attention_layernorm.weight"),
+            ones(hidden)?,
+        );
     }
     t.insert("model.norm.weight".into(), ones(hidden)?);
     t.insert("lm_head.weight".into(), r((vocab, hidden), 0.1)?);

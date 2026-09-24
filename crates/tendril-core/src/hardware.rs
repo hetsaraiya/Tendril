@@ -60,7 +60,7 @@ impl Backend {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase", tag = "kind", content = "value")]
+#[serde(rename_all = "lowercase")]
 pub enum ProfileSource {
     Detected,
     Preset(String),

@@ -14,7 +14,12 @@ pub enum Activation {
 pub enum RopeScaling {
     None,
     Linear(f64),
-    Llama3 { factor: f64, low_freq_factor: f64, high_freq_factor: f64, original_max: f64 },
+    Llama3 {
+        factor: f64,
+        low_freq_factor: f64,
+        high_freq_factor: f64,
+        original_max: f64,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -68,14 +73,21 @@ fn f(v: &Value, k: &str) -> Option<f64> {
 fn ids(v: Option<&Value>) -> Vec<u32> {
     match v {
         Some(Value::Number(n)) => n.as_u64().map(|x| vec![x as u32]).unwrap_or_default(),
-        Some(Value::Array(a)) => a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)).collect(),
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|x| x.as_u64().map(|x| x as u32))
+            .collect(),
         _ => vec![],
     }
 }
 
 fn parse_rope(v: &Value, default_theta: f64) -> (f64, RopeScaling) {
     let theta = f(v, "rope_theta").unwrap_or(default_theta);
-    let kind = v.get("rope_type").or_else(|| v.get("type")).and_then(|x| x.as_str()).unwrap_or("default");
+    let kind = v
+        .get("rope_type")
+        .or_else(|| v.get("type"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("default");
     let scaling = match kind {
         "linear" => RopeScaling::Linear(f(v, "factor").unwrap_or(1.0)),
         "llama3" => RopeScaling::Llama3 {
@@ -96,8 +108,15 @@ fn parse_rope(v: &Value, default_theta: f64) -> (f64, RopeScaling) {
 impl ModelConfig {
     pub fn from_json(raw: &Value) -> Result<ModelConfig> {
         let top_type = raw.get("model_type").and_then(|v| v.as_str()).unwrap_or("");
-        let c = raw.get("text_config").filter(|t| t.is_object()).unwrap_or(raw);
-        let model_type = c.get("model_type").and_then(|v| v.as_str()).unwrap_or(top_type).to_string();
+        let c = raw
+            .get("text_config")
+            .filter(|t| t.is_object())
+            .unwrap_or(raw);
+        let model_type = c
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or(top_type)
+            .to_string();
         let arch = Arch::from_hf(&model_type);
         if arch == Arch::Other {
             bail!(
@@ -125,25 +144,36 @@ impl ModelConfig {
         // RoPE: classic keys (rope_theta / rope_scaling) or transformers v5
         // `rope_parameters`, which may be keyed by layer type.
         let default_theta = f(c, "rope_theta").unwrap_or(10000.0);
-        let (rope_theta, rope_scaling, local) = match c.get("rope_parameters").filter(|v| v.is_object()) {
-            Some(rp) if rp.get("full_attention").is_some() || rp.get("sliding_attention").is_some() => {
-                let g = rp.get("full_attention").unwrap_or(rp);
-                let (gt, gs) = parse_rope(g, default_theta);
-                let local = rp.get("sliding_attention").map(|l| parse_rope(l, 10000.0));
-                (gt, gs, local)
-            }
-            Some(rp) => {
-                let (t, s) = parse_rope(rp, default_theta);
-                (t, s, None)
-            }
-            None => {
-                let scaling = c.get("rope_scaling").filter(|v| v.is_object()).map(|rs| parse_rope(rs, default_theta).1).unwrap_or(RopeScaling::None);
-                (default_theta, scaling, None)
-            }
-        };
+        let (rope_theta, rope_scaling, local) =
+            match c.get("rope_parameters").filter(|v| v.is_object()) {
+                Some(rp)
+                    if rp.get("full_attention").is_some()
+                        || rp.get("sliding_attention").is_some() =>
+                {
+                    let g = rp.get("full_attention").unwrap_or(rp);
+                    let (gt, gs) = parse_rope(g, default_theta);
+                    let local = rp.get("sliding_attention").map(|l| parse_rope(l, 10000.0));
+                    (gt, gs, local)
+                }
+                Some(rp) => {
+                    let (t, s) = parse_rope(rp, default_theta);
+                    (t, s, None)
+                }
+                None => {
+                    let scaling = c
+                        .get("rope_scaling")
+                        .filter(|v| v.is_object())
+                        .map(|rs| parse_rope(rs, default_theta).1)
+                        .unwrap_or(RopeScaling::None);
+                    (default_theta, scaling, None)
+                }
+            };
         let (rope_local_theta, rope_local_scaling) = match local {
             Some((t, s)) => (t, s),
-            None => (f(c, "rope_local_base_freq").unwrap_or(10000.0), RopeScaling::None),
+            None => (
+                f(c, "rope_local_base_freq").unwrap_or(10000.0),
+                RopeScaling::None,
+            ),
         };
         let window = u(c, "sliding_window");
         let mut layer_window = vec![None; layers];
@@ -155,16 +185,22 @@ impl ModelConfig {
             }
         } else if let Some(w) = window {
             match arch {
-                Arch::Gemma2 => (0..layers).filter(|i| i % 2 == 0).for_each(|i| layer_window[i] = Some(w)),
+                Arch::Gemma2 => (0..layers)
+                    .filter(|i| i % 2 == 0)
+                    .for_each(|i| layer_window[i] = Some(w)),
                 Arch::Gemma3 => {
                     let p = u(c, "sliding_window_pattern").unwrap_or(6).max(1);
-                    (0..layers).filter(|i| (i + 1) % p != 0).for_each(|i| layer_window[i] = Some(w));
+                    (0..layers)
+                        .filter(|i| (i + 1) % p != 0)
+                        .for_each(|i| layer_window[i] = Some(w));
                 }
                 Arch::Mistral => layer_window.iter_mut().for_each(|x| *x = Some(w)),
                 Arch::Qwen2 | Arch::Qwen3 => {
                     if c.get("use_sliding_window").and_then(|v| v.as_bool()) == Some(true) {
                         let max_window_layers = u(c, "max_window_layers").unwrap_or(layers);
-                        (0..layers).filter(|&i| i >= max_window_layers).for_each(|i| layer_window[i] = Some(w));
+                        (0..layers)
+                            .filter(|&i| i >= max_window_layers)
+                            .for_each(|i| layer_window[i] = Some(w));
                     }
                 }
                 _ => {}
@@ -186,25 +222,38 @@ impl ModelConfig {
             num_heads: heads,
             num_kv_heads: u(c, "num_key_value_heads").unwrap_or(heads),
             head_dim,
-            vocab_size: u(c, "vocab_size").or_else(|| u(raw, "vocab_size")).context("vocab_size missing")?,
+            vocab_size: u(c, "vocab_size")
+                .or_else(|| u(raw, "vocab_size"))
+                .context("vocab_size missing")?,
             max_position: u(c, "max_position_embeddings").unwrap_or(4096),
-            rms_eps: f(c, "rms_norm_eps").or_else(|| f(c, "layer_norm_eps")).unwrap_or(1e-6),
+            rms_eps: f(c, "rms_norm_eps")
+                .or_else(|| f(c, "layer_norm_eps"))
+                .unwrap_or(1e-6),
             rope_theta,
             rope_local_theta,
             rope_local_scaling,
             rope_scaling,
             tie_embeddings: tie,
             activation,
-            attention_bias: arch == Arch::Qwen2 || c.get("attention_bias").and_then(|v| v.as_bool()) == Some(true),
+            attention_bias: arch == Arch::Qwen2
+                || c.get("attention_bias").and_then(|v| v.as_bool()) == Some(true),
             qk_norm: matches!(arch, Arch::Qwen3 | Arch::Gemma3),
             gemma_norm: gemma,
             sandwich_norm: matches!(arch, Arch::Gemma2 | Arch::Gemma3),
             attn_softcap: f(c, "attn_logit_softcapping"),
             final_softcap: f(c, "final_logit_softcapping"),
-            query_pre_attn_scalar: if matches!(arch, Arch::Gemma2 | Arch::Gemma3) { f(c, "query_pre_attn_scalar") } else { None },
+            query_pre_attn_scalar: if matches!(arch, Arch::Gemma2 | Arch::Gemma3) {
+                f(c, "query_pre_attn_scalar")
+            } else {
+                None
+            },
             layer_window,
             fused_qkv: arch == Arch::Phi3,
-            bos_token_id: c.get("bos_token_id").or_else(|| raw.get("bos_token_id")).and_then(|v| v.as_u64()).map(|x| x as u32),
+            bos_token_id: c
+                .get("bos_token_id")
+                .or_else(|| raw.get("bos_token_id"))
+                .and_then(|v| v.as_u64())
+                .map(|x| x as u32),
             eos_token_ids: eos,
             torch_dtype: c
                 .get("torch_dtype")
@@ -217,12 +266,17 @@ impl ModelConfig {
     }
 
     pub fn from_file(path: &std::path::Path) -> Result<ModelConfig> {
-        let raw: Value = serde_json::from_slice(&std::fs::read(path).with_context(|| format!("read {}", path.display()))?)
-            .context("config.json is not valid JSON")?;
+        let raw: Value = serde_json::from_slice(
+            &std::fs::read(path).with_context(|| format!("read {}", path.display()))?,
+        )
+        .context("config.json is not valid JSON")?;
         Self::from_json(&raw)
     }
 
     pub fn attn_scale(&self) -> f64 {
-        1.0 / self.query_pre_attn_scalar.unwrap_or(self.head_dim as f64).sqrt()
+        1.0 / self
+            .query_pre_attn_scalar
+            .unwrap_or(self.head_dim as f64)
+            .sqrt()
     }
 }

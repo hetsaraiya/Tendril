@@ -14,7 +14,10 @@ pub struct ChatMessage {
 
 impl ChatMessage {
     pub fn new(role: &str, content: &str) -> Self {
-        ChatMessage { role: role.into(), content: content.into() }
+        ChatMessage {
+            role: role.into(),
+            content: content.into(),
+        }
     }
 }
 
@@ -75,13 +78,19 @@ impl Tok {
         if template.is_none() {
             if let Ok(j) = std::fs::read(dir.join("chat_template.json")) {
                 if let Ok(v) = serde_json::from_slice::<Value>(&j) {
-                    template = v.get("chat_template").and_then(|t| t.as_str()).map(String::from);
+                    template = v
+                        .get("chat_template")
+                        .and_then(|t| t.as_str())
+                        .map(String::from);
                 }
             }
         }
         let bos_token = token_str(tc.get("bos_token"));
         let eos_token = token_str(tc.get("eos_token"));
-        let add_bos = tc.get("add_bos_token").and_then(|v| v.as_bool()).unwrap_or(false);
+        let add_bos = tc
+            .get("add_bos_token")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let gen: Value = std::fs::read(dir.join("generation_config.json"))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
@@ -91,7 +100,9 @@ impl Tok {
             Some(Value::Number(n)) => {
                 stop_ids.insert(n.as_u64().unwrap_or(0) as u32);
             }
-            Some(Value::Array(a)) => stop_ids.extend(a.iter().filter_map(|x| x.as_u64().map(|x| x as u32))),
+            Some(Value::Array(a)) => {
+                stop_ids.extend(a.iter().filter_map(|x| x.as_u64().map(|x| x as u32)))
+            }
             _ => {}
         }
         if let Some(e) = &eos_token {
@@ -104,8 +115,19 @@ impl Tok {
                 stop_ids.insert(id);
             }
         }
-        let bos_id = bos_token.as_deref().and_then(|b| inner.token_to_id(b)).or(config_bos);
-        Ok(Tok { inner, template, bos_token, eos_token, add_bos, bos_id, stop_ids })
+        let bos_id = bos_token
+            .as_deref()
+            .and_then(|b| inner.token_to_id(b))
+            .or(config_bos);
+        Ok(Tok {
+            inner,
+            template,
+            bos_token,
+            eos_token,
+            add_bos,
+            bos_id,
+            stop_ids,
+        })
     }
 
     pub fn has_chat_template(&self) -> bool {
@@ -117,16 +139,29 @@ impl Tok {
     }
 
     /// Render messages with the model's chat template (ChatML if it has none).
-    pub fn render_chat(&self, messages: &[ChatMessage], add_generation_prompt: bool) -> Result<String> {
+    pub fn render_chat(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+    ) -> Result<String> {
         let tpl = self.template.clone().unwrap_or_else(|| CHATML.to_string());
         let mut env = minijinja::Environment::new();
         minijinja_contrib::add_to_environment(&mut env);
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_function("raise_exception", |msg: String| -> Result<String, minijinja::Error> {
-            Err(minijinja::Error::new(minijinja::ErrorKind::InvalidOperation, msg))
+        env.add_function(
+            "raise_exception",
+            |msg: String| -> Result<String, minijinja::Error> {
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    msg,
+                ))
+            },
+        );
+        env.add_function("strftime_now", |fmt: String| -> String {
+            chrono::Local::now().format(&fmt).to_string()
         });
-        env.add_function("strftime_now", |fmt: String| -> String { chrono::Local::now().format(&fmt).to_string() });
-        env.add_template("chat", &tpl).map_err(|e| anyhow!("chat template does not parse: {e}"))?;
+        env.add_template("chat", &tpl)
+            .map_err(|e| anyhow!("chat template does not parse: {e}"))?;
         let t = env.get_template("chat").unwrap();
         let out = t
             .render(minijinja::context! {
@@ -144,7 +179,10 @@ impl Tok {
     pub fn encode_chat(&self, messages: &[ChatMessage]) -> Result<Vec<u32>> {
         let text = self.render_chat(messages, true)?;
         let mut ids = self.encode(&text, false)?;
-        let has_bos_text = self.bos_token.as_deref().is_some_and(|b| !b.is_empty() && text.starts_with(b));
+        let has_bos_text = self
+            .bos_token
+            .as_deref()
+            .is_some_and(|b| !b.is_empty() && text.starts_with(b));
         if self.add_bos && !has_bos_text {
             if let Some(b) = self.bos_id {
                 if ids.first() != Some(&b) {
@@ -156,7 +194,10 @@ impl Tok {
     }
 
     pub fn encode(&self, text: &str, add_special: bool) -> Result<Vec<u32>> {
-        let e = self.inner.encode(text, add_special).map_err(|e| anyhow!("tokenize: {e}"))?;
+        let e = self
+            .inner
+            .encode(text, add_special)
+            .map_err(|e| anyhow!("tokenize: {e}"))?;
         Ok(e.get_ids().to_vec())
     }
 
@@ -174,7 +215,9 @@ impl Tok {
     }
 
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
-        self.inner.decode(ids, true).map_err(|e| anyhow!("detokenize: {e}"))
+        self.inner
+            .decode(ids, true)
+            .map_err(|e| anyhow!("detokenize: {e}"))
     }
 
     pub fn is_stop(&self, id: u32) -> bool {
@@ -197,7 +240,11 @@ impl Default for Detokenizer {
 
 impl Detokenizer {
     pub fn new() -> Self {
-        Detokenizer { ids: Vec::new(), prefix: 0, read: 0 }
+        Detokenizer {
+            ids: Vec::new(),
+            prefix: 0,
+            read: 0,
+        }
     }
 
     pub fn push(&mut self, tok: &Tok, id: u32) -> Result<String> {

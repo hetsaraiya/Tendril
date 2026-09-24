@@ -7,6 +7,7 @@ on:
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -19,3 +20,21 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
+      - name: Build with Metal
+        if: runner.os == 'macOS'
+        run: cargo build -p tendril-cli --features metal
+
+  # Compare the engine against HuggingFace transformers on tiny random models
+  # of every supported architecture.
+  reference:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu && pip install transformers safetensors
+      - run: python tools/make_test_models.py /tmp/tendril-models
+      - run: TENDRIL_TEST_MODELS=/tmp/tendril-models cargo test -p tendril-engine --test reference -- --nocapture

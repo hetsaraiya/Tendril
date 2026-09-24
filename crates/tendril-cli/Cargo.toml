@@ -9,15 +9,32 @@ license.workspace = true
 name = "tendril"
 path = "src/main.rs"
 
+[features]
+default = []
+metal = ["tendril-engine/metal"]
+cuda = ["tendril-engine/cuda"]
+accelerate = ["tendril-engine/accelerate"]
+
 [dependencies]
 tendril-core.workspace = true
+tendril-engine = { path = "../tendril-engine" }
+tendril-cluster = { path = "../tendril-cluster" }
+tokio = { version = "1", features = ["full"] }
+axum = "0.8"
+indicatif = "0.18"
+futures = "0.3"
+candle-core = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+local-ip-address = "0.6"
+ctrlc = "3"
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
 owo-colors.workspace = true
 sysinfo.workspace = true
-reqwest.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "stream", "rustls-tls-native-roots", "rustls-tls-webpki-roots", "http2"] }
 dirs.workspace = true
 
 [target.'cfg(unix)'.dependencies]

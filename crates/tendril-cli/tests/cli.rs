@@ -15,7 +15,18 @@ fn tendril(args: &[&str]) -> (bool, String) {
 
 #[test]
 fn plans_two_macs() {
-    let (ok, out) = tendril(&["plan", "gemma-2-9b", "--node", "a=m4:16", "--node", "b=m5:16", "--quantize", "q8_0", "--link", "tb"]);
+    let (ok, out) = tendril(&[
+        "plan",
+        "gemma-2-9b",
+        "--node",
+        "a=m4:16",
+        "--node",
+        "b=m5:16",
+        "--quantize",
+        "q8_0",
+        "--link",
+        "tb",
+    ]);
     assert!(ok, "{out}");
     assert!(out.contains("Runs across 2 machines"), "{out}");
     assert!(out.contains("final norm + LM head"), "{out}");

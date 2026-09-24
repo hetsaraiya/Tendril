@@ -25,7 +25,12 @@ pub struct StageSpec {
 
 impl StageSpec {
     pub fn whole(cfg: &ModelConfig) -> StageSpec {
-        StageSpec { layer_start: 0, layer_end: cfg.num_layers, embed: true, head: true }
+        StageSpec {
+            layer_start: 0,
+            layer_end: cfg.num_layers,
+            embed: true,
+            head: true,
+        }
     }
     pub fn layers(&self) -> usize {
         self.layer_end - self.layer_start
@@ -38,15 +43,28 @@ struct RmsNorm {
 }
 
 impl RmsNorm {
-    fn load(ws: &WeightStore, name: &str, cfg: &ModelConfig, dev: &Device, dtype: DType) -> Result<RmsNorm> {
+    fn load(
+        ws: &WeightStore,
+        name: &str,
+        cfg: &ModelConfig,
+        dev: &Device,
+        dtype: DType,
+    ) -> Result<RmsNorm> {
         let mut w = ws.tensor(name, &Device::Cpu, DType::F32)?;
         if cfg.gemma_norm {
             w = (w + 1.0)?;
         }
-        Ok(RmsNorm { w: w.to_dtype(dtype)?.to_device(dev)?, eps: cfg.rms_eps })
+        Ok(RmsNorm {
+            w: w.to_dtype(dtype)?.to_device(dev)?,
+            eps: cfg.rms_eps,
+        })
     }
     fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        Ok(candle_nn::ops::rms_norm(&x.contiguous()?, &self.w, self.eps as f32)?)
+        Ok(candle_nn::ops::rms_norm(
+            &x.contiguous()?,
+            &self.w,
+            self.eps as f32,
+        )?)
     }
 }
 
@@ -61,13 +79,26 @@ struct Rope {
 }
 
 impl Rope {
-    fn new(cfg: &ModelConfig, theta: f64, scaling: &RopeScaling, dtype: DType, device: &Device) -> Result<Rope> {
+    fn new(
+        cfg: &ModelConfig,
+        theta: f64,
+        scaling: &RopeScaling,
+        dtype: DType,
+        device: &Device,
+    ) -> Result<Rope> {
         let d = cfg.head_dim;
-        let mut inv: Vec<f32> = (0..d / 2).map(|i| (1.0 / theta.powf(2.0 * i as f64 / d as f64)) as f32).collect();
+        let mut inv: Vec<f32> = (0..d / 2)
+            .map(|i| (1.0 / theta.powf(2.0 * i as f64 / d as f64)) as f32)
+            .collect();
         match scaling {
             RopeScaling::None => {}
             RopeScaling::Linear(f) => inv.iter_mut().for_each(|x| *x /= *f as f32),
-            RopeScaling::Llama3 { factor, low_freq_factor, high_freq_factor, original_max } => {
+            RopeScaling::Llama3 {
+                factor,
+                low_freq_factor,
+                high_freq_factor,
+                original_max,
+            } => {
                 let low_wl = original_max / low_freq_factor;
                 let high_wl = original_max / high_freq_factor;
                 for x in inv.iter_mut() {
@@ -78,7 +109,8 @@ impl Rope {
                     } else if wl > low_wl {
                         f / factor
                     } else {
-                        let smooth = (original_max / wl - low_freq_factor) / (high_freq_factor - low_freq_factor);
+                        let smooth = (original_max / wl - low_freq_factor)
+                            / (high_freq_factor - low_freq_factor);
                         (1.0 - smooth) * f / factor + smooth * f
                     } as f32;
                 }
@@ -136,11 +168,21 @@ struct LayerKv {
 
 impl LayerKv {
     fn new() -> LayerKv {
-        LayerKv { k: None, v: None, len: 0, offset: 0 }
+        LayerKv {
+            k: None,
+            v: None,
+            len: 0,
+            offset: 0,
+        }
     }
 
     /// Append [1, kv, seq, hd] and return views of all cached entries.
-    fn append(&mut self, k: &Tensor, v: &Tensor, window: Option<usize>) -> Result<(Tensor, Tensor)> {
+    fn append(
+        &mut self,
+        k: &Tensor,
+        v: &Tensor,
+        window: Option<usize>,
+    ) -> Result<(Tensor, Tensor)> {
         let seq = k.dim(2)?;
         // Sliding-window layers: drop entries no query can see any more, before
         // appending (the returned views alias the cache storage).
@@ -180,7 +222,10 @@ impl LayerKv {
     }
 
     fn bytes(&self) -> usize {
-        self.k.as_ref().map(|t| 2 * t.elem_count() * t.dtype().size_in_bytes()).unwrap_or(0)
+        self.k
+            .as_ref()
+            .map(|t| 2 * t.elem_count() * t.dtype().size_in_bytes())
+            .unwrap_or(0)
     }
 }
 
@@ -267,9 +312,19 @@ fn gelu_tanh(x: &Tensor) -> Result<Tensor> {
 }
 
 impl Stage {
-    pub fn load(cfg: Arc<ModelConfig>, ws: &WeightStore, spec: StageSpec, opts: &LoadOptions) -> Result<Stage> {
+    pub fn load(
+        cfg: Arc<ModelConfig>,
+        ws: &WeightStore,
+        spec: StageSpec,
+        opts: &LoadOptions,
+    ) -> Result<Stage> {
         if spec.layer_end > cfg.num_layers || spec.layer_start > spec.layer_end {
-            bail!("stage layers {}..{} out of range (model has {})", spec.layer_start, spec.layer_end, cfg.num_layers);
+            bail!(
+                "stage layers {}..{} out of range (model has {})",
+                spec.layer_start,
+                spec.layer_end,
+                cfg.num_layers
+            );
         }
         let dev = &opts.device;
         let dt = opts.dtype;
@@ -282,8 +337,13 @@ impl Stage {
         let embed_name = n("embed_tokens.weight");
         let embed = if spec.embed {
             // Embeddings are a lookup table: keep native precision unless quantizing hard.
-            let efmt = if matches!(fmt, WeightFormat::Native) { WeightFormat::Native } else { WeightFormat::Q8_0 };
-            let e = Linear::load(ws, &embed_name, None, dev, dt, efmt).context("loading embeddings")?;
+            let efmt = if matches!(fmt, WeightFormat::Native) {
+                WeightFormat::Native
+            } else {
+                WeightFormat::Q8_0
+            };
+            let e =
+                Linear::load(ws, &embed_name, None, dev, dt, efmt).context("loading embeddings")?;
             weight_bytes += e.bytes();
             Some(e)
         } else {
@@ -296,7 +356,14 @@ impl Stage {
             let lin = |name: &str, bias: bool| -> Result<Linear> {
                 let full = p(name);
                 let b = format!("{}.bias", full.trim_end_matches(".weight"));
-                Linear::load(ws, &full, if bias { Some(b.as_str()) } else { None }, dev, dt, fmt)
+                Linear::load(
+                    ws,
+                    &full,
+                    if bias { Some(b.as_str()) } else { None },
+                    dev,
+                    dt,
+                    fmt,
+                )
             };
             let (q, k, v) = if cfg.fused_qkv {
                 let w = ws.tensor(&p("self_attn.qkv_proj.weight"), &Device::Cpu, DType::F32)?;
@@ -325,12 +392,18 @@ impl Stage {
                     Linear::from_f32(&w.narrow(0, h, h)?, None, dev, dt, fmt, native)?,
                 )
             } else {
-                (lin("mlp.gate_proj.weight", false)?, lin("mlp.up_proj.weight", false)?)
+                (
+                    lin("mlp.gate_proj.weight", false)?,
+                    lin("mlp.up_proj.weight", false)?,
+                )
             };
             let down = lin("mlp.down_proj.weight", false)?;
             let norm = |name: &str| RmsNorm::load(ws, &p(name), &cfg, dev, dt);
             let (q_norm, k_norm) = if cfg.qk_norm {
-                (Some(norm("self_attn.q_norm.weight")?), Some(norm("self_attn.k_norm.weight")?))
+                (
+                    Some(norm("self_attn.q_norm.weight")?),
+                    Some(norm("self_attn.k_norm.weight")?),
+                )
             } else {
                 (None, None)
             };
@@ -372,14 +445,20 @@ impl Stage {
                 GateUp::Split(a, b) => a.bytes() + b.bytes(),
             };
             let layer = Layer {
-                attn: Attention { qkv, o, q_norm, k_norm },
+                attn: Attention {
+                    qkv,
+                    o,
+                    q_norm,
+                    k_norm,
+                },
                 mlp: Mlp { gate_up, down },
                 input_norm: norm("input_layernorm.weight")?,
                 post_attn_norm,
                 pre_ff_norm,
                 post_ff_norm,
                 window: cfg.layer_window.get(i).copied().flatten(),
-                local_rope: cfg.arch == tendril_core::model::Arch::Gemma3 && cfg.layer_window.get(i).copied().flatten().is_some(),
+                local_rope: cfg.arch == tendril_core::model::Arch::Gemma3
+                    && cfg.layer_window.get(i).copied().flatten().is_some(),
             };
             layers.push(layer);
         }
@@ -391,7 +470,8 @@ impl Stage {
                 Some(h) if ws.has(h) && !ws.has(&embed_name) => h.to_string(),
                 _ => embed_name.clone(),
             };
-            let head = Linear::load(ws, &head_name, None, dev, dt, fmt).context("loading output head")?;
+            let head =
+                Linear::load(ws, &head_name, None, dev, dt, fmt).context("loading output head")?;
             weight_bytes += head.bytes();
             (Some(norm), Some(head))
         } else {
@@ -400,7 +480,13 @@ impl Stage {
 
         let rope = Rope::new(&cfg, cfg.rope_theta, &cfg.rope_scaling, dt, dev)?;
         let rope_local = if cfg.arch == tendril_core::model::Arch::Gemma3 {
-            Some(Rope::new(&cfg, cfg.rope_local_theta, &cfg.rope_local_scaling, dt, dev)?)
+            Some(Rope::new(
+                &cfg,
+                cfg.rope_local_theta,
+                &cfg.rope_local_scaling,
+                dt,
+                dev,
+            )?)
         } else {
             None
         };
@@ -437,24 +523,41 @@ impl Stage {
     }
 
     pub fn kv_bytes(&self) -> usize {
-        self.seqs.values().flat_map(|s| s.kv.iter()).map(|k| k.bytes()).sum()
+        self.seqs
+            .values()
+            .flat_map(|s| s.kv.iter())
+            .map(|k| k.bytes())
+            .sum()
     }
 
     /// Run this stage for `seq` starting at absolute position `pos`.
     /// `want_logits` lets non-final prefill chunks skip the output head.
-    pub fn forward(&mut self, seq: u64, pos: usize, input: StageInput, want_logits: bool) -> Result<StageOutput> {
+    pub fn forward(
+        &mut self,
+        seq: u64,
+        pos: usize,
+        input: StageInput,
+        want_logits: bool,
+    ) -> Result<StageOutput> {
         let n_layers = self.layers.len();
-        let state = self.seqs.entry(seq).or_insert_with(|| SeqState { kv: (0..n_layers).map(|_| LayerKv::new()).collect(), pos: 0 });
+        let state = self.seqs.entry(seq).or_insert_with(|| SeqState {
+            kv: (0..n_layers).map(|_| LayerKv::new()).collect(),
+            pos: 0,
+        });
         if state.pos != pos {
             bail!("sequence {seq}: expected position {}, got {pos} (out-of-order or duplicate message)", state.pos);
         }
         let cfg = self.cfg.clone();
         let mut x = match input {
             StageInput::Tokens(ids) => {
-                let e = self.embed.as_ref().context("this stage does not own the embeddings")?;
+                let e = self
+                    .embed
+                    .as_ref()
+                    .context("this stage does not own the embeddings")?;
                 let t = e.rows(&ids, &self.device, self.dtype)?.unsqueeze(0)?;
                 if cfg.gemma_norm {
-                    let s = Tensor::new((cfg.hidden_size as f32).sqrt(), &self.device)?.to_dtype(self.dtype)?;
+                    let s = Tensor::new((cfg.hidden_size as f32).sqrt(), &self.device)?
+                        .to_dtype(self.dtype)?;
                     t.broadcast_mul(&s)?
                 } else {
                     t
@@ -465,7 +568,11 @@ impl Stage {
         let seq_len = x.dim(1)?;
         let state = self.seqs.get_mut(&seq).unwrap();
         for (li, layer) in self.layers.iter().enumerate() {
-            let rope = if layer.local_rope { self.rope_local.as_mut().unwrap() } else { &mut self.rope };
+            let rope = if layer.local_rope {
+                self.rope_local.as_mut().unwrap()
+            } else {
+                &mut self.rope
+            };
             x = layer_forward(layer, &cfg, rope, &mut state.kv[li], &x, pos)?;
         }
         state.pos += seq_len;
@@ -478,7 +585,12 @@ impl Stage {
         }
         let last = x.narrow(1, seq_len - 1, 1)?;
         let h = self.norm.as_ref().unwrap().forward(&last)?;
-        let mut logits = self.head.as_ref().unwrap().forward(&h)?.to_dtype(DType::F32)?;
+        let mut logits = self
+            .head
+            .as_ref()
+            .unwrap()
+            .forward(&h)?
+            .to_dtype(DType::F32)?;
         if let Some(cap) = cfg.final_softcap {
             logits = ((logits / cap)?.tanh()? * cap)?;
         }
@@ -486,7 +598,14 @@ impl Stage {
     }
 }
 
-fn layer_forward(l: &Layer, cfg: &ModelConfig, rope: &mut Rope, kv: &mut LayerKv, x: &Tensor, pos: usize) -> Result<Tensor> {
+fn layer_forward(
+    l: &Layer,
+    cfg: &ModelConfig,
+    rope: &mut Rope,
+    kv: &mut LayerKv,
+    x: &Tensor,
+    pos: usize,
+) -> Result<Tensor> {
     let residual = x;
     let h = l.input_norm.forward(x)?;
     let a = attention(l, cfg, rope, kv, &h, pos)?;
@@ -519,13 +638,24 @@ fn layer_forward(l: &Layer, cfg: &ModelConfig, rope: &mut Rope, kv: &mut LayerKv
     Ok((x + m)?)
 }
 
-fn attention(l: &Layer, cfg: &ModelConfig, rope: &mut Rope, kv: &mut LayerKv, x: &Tensor, pos: usize) -> Result<Tensor> {
+fn attention(
+    l: &Layer,
+    cfg: &ModelConfig,
+    rope: &mut Rope,
+    kv: &mut LayerKv,
+    x: &Tensor,
+    pos: usize,
+) -> Result<Tensor> {
     let (b, seq, _) = x.dims3()?;
     let (nh, nkv, hd) = (cfg.num_heads, cfg.num_kv_heads, cfg.head_dim);
     let (q, k, v) = match &l.attn.qkv {
         Qkv::Fused(f) => {
             let y = f.forward(x)?;
-            (y.narrow(2, 0, nh * hd)?, y.narrow(2, nh * hd, nkv * hd)?, y.narrow(2, (nh + nkv) * hd, nkv * hd)?)
+            (
+                y.narrow(2, 0, nh * hd)?,
+                y.narrow(2, nh * hd, nkv * hd)?,
+                y.narrow(2, (nh + nkv) * hd, nkv * hd)?,
+            )
         }
         Qkv::Split(q, k, v) => (q.forward(x)?, k.forward(x)?, v.forward(x)?),
     };
@@ -548,7 +678,9 @@ fn attention(l: &Layer, cfg: &ModelConfig, rope: &mut Rope, kv: &mut LayerKv, x:
     let groups = nh / nkv;
     let q = (q.contiguous()? * cfg.attn_scale())?;
     let q = q.reshape((b, nkv, groups * seq, hd))?;
-    let mut scores = q.matmul(&k_all.transpose(2, 3)?.contiguous()?)?.to_dtype(DType::F32)?;
+    let mut scores = q
+        .matmul(&k_all.transpose(2, 3)?.contiguous()?)?
+        .to_dtype(DType::F32)?;
     if let Some(cap) = cfg.attn_softcap {
         scores = ((scores / cap)?.tanh()? * cap)?;
     }
@@ -567,12 +699,17 @@ fn attention(l: &Layer, cfg: &ModelConfig, rope: &mut Rope, kv: &mut LayerKv, x:
         }
         let mask = Tensor::from_vec(m, (seq, total), x.device())?;
         // Rows are ordered (group, seq): repeat the mask per group.
-        let mask = mask.unsqueeze(0)?.repeat((groups, 1, 1))?.reshape((groups * seq, total))?;
+        let mask = mask
+            .unsqueeze(0)?
+            .repeat((groups, 1, 1))?
+            .reshape((groups * seq, total))?;
         scores = scores.broadcast_add(&mask)?;
     }
     let probs = candle_nn::ops::softmax_last_dim(&scores)?.to_dtype(v_all.dtype())?;
     let out = probs.matmul(&v_all.contiguous()?)?; // [b, nkv, groups*seq, hd]
-    let out = out.reshape((b, nh, seq, hd))?.transpose(1, 2)?.reshape((b, seq, nh * hd))?;
+    let out = out
+        .reshape((b, nh, seq, hd))?
+        .transpose(1, 2)?
+        .reshape((b, seq, nh * hd))?;
     l.attn.o.forward(&out)
 }
-

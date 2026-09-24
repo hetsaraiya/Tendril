@@ -73,7 +73,11 @@ impl StopMatcher {
     pub fn new(stops: Vec<String>) -> Self {
         let stops: Vec<String> = stops.into_iter().filter(|s| !s.is_empty()).collect();
         let max_len = stops.iter().map(|s| s.len()).max().unwrap_or(0);
-        StopMatcher { stops, pending: String::new(), max_len }
+        StopMatcher {
+            stops,
+            pending: String::new(),
+            max_len,
+        }
     }
 
     /// Returns (text safe to emit, stopped).
@@ -82,7 +86,12 @@ impl StopMatcher {
             return (delta.to_string(), false);
         }
         self.pending.push_str(delta);
-        if let Some((idx, _)) = self.stops.iter().filter_map(|s| self.pending.find(s.as_str()).map(|i| (i, s))).min_by_key(|(i, _)| *i) {
+        if let Some((idx, _)) = self
+            .stops
+            .iter()
+            .filter_map(|s| self.pending.find(s.as_str()).map(|i| (i, s)))
+            .min_by_key(|(i, _)| *i)
+        {
             let out = self.pending[..idx].to_string();
             self.pending.clear();
             return (out, true);
@@ -91,7 +100,9 @@ impl StopMatcher {
         let mut keep = 0;
         for s in &self.stops {
             for l in (1..s.len().min(self.pending.len() + 1)).rev() {
-                if self.pending.is_char_boundary(self.pending.len() - l) && s.starts_with(&self.pending[self.pending.len() - l..]) {
+                if self.pending.is_char_boundary(self.pending.len() - l)
+                    && s.starts_with(&self.pending[self.pending.len() - l..])
+                {
                     keep = keep.max(l);
                     break;
                 }
@@ -128,9 +139,14 @@ impl ModelFiles {
             bail!("{} has no config.json", dir.display());
         }
         if !dir.join("tokenizer.json").exists() {
-            bail!("{} has no tokenizer.json (Tendril needs the HuggingFace tokenizer file)", dir.display());
+            bail!(
+                "{} has no tokenizer.json (Tendril needs the HuggingFace tokenizer file)",
+                dir.display()
+            );
         }
-        Ok(ModelFiles { dir: dir.to_path_buf() })
+        Ok(ModelFiles {
+            dir: dir.to_path_buf(),
+        })
     }
     pub fn config(&self) -> Result<ModelConfig> {
         ModelConfig::from_file(&self.dir.join("config.json"))
@@ -146,7 +162,10 @@ pub struct GenerateRequest {
 
 pub enum GenEvent<'a> {
     Text(&'a str),
-    Done { reason: FinishReason, timing: &'a Timing },
+    Done {
+        reason: FinishReason,
+        timing: &'a Timing,
+    },
 }
 
 /// A model with every stage in this process.
@@ -159,15 +178,33 @@ pub struct LocalModel {
 }
 
 impl LocalModel {
-    pub fn load(files: ModelFiles, device: Device, format: WeightFormat, specs: Option<Vec<StageSpec>>) -> Result<LocalModel> {
+    pub fn load(
+        files: ModelFiles,
+        device: Device,
+        format: WeightFormat,
+        specs: Option<Vec<StageSpec>>,
+    ) -> Result<LocalModel> {
         let cfg = Arc::new(files.config()?);
         let tok = Tok::from_dir(&files.dir, &cfg.eos_token_ids, cfg.bos_token_id)?;
         let ws = WeightStore::open_dir(&files.dir)?;
         let dtype = activation_dtype(&device, &cfg.torch_dtype);
-        let opts = LoadOptions { format, device, dtype };
+        let opts = LoadOptions {
+            format,
+            device,
+            dtype,
+        };
         let specs = specs.unwrap_or_else(|| vec![StageSpec::whole(&cfg)]);
-        let stages = specs.iter().map(|s| Stage::load(cfg.clone(), &ws, *s, &opts)).collect::<Result<Vec<_>>>()?;
-        Ok(LocalModel { cfg, tok, stages, files, next_seq: 1 })
+        let stages = specs
+            .iter()
+            .map(|s| Stage::load(cfg.clone(), &ws, *s, &opts))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(LocalModel {
+            cfg,
+            tok,
+            stages,
+            files,
+            next_seq: 1,
+        })
     }
 
     pub fn weight_bytes(&self) -> usize {
@@ -193,11 +230,18 @@ impl LocalModel {
     }
 
     /// Generate, calling `on` for every piece of text. Return false from `on` to cancel.
-    pub fn generate(&mut self, req: GenerateRequest, mut on: impl FnMut(GenEvent) -> bool) -> Result<Timing> {
+    pub fn generate(
+        &mut self,
+        req: GenerateRequest,
+        mut on: impl FnMut(GenEvent) -> bool,
+    ) -> Result<Timing> {
         let seq = self.next_seq;
         self.next_seq += 1;
         let t0 = Instant::now();
-        let mut timing = Timing { prompt_tokens: req.prompt.len(), ..Default::default() };
+        let mut timing = Timing {
+            prompt_tokens: req.prompt.len(),
+            ..Default::default()
+        };
         if req.prompt.is_empty() {
             bail!("empty prompt");
         }
@@ -259,7 +303,10 @@ impl LocalModel {
         }
         self.release(seq);
         timing.total_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        on(GenEvent::Done { reason, timing: &timing });
+        on(GenEvent::Done {
+            reason,
+            timing: &timing,
+        });
         Ok(timing)
     }
 }
@@ -283,13 +330,27 @@ mod tests {
     fn generates_from_tiny_model() {
         let dir = tempfile::tempdir().unwrap();
         crate::testing::write_tiny_llama(dir.path(), 3, 64, 1, candle_core::DType::F32).unwrap();
-        let mut m = LocalModel::load(ModelFiles::new(dir.path()).unwrap(), Device::Cpu, WeightFormat::Native, None).unwrap();
-        let prompt = m.tok.encode_chat(&[crate::tokenizer::ChatMessage::new("user", "hi")]).unwrap();
+        let mut m = LocalModel::load(
+            ModelFiles::new(dir.path()).unwrap(),
+            Device::Cpu,
+            WeightFormat::Native,
+            None,
+        )
+        .unwrap();
+        let prompt = m
+            .tok
+            .encode_chat(&[crate::tokenizer::ChatMessage::new("user", "hi")])
+            .unwrap();
         assert_eq!(prompt[0], 3, "ChatML starts with <|im_start|>");
         let mut text = String::new();
         let t = m
             .generate(
-                GenerateRequest { prompt: prompt.clone(), params: SamplingParams::greedy(), max_tokens: 12, stop: vec![] },
+                GenerateRequest {
+                    prompt: prompt.clone(),
+                    params: SamplingParams::greedy(),
+                    max_tokens: 12,
+                    stop: vec![],
+                },
                 |e| {
                     if let GenEvent::Text(s) = e {
                         text.push_str(s);
@@ -301,17 +362,41 @@ mod tests {
         assert!(t.completion_tokens >= 1);
         // Split into two stages: identical greedy output.
         let specs = vec![
-            StageSpec { layer_start: 0, layer_end: 1, embed: true, head: false },
-            StageSpec { layer_start: 1, layer_end: 3, embed: false, head: true },
+            StageSpec {
+                layer_start: 0,
+                layer_end: 1,
+                embed: true,
+                head: false,
+            },
+            StageSpec {
+                layer_start: 1,
+                layer_end: 3,
+                embed: false,
+                head: true,
+            },
         ];
-        let mut m2 = LocalModel::load(ModelFiles::new(dir.path()).unwrap(), Device::Cpu, WeightFormat::Native, Some(specs)).unwrap();
+        let mut m2 = LocalModel::load(
+            ModelFiles::new(dir.path()).unwrap(),
+            Device::Cpu,
+            WeightFormat::Native,
+            Some(specs),
+        )
+        .unwrap();
         let mut text2 = String::new();
-        m2.generate(GenerateRequest { prompt, params: SamplingParams::greedy(), max_tokens: 12, stop: vec![] }, |e| {
-            if let GenEvent::Text(s) = e {
-                text2.push_str(s);
-            }
-            true
-        })
+        m2.generate(
+            GenerateRequest {
+                prompt,
+                params: SamplingParams::greedy(),
+                max_tokens: 12,
+                stop: vec![],
+            },
+            |e| {
+                if let GenEvent::Text(s) = e {
+                    text2.push_str(s);
+                }
+                true
+            },
+        )
         .unwrap();
         assert_eq!(text, text2);
         assert_eq!(m.stages[0].active_seqs(), 0, "KV released after generation");

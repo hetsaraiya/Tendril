@@ -56,7 +56,11 @@ impl Pool {
                 .spawn(move || worker(s))
                 .expect("spawn kernel thread");
         }
-        Pool { shared, workers, submit: Mutex::new(()) }
+        Pool {
+            shared,
+            workers,
+            submit: Mutex::new(()),
+        }
     }
 
     pub fn threads(&self) -> usize {
@@ -77,7 +81,8 @@ impl Pool {
         // SAFETY: see `Shared`; we erase the lifetime but block until every
         // worker has finished with the pointer.
         unsafe {
-            let ptr: *const Job = std::mem::transmute::<&(dyn Fn(usize) + Sync), &'static (dyn Fn(usize) + Sync)>(f);
+            let ptr: *const Job =
+                std::mem::transmute::<&(dyn Fn(usize) + Sync), &'static (dyn Fn(usize) + Sync)>(f);
             *s.job.get() = Some(ptr);
         }
         s.next.store(0, Ordering::Relaxed);
@@ -121,17 +126,20 @@ fn worker(s: Arc<Shared>) {
                 break;
             }
             spins = spins.wrapping_add(1);
-            if spins % 256 == 0 && start.elapsed() > SPIN {
+            if spins.is_multiple_of(256) && start.elapsed() > SPIN {
                 let guard = s.park.lock().unwrap_or_else(|e| e.into_inner());
                 s.sleepers.fetch_add(1, Ordering::AcqRel);
                 let guard = if s.gen.load(Ordering::Acquire) == seen {
-                    s.wake.wait_timeout(guard, Duration::from_millis(250)).unwrap_or_else(|e| e.into_inner()).0
+                    s.wake
+                        .wait_timeout(guard, Duration::from_millis(250))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0
                 } else {
                     guard
                 };
                 s.sleepers.fetch_sub(1, Ordering::AcqRel);
                 drop(guard);
-            } else if spins % 16 == 0 {
+            } else if spins.is_multiple_of(16) {
                 // Let other runnable threads (e.g. elementwise ops) use the core.
                 std::thread::yield_now();
             } else {
@@ -153,7 +161,11 @@ pub fn global() -> &'static Pool {
         let n = std::env::var("TENDRIL_THREADS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+            .unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(4)
+            });
         Pool::new(n.max(1))
     })
 }

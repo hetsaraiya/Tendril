@@ -37,7 +37,11 @@ impl Default for SamplingParams {
 
 impl SamplingParams {
     pub fn greedy() -> Self {
-        SamplingParams { temperature: 0.0, top_p: 1.0, ..Default::default() }
+        SamplingParams {
+            temperature: 0.0,
+            top_p: 1.0,
+            ..Default::default()
+        }
     }
 }
 
@@ -58,7 +62,11 @@ impl Sampler {
         for &t in history {
             *counts.entry(t).or_insert(0) += 1;
         }
-        Sampler { params, rng, counts }
+        Sampler {
+            params,
+            rng,
+            counts,
+        }
     }
 
     fn apply_penalties(&self, logits: &mut [f32]) {
@@ -69,7 +77,11 @@ impl Sampler {
         for (&tok, &c) in &self.counts {
             if let Some(l) = logits.get_mut(tok as usize) {
                 if p.repetition_penalty != 1.0 {
-                    *l = if *l > 0.0 { *l / p.repetition_penalty } else { *l * p.repetition_penalty };
+                    *l = if *l > 0.0 {
+                        *l / p.repetition_penalty
+                    } else {
+                        *l * p.repetition_penalty
+                    };
                 }
                 *l -= p.presence_penalty + p.frequency_penalty * c as f32;
             }
@@ -86,18 +98,35 @@ impl Sampler {
 
     fn pick(&mut self, logits: &[f32]) -> u32 {
         let p = &self.params;
-        let argmax = || logits.iter().enumerate().filter(|(_, v)| !v.is_nan()).max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i as u32).unwrap_or(0);
+        let argmax = || {
+            logits
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| !v.is_nan())
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map(|(i, _)| i as u32)
+                .unwrap_or(0)
+        };
         if p.temperature <= 1e-5 {
             return argmax();
         }
         let t = p.temperature;
-        let max = logits.iter().cloned().filter(|v| v.is_finite()).fold(f32::NEG_INFINITY, f32::max);
+        let max = logits
+            .iter()
+            .cloned()
+            .filter(|v| v.is_finite())
+            .fold(f32::NEG_INFINITY, f32::max);
         if !max.is_finite() {
             return argmax();
         }
         // Candidates: drop tokens with probability < 1e-7 of the best before sorting.
         let floor = max - t * 16.0;
-        let mut cand: Vec<(u32, f32)> = logits.iter().enumerate().filter(|(_, &v)| v >= floor).map(|(i, &v)| (i as u32, (v - max) / t)).collect();
+        let mut cand: Vec<(u32, f32)> = logits
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| v >= floor)
+            .map(|(i, &v)| (i as u32, (v - max) / t))
+            .collect();
         cand.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         if p.top_k > 0 && cand.len() > p.top_k {
             cand.truncate(p.top_k);
@@ -108,7 +137,13 @@ impl Sampler {
         let mut keep = probs.len();
         if p.min_p > 0.0 {
             let thr = probs[0] * p.min_p;
-            keep = keep.min(probs.iter().position(|&x| x < thr).unwrap_or(probs.len()).max(1));
+            keep = keep.min(
+                probs
+                    .iter()
+                    .position(|&x| x < thr)
+                    .unwrap_or(probs.len())
+                    .max(1),
+            );
         }
         if p.top_p < 1.0 {
             let mut acc = 0.0;
@@ -141,14 +176,22 @@ mod tests {
         let mut s = Sampler::new(SamplingParams::greedy(), &[]);
         let mut l = vec![0.1, 3.0, 0.2];
         assert_eq!(s.sample(&mut l), 1);
-        let p = SamplingParams { temperature: 1.0, seed: Some(42), ..Default::default() };
+        let p = SamplingParams {
+            temperature: 1.0,
+            seed: Some(42),
+            ..Default::default()
+        };
         let a: Vec<u32> = {
             let mut s = Sampler::new(p.clone(), &[]);
-            (0..20).map(|_| s.sample(&mut vec![1.0, 1.1, 0.9, 1.05])).collect()
+            (0..20)
+                .map(|_| s.sample(&mut [1.0, 1.1, 0.9, 1.05]))
+                .collect()
         };
         let b: Vec<u32> = {
             let mut s = Sampler::new(p, &[]);
-            (0..20).map(|_| s.sample(&mut vec![1.0, 1.1, 0.9, 1.05])).collect()
+            (0..20)
+                .map(|_| s.sample(&mut [1.0, 1.1, 0.9, 1.05]))
+                .collect()
         };
         assert_eq!(a, b);
         assert!(a.iter().any(|&x| x != a[0]), "sampling should vary");
@@ -156,15 +199,29 @@ mod tests {
 
     #[test]
     fn top_k_one_is_greedy() {
-        let mut s = Sampler::new(SamplingParams { temperature: 2.0, top_k: 1, ..Default::default() }, &[]);
+        let mut s = Sampler::new(
+            SamplingParams {
+                temperature: 2.0,
+                top_k: 1,
+                ..Default::default()
+            },
+            &[],
+        );
         for _ in 0..10 {
-            assert_eq!(s.sample(&mut vec![0.0, 0.5, 5.0, 1.0]), 2);
+            assert_eq!(s.sample(&mut [0.0, 0.5, 5.0, 1.0]), 2);
         }
     }
 
     #[test]
     fn repetition_penalty() {
-        let mut s = Sampler::new(SamplingParams { temperature: 0.0, repetition_penalty: 10.0, ..Default::default() }, &[1]);
-        assert_eq!(s.sample(&mut vec![0.0, 2.0, 1.5]), 2);
+        let mut s = Sampler::new(
+            SamplingParams {
+                temperature: 0.0,
+                repetition_penalty: 10.0,
+                ..Default::default()
+            },
+            &[1],
+        );
+        assert_eq!(s.sample(&mut [0.0, 2.0, 1.5]), 2);
     }
 }
