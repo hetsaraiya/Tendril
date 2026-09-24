@@ -386,6 +386,11 @@ function renderStatus(s) {
   $('cacheLine').textContent = m.prefix_hits
     ? `Prefix cache: ${m.prefix_hits} turn${m.prefix_hits === 1 ? '' : 's'} resumed · ${fmtK(m.cached_tokens)} prompt tokens not recomputed · ${m.parked_ram} parked in memory, ${m.parked_disk} on disk`
     : (m.parked_ram || m.parked_disk ? `Prefix cache: ${m.parked_ram} conversation(s) parked in memory, ${m.parked_disk} on disk` : '');
+  if (m.spec_steps > 0) {
+    const rate = m.drafted_tokens ? Math.round(m.accepted_tokens / m.drafted_tokens * 100) : 0;
+    $('cacheLine').textContent += ($('cacheLine').textContent ? ' · ' : '') +
+      `Speculation: ${rate}% of ${fmtK(m.drafted_tokens)} drafted tokens accepted`;
+  }
   const pts = m.recent.map(r => r.decode_tps).slice(-30);
   if (pts.length > 1) {
     const max = Math.max(...pts, 1);

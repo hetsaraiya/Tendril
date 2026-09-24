@@ -4,10 +4,12 @@
 use crate::agent::{connect_retry, pump};
 use crate::calibration::Calibration;
 use crate::prefix::{Evict, Hit, PrefixCache};
+use crate::proto::Draft;
 use crate::proto::{
     KvOpKind, Msg, NextHop, Payload, SampleSetup, StageTime, TensorEntry, PROTOCOL,
 };
 use crate::shard::{model_key, stage_tensors};
+use crate::speculate::{lookup, Controller};
 use crate::worker::StageWorker;
 use crate::{token, wire};
 use anyhow::{anyhow, bail, Context, Result};
@@ -60,6 +62,10 @@ pub struct ServeOptions {
     pub prefix_cache: bool,
     /// Disk each machine may use for parked conversations (0 = never spill).
     pub kv_disk: Bytes,
+    /// Speculative decoding with prompt-lookup drafts.
+    pub speculate: bool,
+    /// Most tokens drafted per step.
+    pub draft_tokens: usize,
 }
 
 /// Human-readable log of what the cluster is doing.
@@ -137,6 +143,10 @@ pub struct Metrics {
     pub cached_tokens: u64,
     pub kv_spills: u64,
     pub kv_restores: u64,
+    /// Speculative decoding: verification passes, drafted and accepted tokens.
+    pub spec_steps: u64,
+    pub drafted_tokens: u64,
+    pub accepted_tokens: u64,
     /// Conversations parked in memory / on disk right now.
     pub parked_ram: usize,
     pub parked_disk: usize,
@@ -244,8 +254,13 @@ impl Entry {
 
 enum SeqEvent {
     Token(u32, Vec<StageTime>),
+    /// Speculative verification result: accepted drafts + one new token.
+    Tokens(Vec<u32>),
     Error(String),
-    KvAck { ok: bool, error: Option<String> },
+    KvAck {
+        ok: bool,
+        error: Option<String>,
+    },
 }
 
 /// Measured per-token timings of the running pipeline (decode steps only).
@@ -1474,6 +1489,7 @@ impl Coordinator {
                 SeqEvent::Error(format!("stage {} failed: {error}", stage + 1)),
             ),
             Msg::KvOp { seq, ok, error, .. } => (seq, SeqEvent::KvAck { ok, error }),
+            Msg::Tokens { seq, tokens, .. } => (seq, SeqEvent::Tokens(tokens)),
             _ => return,
         };
         if let Some(tx) = self.inner.router.lock().unwrap().get(&seq) {
@@ -1630,6 +1646,7 @@ impl Coordinator {
                 want_logits: last,
                 sample: if first { Some(setup.clone()) } else { None },
                 trace: Vec::new(),
+                draft: None,
             });
             first = false;
             pos += nchunk;
@@ -1638,8 +1655,16 @@ impl Coordinator {
         let mut stop = StopMatcher::new(req.stop.clone());
         let mut reason = FinishReason::Length;
         let mut error: Option<String> = None;
+        let mut pending_draft: Vec<u32> = Vec::new();
         let mut step_sent: Option<Instant> = None;
-        loop {
+        // Speculation state: the draft in flight and how many tokens it proposed.
+        let mut spec = self
+            .inner
+            .opts
+            .speculate
+            .then(|| Controller::new(self.inner.opts.draft_tokens));
+        let mut in_flight: usize = 0;
+        'decode: loop {
             let ev = match tokio::time::timeout(Duration::from_secs(300), srx.recv()).await {
                 Ok(Some(e)) => e,
                 Ok(None) => {
@@ -1651,21 +1676,49 @@ impl Coordinator {
                     break;
                 }
             };
-            let tok = match ev {
+            let step_ms = step_sent.take().map(|t| t.elapsed().as_secs_f64() * 1000.0);
+            let toks: Vec<u32> = match ev {
                 SeqEvent::Token(t, trace) => {
-                    if let Some(sent) = step_sent.take().filter(|_| pos <= 2048) {
+                    if let (Some(ms), true) = (step_ms, pos <= 2048) {
                         // Calibrate on typical contexts only; very long ones are attention-bound.
-                        let step_ms = sent.elapsed().as_secs_f64() * 1000.0;
                         let samples = {
                             let mut tel = p.telemetry.lock().unwrap();
-                            tel.record(step_ms, &trace, p.slots.len());
+                            tel.record(ms, &trace, p.slots.len());
                             tel.samples
                         };
                         if samples == 64 || samples % 512 == 0 {
                             self.calibrate(&p);
                         }
                     }
-                    t
+                    if let (Some(c), Some(ms)) = (spec.as_mut(), step_ms) {
+                        c.on_plain_step(ms);
+                    }
+                    vec![t]
+                }
+                SeqEvent::Tokens(ts) => {
+                    // The pipeline appended [last, drafts...]; keep only what was accepted.
+                    let accepted = ts.len().saturating_sub(1).min(in_flight);
+                    fed.extend_from_slice(&pending_draft[..accepted]);
+                    pos += accepted;
+                    if accepted < in_flight {
+                        p.entry.send(Msg::KvOp {
+                            epoch,
+                            seq,
+                            op: KvOpKind::Truncate { len: pos as u32 },
+                            ok: true,
+                            error: None,
+                        });
+                    }
+                    if let (Some(c), Some(ms)) = (spec.as_mut(), step_ms) {
+                        c.on_spec_step(ms, in_flight, accepted);
+                    }
+                    {
+                        let mut m = self.inner.metrics.lock().unwrap();
+                        m.spec_steps += 1;
+                        m.drafted_tokens += in_flight as u64;
+                        m.accepted_tokens += accepted as u64;
+                    }
+                    ts
                 }
                 SeqEvent::Error(e) => {
                     error = Some(e);
@@ -1673,38 +1726,71 @@ impl Coordinator {
                 }
                 SeqEvent::KvAck { .. } => continue,
             };
-            if timing.completion_tokens == 0 {
-                timing.ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
+            let n_new = toks.len();
+            let mut last_tok = 0;
+            for (i, tok) in toks.into_iter().enumerate() {
+                if timing.completion_tokens == 0 {
+                    timing.ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                }
+                timing.completion_tokens += 1;
+                if self.inner.tok.is_stop(tok) && !req.ignore_eos {
+                    reason = FinishReason::Stop;
+                    break 'decode;
+                }
+                let delta = detok.push(&self.inner.tok, tok).unwrap_or_default();
+                let (emit, stopped) = stop.push(&delta);
+                if !emit.is_empty() && out.send(GenOut::Text(emit)).await.is_err() {
+                    reason = FinishReason::Cancelled;
+                    break 'decode;
+                }
+                if stopped {
+                    reason = FinishReason::Stop;
+                    break 'decode;
+                }
+                if timing.completion_tokens >= req.max_tokens {
+                    break 'decode;
+                }
+                // Accepted drafts are already in the KV; only the final token is new.
+                if i + 1 == n_new {
+                    last_tok = tok;
+                }
             }
-            timing.completion_tokens += 1;
-            if self.inner.tok.is_stop(tok) && !req.ignore_eos {
-                reason = FinishReason::Stop;
-                break;
-            }
-            let delta = detok.push(&self.inner.tok, tok).unwrap_or_default();
-            let (emit, stopped) = stop.push(&delta);
-            if !emit.is_empty() && out.send(GenOut::Text(emit)).await.is_err() {
-                reason = FinishReason::Cancelled;
-                break;
-            }
-            if stopped {
-                reason = FinishReason::Stop;
-                break;
-            }
-            if timing.completion_tokens >= req.max_tokens {
-                break;
-            }
+            // Feed the newest token, with a speculative draft when it's worth it.
+            let remaining = req.max_tokens - timing.completion_tokens;
+            let room = self.inner.opts.context.saturating_sub(pos + 2);
+            let k = spec
+                .as_mut()
+                .map(|c| c.draft_len())
+                .unwrap_or(0)
+                .min(remaining.saturating_sub(1))
+                .min(room);
+            let mut ctx_tail = Vec::new();
+            let draft = if k > 0 {
+                ctx_tail.extend_from_slice(&fed);
+                ctx_tail.push(last_tok);
+                lookup(&ctx_tail, k, 4)
+            } else {
+                Vec::new()
+            };
+            let mut payload = vec![last_tok];
+            payload.extend_from_slice(&draft);
+            in_flight = draft.len();
+            pending_draft = draft.clone();
             p.entry.send(Msg::Forward {
                 epoch,
                 seq,
                 pos: pos as u32,
-                payload: Payload::Tokens(vec![tok]),
+                payload: Payload::Tokens(payload),
                 want_logits: true,
                 sample: None,
                 trace: Vec::new(),
+                draft: (!draft.is_empty()).then(|| Draft {
+                    q: draft.iter().map(|&t| vec![(t, 1.0)]).collect(),
+                    tokens: draft,
+                }),
             });
             step_sent = Some(Instant::now());
-            fed.push(tok);
+            fed.push(last_tok);
             pos += 1;
         }
         let rest = stop.flush();

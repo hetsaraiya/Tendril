@@ -276,6 +276,8 @@ pub enum StageOutput {
     Hidden(Tensor),
     /// f32 logits of the last position.
     Logits(Vec<f32>),
+    /// f32 logits of every position (speculative verification).
+    AllLogits(Vec<Vec<f32>>),
     /// Last stage asked not to compute logits (non-final prefill chunk).
     Nothing,
 }
@@ -654,6 +656,7 @@ impl Stage {
             pos,
             input,
             want_logits,
+            all_logits: false,
         }])
         .pop()
         .expect("one result per item")
@@ -668,7 +671,7 @@ impl Stage {
         let n_layers = self.layers.len();
         // Validate and take each sequence's state out of the map.
         let mut taken: Vec<(usize, u64, SeqState)> = Vec::new();
-        let mut inputs: Vec<(usize, StageInput, bool)> = Vec::new();
+        let mut inputs: Vec<(usize, StageInput, (bool, bool))> = Vec::new();
         for (i, it) in items.into_iter().enumerate() {
             if taken.iter().any(|(_, s, _)| *s == it.seq) {
                 results[i] = Some(Err(anyhow::anyhow!(
@@ -694,7 +697,7 @@ impl Stage {
                 continue;
             }
             taken.push((i, it.seq, state));
-            inputs.push((i, it.input, it.want_logits));
+            inputs.push((i, it.input, (it.want_logits, it.all_logits)));
         }
         if !taken.is_empty() {
             match self.run_batch(&mut taken, inputs) {
@@ -724,7 +727,7 @@ impl Stage {
     fn run_batch(
         &mut self,
         taken: &mut [(usize, u64, SeqState)],
-        inputs: Vec<(usize, StageInput, bool)>,
+        inputs: Vec<(usize, StageInput, (bool, bool))>,
     ) -> Result<Vec<(usize, StageOutput)>> {
         let cfg = self.cfg.clone();
         // Concatenate every item's tokens (or hidden rows) along the sequence axis.
@@ -800,13 +803,16 @@ impl Stage {
             }
             return Ok(out);
         }
-        // Output head only on the last row of items that need logits.
-        let rows: Vec<u32> = spans
-            .iter()
-            .zip(&want)
-            .filter(|(_, w)| **w)
-            .map(|((_, s, len), _)| (s + len - 1) as u32)
-            .collect();
+        // Output head only on the rows that need logits: the last row of each
+        // item, or every row when verifying speculative drafts.
+        let mut rows: Vec<u32> = Vec::new();
+        for ((_, s, len), (w, all)) in spans.iter().zip(&want) {
+            if *all {
+                rows.extend((*s..s + len).map(|r| r as u32));
+            } else if *w {
+                rows.push((s + len - 1) as u32);
+            }
+        }
         let mut logits_rows: Vec<Vec<f32>> = Vec::new();
         if !rows.is_empty() {
             let sel = Tensor::new(rows.as_slice(), &self.device)?;
@@ -827,15 +833,18 @@ impl Stage {
         Ok(idx
             .into_iter()
             .zip(want)
-            .map(|(i, w)| {
-                (
-                    i,
-                    if w {
-                        StageOutput::Logits(lr.next().unwrap_or_default())
-                    } else {
-                        StageOutput::Nothing
-                    },
-                )
+            .zip(&spans)
+            .map(|((i, (w, all)), (_, _, len))| {
+                let out = if all {
+                    StageOutput::AllLogits(
+                        (0..*len).map(|_| lr.next().unwrap_or_default()).collect(),
+                    )
+                } else if w {
+                    StageOutput::Logits(lr.next().unwrap_or_default())
+                } else {
+                    StageOutput::Nothing
+                };
+                (i, out)
             })
             .collect())
     }
@@ -930,6 +939,8 @@ pub struct BatchItem {
     pub pos: usize,
     pub input: StageInput,
     pub want_logits: bool,
+    /// Logits for every input position, not just the last.
+    pub all_logits: bool,
 }
 
 fn layer_forward(

@@ -79,3 +79,10 @@ The planner's memory model matches the engine: weights in the planned representa
 KV in f16 on GPUs and f32 on CPUs, tied embeddings duplicated at both ends of a
 pipeline, ~256 MiB attention scratch, transport buffers, backend runtime overhead and a
 safety margin.
+
+## Development aids
+
+- `TENDRIL_SIM_LATENCY_MS=3` delays every data-plane hop, to emulate a slow link
+  (e.g. Wi-Fi) when all machines are one computer.
+- `tendril dev-tiny-model DIR --layers N --hidden H` writes a random-weight model with a
+  byte-level tokenizer for exercising the whole stack without downloads.

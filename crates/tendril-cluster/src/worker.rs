@@ -7,7 +7,7 @@
 //! (continuous batching). The last stage samples tokens itself so only a token
 //! id crosses the network.
 
-use crate::proto::{KvOpKind, Msg, Payload, SampleSetup, StageTime, WireTensor};
+use crate::proto::{Draft, KvOpKind, Msg, Payload, SampleSetup, StageTime, WireTensor};
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc;
 use std::time::Instant;
@@ -73,6 +73,7 @@ struct Pending {
     want_logits: bool,
     sample: Option<SampleSetup>,
     trace: Vec<StageTime>,
+    draft: Option<Draft>,
     arrived: Instant,
 }
 
@@ -153,11 +154,13 @@ fn run(
                 want_logits,
                 sample,
                 trace,
+                draft,
                 ..
             } = m
             {
                 tokens += n;
                 batch.push(Pending {
+                    draft,
                     seq,
                     pos,
                     payload,
@@ -208,7 +211,11 @@ fn control(
                     }
                 }
             };
-            samplers.remove(&seq);
+            // Truncation keeps the conversation (speculative rollback, prefix
+            // reuse); moving it out of memory ends this stage's sampling state.
+            if !matches!(op, KvOpKind::Truncate { .. }) {
+                samplers.remove(&seq);
+            }
             let (ok, error) = match r {
                 Ok(()) => (ok, error),
                 Err(e) => (false, Some(format!("stage: {e:#}"))),
@@ -279,15 +286,26 @@ fn execute(
                     pos: p.pos as usize,
                     input,
                     want_logits: p.want_logits,
+                    all_logits: stage.spec.head && p.draft.is_some(),
                 });
-                meta.push((p.seq, p.pos, n, p.want_logits, p.sample, p.trace, p.arrived));
+                meta.push((
+                    p.seq,
+                    p.pos,
+                    n,
+                    p.want_logits,
+                    p.sample,
+                    p.trace,
+                    p.draft,
+                    p.arrived,
+                ));
             }
             Err(e) => fail(stage, samplers, index, epoch, p.seq, format!("{e:#}"), out),
         }
     }
     let results = stage.forward_batch(items);
     let compute_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
-    for (r, (seq, pos, n, want_logits, sample, mut trace, arrived)) in results.into_iter().zip(meta)
+    for (r, (seq, pos, n, want_logits, sample, mut trace, draft, arrived)) in
+        results.into_iter().zip(meta)
     {
         trace.push(StageTime {
             stage: index,
@@ -308,6 +326,7 @@ fn execute(
                     want_logits,
                     sample,
                     trace,
+                    draft,
                 }),
                 Err(e) => {
                     fail(stage, samplers, index, epoch, seq, format!("{e:#}"), out);
@@ -330,6 +349,30 @@ fn execute(
                         epoch,
                         seq,
                         format!("no sampler for sequence {seq}"),
+                        out,
+                    );
+                    None
+                }
+            },
+            Ok(StageOutput::AllLogits(mut rows)) => match (samplers.get_mut(&seq), draft) {
+                (Some(s), Some(d)) if rows.len() == d.tokens.len() + 1 => {
+                    let tokens = s.verify(&mut rows, &d.tokens, &d.q);
+                    Some(Msg::Tokens {
+                        epoch,
+                        seq,
+                        pos,
+                        tokens,
+                        trace,
+                    })
+                }
+                _ => {
+                    fail(
+                        stage,
+                        samplers,
+                        index,
+                        epoch,
+                        seq,
+                        format!("sequence {seq}: malformed speculative draft"),
                         out,
                     );
                     None

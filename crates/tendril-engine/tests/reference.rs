@@ -38,7 +38,7 @@ fn run(stages: &mut [Stage], ids: &[u32], split: usize) -> Vec<(usize, Vec<f32>)
             match s.forward(7, pos, input, true).unwrap() {
                 StageOutput::Hidden(h) => input = StageInput::Hidden(h),
                 StageOutput::Logits(l) => return l,
-                StageOutput::Nothing => panic!("no logits"),
+                StageOutput::Nothing | StageOutput::AllLogits(_) => panic!("no logits"),
             }
         }
         unreachable!()
@@ -218,6 +218,7 @@ fn batch_equals_sequential() {
             pos: 0,
             input: StageInput::Tokens(p.clone()),
             want_logits: true,
+            all_logits: false,
         })
         .collect();
     let mut cur: Vec<Vec<f32>> = b
@@ -240,6 +241,7 @@ fn batch_equals_sequential() {
                 pos: prompts[s].len() + i,
                 input: StageInput::Tokens(vec![argmax(l) as u32]),
                 want_logits: true,
+                all_logits: false,
             })
             .collect();
         cur = b
@@ -265,12 +267,14 @@ fn batch_equals_sequential() {
             pos: 999,
             input: StageInput::Tokens(vec![5]),
             want_logits: true,
+            all_logits: false,
         },
         tendril_engine::model::BatchItem {
             seq: 1,
             pos: prompts[1].len() + 5,
             input: StageInput::Tokens(vec![5]),
             want_logits: true,
+            all_logits: false,
         },
     ]);
     assert!(r[0].is_err() && r[1].is_ok());

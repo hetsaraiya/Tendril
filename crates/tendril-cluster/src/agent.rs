@@ -421,7 +421,15 @@ pub(crate) async fn pump(
     {
         return;
     }
+    // Development aid: emulate a slower link (e.g. Wi-Fi) on one machine.
+    let delay = std::env::var("TENDRIL_SIM_LATENCY_MS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|ms| Duration::from_secs_f64(ms / 1000.0));
     while let Some(m) = rx.recv().await {
+        if let Some(d) = delay {
+            tokio::time::sleep(d).await;
+        }
         if let Err(e) = conn.writer.send(&m).await {
             tracing::warn!("next hop connection lost: {e:#}");
             break;

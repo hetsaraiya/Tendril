@@ -61,6 +61,12 @@ pub struct ServeArgs {
     /// Name this machine in the cluster.
     #[arg(long)]
     pub name: Option<String>,
+    /// Don't draft tokens from the conversation to speed up decoding.
+    #[arg(long)]
+    pub no_speculate: bool,
+    /// Most tokens drafted per verification pass.
+    #[arg(long, default_value_t = 6)]
+    pub draft_tokens: usize,
     /// Don't keep finished conversations to speed up their next turn.
     #[arg(long)]
     pub no_prefix_cache: bool,
@@ -151,6 +157,8 @@ pub fn serve(a: ServeArgs) -> Result<()> {
         min_stages: a.min_machines.max(1),
         max_memory,
         prefix_cache: !a.no_prefix_cache,
+        speculate: !a.no_speculate,
+        draft_tokens: a.draft_tokens.clamp(1, 16),
         kv_disk: Bytes::parse(&a.kv_disk)
             .ok_or_else(|| anyhow::anyhow!("cannot parse --kv-disk '{}'", a.kv_disk))?,
     };
@@ -383,6 +391,8 @@ pub async fn start_local_for_bench(
         max_memory: None,
         prefix_cache: true,
         kv_disk: Bytes::gib(1.0),
+        speculate: true,
+        draft_tokens: 6,
     };
     let coord = Coordinator::start(opts).await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

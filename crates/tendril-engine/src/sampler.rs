@@ -90,80 +90,147 @@ impl Sampler {
 
     /// Pick the next token and remember it.
     pub fn sample(&mut self, logits: &mut [f32]) -> u32 {
-        self.apply_penalties(logits);
-        let tok = self.pick(logits);
-        *self.counts.entry(tok).or_insert(0) += 1;
+        let d = self.distribution(logits);
+        let tok = self.draw(&d);
+        self.observe(tok);
         tok
     }
 
-    fn pick(&mut self, logits: &[f32]) -> u32 {
+    /// Count a token as part of the history (for penalties).
+    pub fn observe(&mut self, tok: u32) {
+        *self.counts.entry(tok).or_insert(0) += 1;
+    }
+
+    /// The distribution this sampler draws from after penalties, temperature,
+    /// top-k, min-p and top-p: `(token, probability)` sorted by probability,
+    /// summing to 1. Greedy sampling is a one-hot distribution.
+    pub fn distribution(&self, logits: &mut [f32]) -> Vec<(u32, f32)> {
+        self.apply_penalties(logits);
         let p = &self.params;
-        let argmax = || {
-            logits
-                .iter()
-                .enumerate()
-                .filter(|(_, v)| !v.is_nan())
-                .max_by(|a, b| a.1.total_cmp(b.1))
-                .map(|(i, _)| i as u32)
-                .unwrap_or(0)
-        };
-        if p.temperature <= 1e-5 {
-            return argmax();
+        let argmax = logits
+            .iter()
+            .enumerate()
+            .filter(|(_, v)| !v.is_nan())
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i as u32)
+            .unwrap_or(0);
+        let max = logits[argmax as usize];
+        if p.temperature <= 1e-5 || !max.is_finite() {
+            return vec![(argmax, 1.0)];
         }
         let t = p.temperature;
-        let max = logits
-            .iter()
-            .cloned()
-            .filter(|v| v.is_finite())
-            .fold(f32::NEG_INFINITY, f32::max);
-        if !max.is_finite() {
-            return argmax();
-        }
         // Candidates: drop tokens with probability < 1e-7 of the best before sorting.
         let floor = max - t * 16.0;
         let mut cand: Vec<(u32, f32)> = logits
             .iter()
             .enumerate()
             .filter(|(_, &v)| v >= floor)
-            .map(|(i, &v)| (i as u32, (v - max) / t))
+            .map(|(i, &v)| (i as u32, ((v - max) / t).exp()))
             .collect();
         cand.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
         if p.top_k > 0 && cand.len() > p.top_k {
             cand.truncate(p.top_k);
         }
-        let mut probs: Vec<f32> = cand.iter().map(|(_, l)| l.exp()).collect();
-        let sum: f32 = probs.iter().sum();
-        probs.iter_mut().for_each(|x| *x /= sum);
-        let mut keep = probs.len();
+        let sum: f32 = cand.iter().map(|c| c.1).sum();
+        cand.iter_mut().for_each(|c| c.1 /= sum);
+        let mut keep = cand.len();
         if p.min_p > 0.0 {
-            let thr = probs[0] * p.min_p;
+            let thr = cand[0].1 * p.min_p;
             keep = keep.min(
-                probs
-                    .iter()
-                    .position(|&x| x < thr)
-                    .unwrap_or(probs.len())
+                cand.iter()
+                    .position(|c| c.1 < thr)
+                    .unwrap_or(cand.len())
                     .max(1),
             );
         }
         if p.top_p < 1.0 {
             let mut acc = 0.0;
-            for (i, &x) in probs.iter().enumerate().take(keep) {
-                acc += x;
+            for (i, c) in cand.iter().enumerate().take(keep) {
+                acc += c.1;
                 if acc >= p.top_p {
                     keep = i + 1;
                     break;
                 }
             }
         }
-        let total: f32 = probs[..keep].iter().sum();
+        cand.truncate(keep);
+        let total: f32 = cand.iter().map(|c| c.1).sum();
+        cand.iter_mut().for_each(|c| c.1 /= total);
+        cand
+    }
+
+    /// Draw from a distribution returned by [`Sampler::distribution`].
+    pub fn draw(&mut self, dist: &[(u32, f32)]) -> u32 {
+        if dist.len() == 1 {
+            return dist[0].0;
+        }
+        let total: f32 = dist.iter().map(|d| d.1).sum();
         let mut r = self.rng.random::<f32>() * total;
-        for i in 0..keep {
-            r -= probs[i];
+        for &(tok, p) in dist {
+            r -= p;
             if r <= 0.0 {
-                return cand[i].0;
+                return tok;
             }
         }
-        cand[keep - 1].0
+        dist.last().map(|d| d.0).unwrap_or(0)
+    }
+
+    /// Speculative verification. `rows[i]` are the target logits after
+    /// `draft[..i]`; `q[i]` is the (sparse) distribution the draft token
+    /// `draft[i]` was drawn from. Returns the accepted draft tokens followed by
+    /// exactly one token drawn from the target: the output has the same
+    /// distribution as sampling the target one token at a time.
+    pub fn verify(
+        &mut self,
+        rows: &mut [Vec<f32>],
+        draft: &[u32],
+        q: &[Vec<(u32, f32)>],
+    ) -> Vec<u32> {
+        let mut out = Vec::with_capacity(draft.len() + 1);
+        for (i, &x) in draft.iter().enumerate() {
+            let p = self.distribution(&mut rows[i]);
+            let px = p.iter().find(|d| d.0 == x).map_or(0.0, |d| d.1);
+            let qx = q
+                .get(i)
+                .and_then(|qi| qi.iter().find(|d| d.0 == x))
+                .map_or(0.0, |d| d.1);
+            let accept = if qx <= 0.0 {
+                px > 0.0 && self.rng.random::<f32>() < px
+            } else {
+                self.rng.random::<f32>() < (px / qx).min(1.0)
+            };
+            if accept {
+                self.observe(x);
+                out.push(x);
+                continue;
+            }
+            // Rejected: draw from the residual max(0, p - q).
+            let qi = q.get(i).cloned().unwrap_or_default();
+            let residual: Vec<(u32, f32)> = p
+                .iter()
+                .map(|&(t, pt)| {
+                    (
+                        t,
+                        (pt - qi.iter().find(|d| d.0 == t).map_or(0.0, |d| d.1)).max(0.0),
+                    )
+                })
+                .filter(|d| d.1 > 0.0)
+                .collect();
+            let tok = if residual.is_empty() {
+                self.draw(&p)
+            } else {
+                self.draw(&residual)
+            };
+            self.observe(tok);
+            out.push(tok);
+            return out;
+        }
+        // Every draft accepted: one bonus token from the last row.
+        let p = self.distribution(&mut rows[draft.len()]);
+        let tok = self.draw(&p);
+        self.observe(tok);
+        out.push(tok);
+        out
     }
 }
 
@@ -209,6 +276,55 @@ mod tests {
         );
         for _ in 0..10 {
             assert_eq!(s.sample(&mut [0.0, 0.5, 5.0, 1.0]), 2);
+        }
+    }
+
+    #[test]
+    fn greedy_verification_accepts_matching_prefix() {
+        let mut s = Sampler::new(SamplingParams::greedy(), &[]);
+        // Target argmaxes: 2, 1, 0, 3
+        let mut rows = vec![
+            vec![0.0, 0.0, 5.0, 0.0],
+            vec![0.0, 5.0, 0.0, 0.0],
+            vec![5.0, 0.0, 0.0, 0.0],
+            vec![0.0, 0.0, 0.0, 5.0],
+        ];
+        let one = |t: u32| vec![(t, 1.0)];
+        // Drafts 2, 1, 3: third is wrong -> [2, 1, 0]
+        assert_eq!(
+            s.verify(&mut rows.clone(), &[2, 1, 3], &[one(2), one(1), one(3)]),
+            vec![2, 1, 0]
+        );
+        // All right -> bonus token 3.
+        assert_eq!(
+            s.verify(&mut rows, &[2, 1, 0], &[one(2), one(1), one(0)]),
+            vec![2, 1, 0, 3]
+        );
+    }
+
+    #[test]
+    fn sampled_verification_preserves_the_target_distribution() {
+        // Target p = [0.6, 0.3, 0.1]; draft always proposes token 1 (one-hot q).
+        // Accepted tokens + residual draws must still follow p.
+        let logits = [0.6f32.ln(), 0.3f32.ln(), 0.1f32.ln()];
+        let params = SamplingParams {
+            temperature: 1.0,
+            top_p: 1.0,
+            seed: Some(7),
+            ..Default::default()
+        };
+        let mut s = Sampler::new(params, &[]);
+        let mut counts = [0usize; 3];
+        let n = 60_000;
+        for _ in 0..n {
+            let mut rows = vec![logits.to_vec(), logits.to_vec()];
+            let out = s.verify(&mut rows, &[1], &[vec![(1, 1.0)]]);
+            counts[out[0] as usize] += 1;
+            s.counts.clear();
+        }
+        for (i, want) in [0.6, 0.3, 0.1].iter().enumerate() {
+            let got = counts[i] as f64 / n as f64;
+            assert!((got - want).abs() < 0.01, "token {i}: {got} vs {want}");
         }
     }
 

@@ -222,6 +222,7 @@ impl LocalModel {
             match s.forward(seq, pos, input, want)? {
                 StageOutput::Hidden(h) => input = StageInput::Hidden(h),
                 StageOutput::Logits(l) => return Ok(Some(l)),
+                StageOutput::AllLogits(mut l) => return Ok(l.pop()),
                 StageOutput::Nothing => return Ok(None),
             }
         }
