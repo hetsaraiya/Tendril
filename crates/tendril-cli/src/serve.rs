@@ -342,3 +342,61 @@ pub fn join(a: JoinArgs) -> Result<()> {
         }
     })
 }
+
+/// Start an in-process coordinator + HTTP server on a free port (for `bench <model>`).
+pub async fn start_local_for_bench(
+    model: &str,
+    quantize: &str,
+    concurrency: usize,
+) -> Result<(String, Coordinator)> {
+    let format = WeightFormat::parse(quantize)
+        .ok_or_else(|| anyhow::anyhow!("unknown --quantize '{quantize}'"))?;
+    let (dir, name) = ensure_local(model, true)?;
+    let control = std::net::TcpListener::bind("127.0.0.1:0")?
+        .local_addr()?
+        .port();
+    let opts = ServeOptions {
+        model_dir: dir,
+        model_name: name.clone(),
+        format,
+        context: 8192,
+        concurrency: concurrency.max(1),
+        goal: Goal::Balanced,
+        safety: 0.05,
+        control_port: control,
+        data_port: 0,
+        token: tendril_cluster::token::generate(),
+        device: "auto".into(),
+        use_local: true,
+        link: None,
+        name: None,
+        min_stages: 1,
+        max_memory: None,
+    };
+    let coord = Coordinator::start(opts).await?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let app = router(AppState {
+        coord: coord.clone(),
+        join_command: String::new(),
+        model_id: name,
+    });
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    eprint!("{} loading the model in-process… ", dim("·"));
+    for _ in 0..6000 {
+        match coord.status() {
+            Status::Ready { .. } => {
+                eprintln!("{}", ok_mark());
+                return Ok((format!("http://127.0.0.1:{port}"), coord));
+            }
+            Status::Waiting { reason, .. } => {
+                anyhow::bail!("the model does not fit on this machine: {reason}")
+            }
+            Status::Failed { error } => anyhow::bail!(error),
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    anyhow::bail!("timed out loading the model")
+}

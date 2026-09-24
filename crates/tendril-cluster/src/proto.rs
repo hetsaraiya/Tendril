@@ -38,6 +38,16 @@ pub struct TensorEntry {
     pub len: u64,
 }
 
+/// Time one stage spent on one message, microseconds.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct StageTime {
+    pub stage: u32,
+    /// Waiting in the stage's queue.
+    pub queue_us: u32,
+    /// Running the stage (including (de)serializing activations).
+    pub compute_us: u32,
+}
+
 /// Where a stage sends its output.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum NextHop {
@@ -143,6 +153,8 @@ pub enum Msg {
         payload: Payload,
         want_logits: bool,
         sample: Option<SampleSetup>,
+        /// Per-stage timings appended as the message travels the pipeline.
+        trace: Vec<StageTime>,
     },
     /// Sampled token from the last stage.
     Token {
@@ -150,6 +162,7 @@ pub enum Msg {
         seq: u64,
         pos: u32,
         token: u32,
+        trace: Vec<StageTime>,
     },
     /// Free a sequence's KV on every stage (travels down the chain).
     Release {
