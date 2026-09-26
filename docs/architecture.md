@@ -1,7 +1,6 @@
 # Tendril architecture
 
-How the pieces fit, what crosses the network and why. For the product motivation see
-[project-and-challenges.md](project-and-challenges.md).
+How the pieces fit, what crosses the network and why.
 
 ## Crates
 

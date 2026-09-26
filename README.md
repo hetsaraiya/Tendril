@@ -235,7 +235,4 @@ Predictions come from hardware specs; they are estimates, clearly labelled as su
 
 ## Project docs
 
-- [What Tendril is and its main challenges](docs/project-and-challenges.md)
-- [Approaches and experiments to try first](docs/approaches-and-experiments.md)
-- [Original imported project context](docs/project-context.md)
-- [Full readable source conversation](docs/source-conversation.md)
+- [Architecture: how the pieces fit and what crosses the network](docs/architecture.md)
