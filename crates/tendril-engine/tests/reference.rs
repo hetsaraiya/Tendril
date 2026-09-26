@@ -163,3 +163,115 @@ fn matches_transformers() {
         check_dir(&d);
     }
 }
+
+/// Batched decoding must equal one-at-a-time decoding.
+#[test]
+fn batch_equals_sequential() {
+    let dir = tempfile::tempdir().unwrap();
+    tendril_engine::testing::write_tiny_llama(dir.path(), 3, 64, 9, candle_core::DType::F32)
+        .unwrap();
+    let cfg = Arc::new(ModelConfig::from_file(&dir.path().join("config.json")).unwrap());
+    let ws = WeightStore::open_dir(dir.path()).unwrap();
+    let opts = LoadOptions {
+        format: WeightFormat::Native,
+        device: candle_core::Device::Cpu,
+        dtype: candle_core::DType::F32,
+    };
+    let prompts: Vec<Vec<u32>> = vec![
+        vec![5, 9, 22, 31],
+        vec![7, 8],
+        vec![40, 41, 42, 43, 44, 45, 46],
+    ];
+    let spec = StageSpec::whole(&cfg);
+    // Sequential reference.
+    let mut a = Stage::load(cfg.clone(), &ws, spec, &opts).unwrap();
+    let mut want = Vec::new();
+    for (s, p) in prompts.iter().enumerate() {
+        let mut l = match a
+            .forward(s as u64, 0, StageInput::Tokens(p.clone()), true)
+            .unwrap()
+        {
+            StageOutput::Logits(l) => l,
+            _ => panic!(),
+        };
+        let mut steps = vec![l.clone()];
+        for i in 0..5 {
+            let t = argmax(&l) as u32;
+            l = match a
+                .forward(s as u64, p.len() + i, StageInput::Tokens(vec![t]), true)
+                .unwrap()
+            {
+                StageOutput::Logits(l) => l,
+                _ => panic!(),
+            };
+            steps.push(l.clone());
+        }
+        want.push(steps);
+    }
+    // Batched: all prefills in one call, then all decode steps together.
+    let mut b = Stage::load(cfg.clone(), &ws, spec, &opts).unwrap();
+    let items = prompts
+        .iter()
+        .enumerate()
+        .map(|(s, p)| tendril_engine::model::BatchItem {
+            seq: s as u64,
+            pos: 0,
+            input: StageInput::Tokens(p.clone()),
+            want_logits: true,
+        })
+        .collect();
+    let mut cur: Vec<Vec<f32>> = b
+        .forward_batch(items)
+        .into_iter()
+        .map(|r| match r.unwrap() {
+            StageOutput::Logits(l) => l,
+            _ => panic!(),
+        })
+        .collect();
+    for (s, c) in cur.iter().enumerate() {
+        assert!(c.iter().zip(&want[s][0]).all(|(x, y)| (x - y).abs() < 1e-4));
+    }
+    for i in 0..5 {
+        let items = cur
+            .iter()
+            .enumerate()
+            .map(|(s, l)| tendril_engine::model::BatchItem {
+                seq: s as u64,
+                pos: prompts[s].len() + i,
+                input: StageInput::Tokens(vec![argmax(l) as u32]),
+                want_logits: true,
+            })
+            .collect();
+        cur = b
+            .forward_batch(items)
+            .into_iter()
+            .map(|r| match r.unwrap() {
+                StageOutput::Logits(l) => l,
+                _ => panic!(),
+            })
+            .collect();
+        for (s, c) in cur.iter().enumerate() {
+            let d = c
+                .iter()
+                .zip(&want[s][i + 1])
+                .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+            assert!(d < 1e-4, "seq {s} step {i}: {d}");
+        }
+    }
+    // A wrong position fails only that item.
+    let r = b.forward_batch(vec![
+        tendril_engine::model::BatchItem {
+            seq: 0,
+            pos: 999,
+            input: StageInput::Tokens(vec![5]),
+            want_logits: true,
+        },
+        tendril_engine::model::BatchItem {
+            seq: 1,
+            pos: prompts[1].len() + 5,
+            input: StageInput::Tokens(vec![5]),
+            want_logits: true,
+        },
+    ]);
+    assert!(r[0].is_err() && r[1].is_ok());
+}

@@ -53,8 +53,9 @@ pub struct Linear {
     pub in_features: usize,
 }
 
-/// Rows at or above this use a widened f32 GEMM instead of the GEMV kernel.
-const GEMM_ROWS: usize = 12;
+/// Rows at or above this use a widened f32 GEMM instead of the multi-row
+/// kernel (which reads each weight once for all rows; faster below ~96 rows).
+const GEMM_ROWS: usize = 96;
 
 impl Linear {
     /// Load `name` (+ optional bias) from the store.

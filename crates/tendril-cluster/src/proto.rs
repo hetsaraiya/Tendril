@@ -46,6 +46,8 @@ pub struct StageTime {
     pub queue_us: u32,
     /// Running the stage (including (de)serializing activations).
     pub compute_us: u32,
+    /// Sequences that shared this stage pass (continuous batching).
+    pub batch: u16,
 }
 
 /// Where a stage sends its output.

@@ -1,19 +1,28 @@
 //! Runs one pipeline stage on a dedicated thread.
 //!
-//! Work arrives in order on a queue (forwards, releases, upstream errors);
-//! results go to the next hop. The last stage samples tokens itself so only a
-//! token id — not a vocabulary-sized logits vector — crosses the network.
+//! Work arrives in order on a queue (forwards, releases, upstream errors).
+//! Whatever forwards are waiting when the stage becomes free — decode steps of
+//! different conversations and prefill chunks — run together as one batch, so
+//! every weight is read once per batch instead of once per request
+//! (continuous batching). The last stage samples tokens itself so only a token
+//! id crosses the network.
 
-use crate::proto::{Msg, Payload, StageTime, WireTensor};
-use std::collections::HashMap;
+use crate::proto::{Msg, Payload, SampleSetup, StageTime, WireTensor};
+use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc;
-use tendril_engine::model::{Stage, StageInput, StageOutput};
+use std::time::Instant;
+use tendril_engine::model::{BatchItem, Stage, StageInput, StageOutput};
 use tendril_engine::sampler::Sampler;
 use tokio::sync::mpsc::UnboundedSender;
 
+/// Most tokens processed in one stage pass (a prefill chunk plus decodes).
+pub const MAX_BATCH_TOKENS: usize = 640;
+/// Most sequences in one stage pass.
+pub const MAX_BATCH_SEQS: usize = 64;
+
 pub enum Work {
     /// A message and when it arrived.
-    Msg(Msg, std::time::Instant),
+    Msg(Msg, Instant),
     Stop,
 }
 
@@ -38,9 +47,7 @@ impl StageWorker {
     }
 
     pub fn submit(&self, m: Msg) -> bool {
-        self.tx
-            .send(Work::Msg(m, std::time::Instant::now()))
-            .is_ok()
+        self.tx.send(Work::Msg(m, Instant::now())).is_ok()
     }
 }
 
@@ -53,6 +60,23 @@ impl Drop for StageWorker {
     }
 }
 
+struct Pending {
+    seq: u64,
+    pos: u32,
+    payload: Payload,
+    want_logits: bool,
+    sample: Option<SampleSetup>,
+    trace: Vec<StageTime>,
+    arrived: Instant,
+}
+
+fn tokens_of(p: &Payload) -> usize {
+    match p {
+        Payload::Tokens(t) => t.len(),
+        Payload::Hidden(h) => h.shape.get(1).copied().unwrap_or(1),
+    }
+}
+
 fn run(
     mut stage: Stage,
     index: u32,
@@ -61,123 +85,236 @@ fn run(
     out: UnboundedSender<Msg>,
 ) {
     let mut samplers: HashMap<u64, Sampler> = HashMap::new();
-    while let Ok(w) = rx.recv() {
-        let (msg, arrived) = match w {
-            Work::Msg(m, t) => (m, t),
-            Work::Stop => break,
+    let mut queue: VecDeque<(Msg, Instant)> = VecDeque::new();
+    let mut stopping = false;
+    loop {
+        if queue.is_empty() {
+            if stopping {
+                break;
+            }
+            match rx.recv() {
+                Ok(Work::Msg(m, t)) => queue.push_back((m, t)),
+                Ok(Work::Stop) | Err(_) => break,
+            }
+        }
+        // Everything that arrived while we were busy joins this round.
+        while let Ok(w) = rx.try_recv() {
+            match w {
+                Work::Msg(m, t) => queue.push_back((m, t)),
+                Work::Stop => stopping = true,
+            }
+        }
+        let Some((front, _)) = queue.front() else {
+            continue;
         };
-        let started = std::time::Instant::now();
-        let queue_us = started
-            .duration_since(arrived)
-            .as_micros()
-            .min(u32::MAX as u128) as u32;
-        match msg {
-            Msg::Forward {
+        if !matches!(front, Msg::Forward { .. }) {
+            let (m, _) = queue.pop_front().unwrap();
+            control(&mut stage, &mut samplers, m, &out);
+            continue;
+        }
+        // Form a batch: consecutive forwards, one item per sequence, within budget.
+        let mut batch: Vec<Pending> = Vec::new();
+        let mut tokens = 0;
+        let mut i = 0;
+        while i < queue.len() && batch.len() < MAX_BATCH_SEQS {
+            let (m, _) = &queue[i];
+            let Msg::Forward {
                 epoch: e,
+                seq,
+                payload,
+                ..
+            } = m
+            else {
+                break;
+            };
+            if *e != epoch {
+                queue.remove(i); // stale work from a previous plan
+                continue;
+            }
+            let n = tokens_of(payload);
+            if batch.iter().any(|b| b.seq == *seq)
+                || (!batch.is_empty() && tokens + n > MAX_BATCH_TOKENS)
+            {
+                i += 1;
+                continue;
+            }
+            let (m, arrived) = queue.remove(i).unwrap();
+            if let Msg::Forward {
                 seq,
                 pos,
                 payload,
                 want_logits,
                 sample,
-                mut trace,
-            } => {
-                if e != epoch {
-                    continue; // stale work from a previous plan
-                }
-                if stage.spec.head {
-                    if let Some(s) = &sample {
-                        samplers.insert(seq, Sampler::new(s.params.clone(), &s.history));
-                    }
-                }
-                let mut result = (|| -> anyhow::Result<Option<Msg>> {
-                    let n_in;
-                    let input = match payload {
-                        Payload::Tokens(t) => {
-                            n_in = t.len();
-                            StageInput::Tokens(t)
-                        }
-                        Payload::Hidden(h) => {
-                            let t = h.to_tensor(&stage.device)?;
-                            n_in = t.dim(1)?;
-                            StageInput::Hidden(t)
-                        }
-                    };
-                    match stage.forward(seq, pos as usize, input, want_logits)? {
-                        StageOutput::Hidden(h) => Ok(Some(Msg::Forward {
-                            epoch,
-                            seq,
-                            pos,
-                            payload: Payload::Hidden(WireTensor::from_tensor(&h)?),
-                            want_logits,
-                            sample,
-                            trace: Vec::new(),
-                        })),
-                        StageOutput::Logits(mut l) => {
-                            let s = samplers
-                                .get_mut(&seq)
-                                .ok_or_else(|| anyhow::anyhow!("no sampler for sequence {seq}"))?;
-                            let token = s.sample(&mut l);
-                            Ok(Some(Msg::Token {
-                                epoch,
-                                seq,
-                                pos: pos + n_in as u32 - 1,
-                                token,
-                                trace: Vec::new(),
-                            }))
-                        }
-                        StageOutput::Nothing => Ok(None),
-                    }
-                })();
-                // Stamp this stage's timing onto the outgoing message.
-                let me = StageTime {
-                    stage: index,
-                    queue_us,
-                    compute_us: started.elapsed().as_micros().min(u32::MAX as u128) as u32,
-                };
-                trace.push(me);
-                if let Ok(Some(Msg::Forward { trace: t, .. } | Msg::Token { trace: t, .. })) =
-                    &mut result
-                {
-                    *t = std::mem::take(&mut trace);
-                }
-                match result {
-                    Ok(Some(m)) => {
-                        let _ = out.send(m);
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        stage.release(seq);
-                        samplers.remove(&seq);
-                        let _ = out.send(Msg::StageError {
-                            epoch,
-                            seq,
-                            stage: index,
-                            error: format!("{e:#}"),
-                        });
-                    }
-                }
+                trace,
+                ..
+            } = m
+            {
+                tokens += n;
+                batch.push(Pending {
+                    seq,
+                    pos,
+                    payload,
+                    want_logits,
+                    sample,
+                    trace,
+                    arrived,
+                });
             }
-            Msg::Release { epoch: e, seq } => {
-                stage.release(seq);
-                samplers.remove(&seq);
-                let _ = out.send(Msg::Release { epoch: e, seq });
-            }
-            Msg::StageError {
-                epoch: e,
+        }
+        if !batch.is_empty() {
+            execute(&mut stage, &mut samplers, index, epoch, batch, &out);
+        }
+    }
+}
+
+fn control(
+    stage: &mut Stage,
+    samplers: &mut HashMap<u64, Sampler>,
+    m: Msg,
+    out: &UnboundedSender<Msg>,
+) {
+    match m {
+        Msg::Release { epoch, seq } => {
+            stage.release(seq);
+            samplers.remove(&seq);
+            let _ = out.send(Msg::Release { epoch, seq });
+        }
+        Msg::StageError {
+            epoch,
+            seq,
+            stage: s,
+            error,
+        } => {
+            stage.release(seq);
+            samplers.remove(&seq);
+            let _ = out.send(Msg::StageError {
+                epoch,
                 seq,
                 stage: s,
                 error,
-            } => {
-                stage.release(seq);
-                samplers.remove(&seq);
-                let _ = out.send(Msg::StageError {
-                    epoch: e,
-                    seq,
-                    stage: s,
-                    error,
-                });
+            });
+        }
+        _ => {}
+    }
+}
+
+fn execute(
+    stage: &mut Stage,
+    samplers: &mut HashMap<u64, Sampler>,
+    index: u32,
+    epoch: u64,
+    batch: Vec<Pending>,
+    out: &UnboundedSender<Msg>,
+) {
+    let started = Instant::now();
+    let size = batch.len() as u16;
+    // Decode inputs; a malformed payload fails only its own sequence.
+    let mut items = Vec::with_capacity(batch.len());
+    let mut meta = Vec::with_capacity(batch.len());
+    for p in batch {
+        if stage.spec.head {
+            if let Some(s) = &p.sample {
+                samplers.insert(p.seq, Sampler::new(s.params.clone(), &s.history));
             }
-            _ => {}
+        }
+        let input = match p.payload {
+            Payload::Tokens(t) => Ok(StageInput::Tokens(t)),
+            Payload::Hidden(h) => h.to_tensor(&stage.device).map(StageInput::Hidden),
+        };
+        match input {
+            Ok(input) => {
+                let n = match &input {
+                    StageInput::Tokens(t) => t.len(),
+                    StageInput::Hidden(h) => h.dim(1).unwrap_or(1),
+                };
+                items.push(BatchItem {
+                    seq: p.seq,
+                    pos: p.pos as usize,
+                    input,
+                    want_logits: p.want_logits,
+                });
+                meta.push((p.seq, p.pos, n, p.want_logits, p.sample, p.trace, p.arrived));
+            }
+            Err(e) => fail(stage, samplers, index, epoch, p.seq, format!("{e:#}"), out),
         }
     }
+    let results = stage.forward_batch(items);
+    let compute_us = started.elapsed().as_micros().min(u32::MAX as u128) as u32;
+    for (r, (seq, pos, n, want_logits, sample, mut trace, arrived)) in results.into_iter().zip(meta)
+    {
+        trace.push(StageTime {
+            stage: index,
+            queue_us: started
+                .duration_since(arrived)
+                .as_micros()
+                .min(u32::MAX as u128) as u32,
+            compute_us,
+            batch: size,
+        });
+        let msg = match r {
+            Ok(StageOutput::Hidden(h)) => match WireTensor::from_tensor(&h) {
+                Ok(t) => Some(Msg::Forward {
+                    epoch,
+                    seq,
+                    pos,
+                    payload: Payload::Hidden(t),
+                    want_logits,
+                    sample,
+                    trace,
+                }),
+                Err(e) => {
+                    fail(stage, samplers, index, epoch, seq, format!("{e:#}"), out);
+                    None
+                }
+            },
+            Ok(StageOutput::Logits(mut l)) => match samplers.get_mut(&seq) {
+                Some(s) => Some(Msg::Token {
+                    epoch,
+                    seq,
+                    pos: pos + n as u32 - 1,
+                    token: s.sample(&mut l),
+                    trace,
+                }),
+                None => {
+                    fail(
+                        stage,
+                        samplers,
+                        index,
+                        epoch,
+                        seq,
+                        format!("no sampler for sequence {seq}"),
+                        out,
+                    );
+                    None
+                }
+            },
+            Ok(StageOutput::Nothing) => None,
+            Err(e) => {
+                fail(stage, samplers, index, epoch, seq, format!("{e:#}"), out);
+                None
+            }
+        };
+        if let Some(m) = msg {
+            let _ = out.send(m);
+        }
+    }
+}
+
+fn fail(
+    stage: &mut Stage,
+    samplers: &mut HashMap<u64, Sampler>,
+    index: u32,
+    epoch: u64,
+    seq: u64,
+    error: String,
+    out: &UnboundedSender<Msg>,
+) {
+    stage.release(seq);
+    samplers.remove(&seq);
+    let _ = out.send(Msg::StageError {
+        epoch,
+        seq,
+        stage: index,
+        error,
+    });
 }

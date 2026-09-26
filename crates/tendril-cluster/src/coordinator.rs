@@ -241,6 +241,8 @@ pub struct Telemetry {
     pub queue_ms: Vec<f64>,
     /// Step time not spent computing: network, serialization, scheduling, ms.
     pub transfer_ms: f64,
+    /// Average sequences per stage pass (continuous batching).
+    pub batch: Vec<f64>,
 }
 
 impl Telemetry {
@@ -248,6 +250,7 @@ impl Telemetry {
         if self.compute_ms.len() != stages {
             self.compute_ms = vec![0.0; stages];
             self.queue_ms = vec![0.0; stages];
+            self.batch = vec![0.0; stages];
         }
         self.samples += 1;
         // Running mean for the first samples, then an exponential average.
@@ -260,6 +263,7 @@ impl Telemetry {
             if i < stages {
                 mix(&mut self.compute_ms[i], t.compute_us as f64 / 1000.0);
                 mix(&mut self.queue_ms[i], t.queue_us as f64 / 1000.0);
+                mix(&mut self.batch[i], t.batch as f64);
                 busy += (t.compute_us + t.queue_us) as f64 / 1000.0;
             }
         }
