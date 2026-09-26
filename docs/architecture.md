@@ -51,6 +51,18 @@ coordinator ──tokens──▶ stage 0 ──hidden──▶ stage 1 ──hi
   are checked, so duplicated or reordered work fails loudly instead of corrupting KV.
 - Errors travel down the chain to the coordinator and end the request with a message.
 
+## Discovery and recovery
+
+- **Discovery:** the coordinator broadcasts a UDP beacon (port 7419) every second with
+  the model, control port, machine count, state and a fingerprint (hash) of the cluster
+  token. `tendril join --token T` listens for the beacon whose fingerprint matches.
+- **Recovery:** every request keeps a log of committed tokens (the KV it has built).
+  When a machine in the pipeline disconnects, the coordinator tears the plan down and
+  sends each request a `Lost` notice; the request waits for a new plan (new epoch),
+  replays its committed tokens in ≤64-token chunks (the same kernels as decoding, so the
+  rebuilt KV is identical on CPU) and continues sampling. Each request only accepts
+  results stamped with the epoch it currently runs on.
+
 ## Security
 
 - One cluster token (generated on first `serve`, stored with 0600 permissions). Every

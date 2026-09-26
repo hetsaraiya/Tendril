@@ -28,7 +28,7 @@ use clap::{Parser, Subcommand};
     after_help = "Examples:\n  \
         tendril run qwen2.5-0.5b                       chat with a small model on this machine\n  \
         tendril serve Qwen/Qwen2.5-7B-Instruct         serve it; other machines can join\n  \
-        tendril join 192.168.1.20 --token XXXX-...     (on another machine) contribute it\n  \
+        tendril join --token XXXX-XXXX-XXXX-XXXX      (on another machine) contribute it\n  \
         tendril plan gemma-2-9b --node air=m4:16 --node mini=m5:16 --link thunderbolt\n  \
         tendril fit llama-3.1-70b --node studio=m2-ultra:192\n  \
         tendril doctor"
@@ -46,6 +46,8 @@ enum Cmd {
     Serve(serve::ServeArgs),
     /// Contribute this machine to a `tendril serve` cluster.
     Join(serve::JoinArgs),
+    /// List Tendril clusters on the local network.
+    Discover(serve::DiscoverArgs),
     /// Chat with a running server from the terminal.
     Chat(client::ChatArgs),
     /// Show a running server's machines, plan and traffic.
@@ -104,6 +106,7 @@ fn main() {
         Cmd::Run(a) => run::run(a),
         Cmd::Serve(a) => serve::serve(a),
         Cmd::Join(a) => serve::join(a),
+        Cmd::Discover(a) => serve::discover_cmd(a),
         Cmd::Chat(a) => client::chat(a),
         Cmd::Status(a) => client::status(a),
         Cmd::Pull(a) => models::ensure_local(&a.model, true)
