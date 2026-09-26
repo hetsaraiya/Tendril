@@ -105,6 +105,27 @@ Useful flags: `--context 32k`, `--concurrency 8`, `--quantize q8_0|q4_k`,
 machine, on `serve` or `join`), `--min-machines 2` (force a split, e.g. to measure its
 cost), `--no-local` (coordinate only).
 
+### Measure it
+
+```bash
+tendril bench                       # against a running `tendril serve`
+tendril bench qwen2.5-1.5b          # or load a model in-process and measure it
+tendril bench --concurrency 1,2,4,8 --prompt-tokens 128,2048 --output-tokens 256 --runs 5
+```
+
+`tendril bench` runs a fixed protocol — warm-up, prompt-length × concurrency sweep,
+repeated runs, end-of-sequence ignored so every request generates the same length — and
+reports time-to-first-token and inter-token latency percentiles, per-request and total
+throughput, the planner's prediction next to the measurement, and **where each token's
+time goes** (per-stage compute, queueing, network), from timings every stage stamps onto
+the tokens it produces. It writes a self-contained HTML report with charts.
+
+**The planner learns.** While serving, the coordinator compares each machine's measured
+compute time with the plan's prediction and stores the ratio
+(`~/.config/tendril/calibration.json`); the next plan uses how fast machines really are.
+`tendril node --probe` measures memory bandwidth and is reused for two weeks — by `plan`,
+`serve`, and by machines when they `join`.
+
 ### OpenAI-compatible API
 
 ```bash
@@ -116,7 +137,8 @@ curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/jso
 
 `/v1/chat/completions` and `/v1/completions` support streaming, `temperature`, `top_p`,
 `top_k`, `min_p`, `seed`, `stop`, `max_tokens`, presence/frequency/repetition penalties
-and `stream_options.include_usage`. Responses include a `tendril` object with
+and `stream_options.include_usage` (plus `ignore_eos` for benchmarking); `POST /tokenize`
+counts tokens. Responses include a `tendril` object with
 time-to-first-token and decode speed. `/api/status` exposes the cluster as JSON.
 
 ### Supported models

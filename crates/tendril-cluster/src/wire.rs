@@ -233,6 +233,7 @@ mod tests {
             }),
             want_logits: true,
             sample: None,
+            trace: vec![],
         };
         c.writer.send(&big).await.unwrap();
         match c.reader.recv().await.unwrap() {

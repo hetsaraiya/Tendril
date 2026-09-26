@@ -31,6 +31,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(completions))
+        .route("/tokenize", post(tokenize))
         .with_state(state)
 }
 
@@ -76,7 +77,23 @@ async fn status(State(s): State<AppState>) -> Json<Value> {
         })
     });
     let m = c.metrics();
+    let telemetry = c.telemetry().await.map(|(p, t)| {
+        json!({
+            "samples": t.samples,
+            "step_ms": t.step_ms,
+            "predicted_step_ms": p.decode_ms,
+            "transfer_ms": t.transfer_ms,
+            "predicted_network_ms": p.network_ms,
+            "stages": p.stages.iter().enumerate().map(|(i, st)| json!({
+                "node": st.node_name,
+                "predicted_ms": st.decode_ms,
+                "compute_ms": t.compute_ms.get(i).copied().unwrap_or(0.0),
+                "queue_ms": t.queue_ms.get(i).copied().unwrap_or(0.0),
+            })).collect::<Vec<_>>(),
+        })
+    });
     Json(json!({
+        "telemetry": telemetry,
         "model": s.model_id,
         "architecture": c.inner.spec.arch.label(),
         "params": c.inner.spec.total_params(),
@@ -110,6 +127,40 @@ async fn events(
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// `{"prompt": "..."}` or `{"messages": [...]}` → token count and ids.
+async fn tokenize(State(s): State<AppState>, Json(body): Json<Value>) -> Response {
+    let tok = &s.coord.inner.tok;
+    let ids = if let Some(p) = body.get("prompt").and_then(|p| p.as_str()) {
+        tok.encode_prompt(p)
+    } else if let Some(m) = body.get("messages").and_then(|m| m.as_array()) {
+        let msgs: Vec<ChatMessage> = m
+            .iter()
+            .map(|m| ChatMessage {
+                role: m["role"].as_str().unwrap_or("user").into(),
+                content: content_text(&m["content"]),
+            })
+            .collect();
+        tok.encode_chat(&msgs)
+    } else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "send `prompt` or `messages`",
+        );
+    };
+    match ids {
+        Ok(ids) => Json(
+            json!({"count": ids.len(), "tokens": ids, "max_model_len": s.coord.inner.opts.context}),
+        )
+        .into_response(),
+        Err(e) => err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("{e:#}"),
+        ),
+    }
 }
 
 async fn models(State(s): State<AppState>) -> Json<Value> {
@@ -159,6 +210,9 @@ struct CommonParams {
     stop: Option<StopField>,
     #[serde(default)]
     stream: bool,
+    /// Extension: keep generating past end-of-sequence (for benchmarks).
+    #[serde(default)]
+    ignore_eos: bool,
     #[serde(default)]
     stream_options: Option<Value>,
 }
@@ -317,6 +371,7 @@ async fn run(s: AppState, prompt: Vec<u32>, params: CommonParams, chat: bool) ->
             .as_ref()
             .map(|s| s.0.clone())
             .unwrap_or_default(),
+        ignore_eos: params.ignore_eos,
     };
     let mut rx = match s.coord.generate(req).await {
         Ok(rx) => rx,

@@ -74,6 +74,7 @@ async fn collect(c: &Coordinator, prompt: Vec<u32>, max: usize) -> String {
             params: SamplingParams::greedy(),
             max_tokens: max,
             stop: vec![],
+            ignore_eos: false,
         })
         .await
         .unwrap_or_else(|e| panic!("{e}"));
@@ -163,6 +164,7 @@ async fn local_plus_remote_pipeline_matches_single_machine() {
             params: SamplingParams::greedy(),
             max_tokens: 4,
             stop: vec![],
+            ignore_eos: false,
         })
         .await;
     assert!(
@@ -198,5 +200,11 @@ async fn three_remote_stages() {
     let prompt: Vec<u32> = (0..300).map(|i| 5 + (i * 13 % 250) as u32).collect(); // multi-chunk prefill
     let want = reference(dir.path(), &prompt, 20);
     assert_eq!(collect(&c, prompt, 20).await, want);
+    // Per-stage timings travel with every token.
+    let (plan, tel) = c.telemetry().await.expect("running pipeline");
+    assert!(tel.samples >= 3, "{tel:?}");
+    assert_eq!(tel.compute_ms.len(), plan.stages.len());
+    assert!(tel.compute_ms.iter().all(|&m| m > 0.0));
+    assert!(tel.step_ms >= tel.compute_ms.iter().sum::<f64>() * 0.5);
     c.shutdown().await;
 }

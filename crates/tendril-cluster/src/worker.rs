@@ -4,7 +4,7 @@
 //! results go to the next hop. The last stage samples tokens itself so only a
 //! token id — not a vocabulary-sized logits vector — crosses the network.
 
-use crate::proto::{Msg, Payload, WireTensor};
+use crate::proto::{Msg, Payload, StageTime, WireTensor};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use tendril_engine::model::{Stage, StageInput, StageOutput};
@@ -12,7 +12,8 @@ use tendril_engine::sampler::Sampler;
 use tokio::sync::mpsc::UnboundedSender;
 
 pub enum Work {
-    Msg(Msg),
+    /// A message and when it arrived.
+    Msg(Msg, std::time::Instant),
     Stop,
 }
 
@@ -37,7 +38,9 @@ impl StageWorker {
     }
 
     pub fn submit(&self, m: Msg) -> bool {
-        self.tx.send(Work::Msg(m)).is_ok()
+        self.tx
+            .send(Work::Msg(m, std::time::Instant::now()))
+            .is_ok()
     }
 }
 
@@ -59,10 +62,15 @@ fn run(
 ) {
     let mut samplers: HashMap<u64, Sampler> = HashMap::new();
     while let Ok(w) = rx.recv() {
-        let msg = match w {
-            Work::Msg(m) => m,
+        let (msg, arrived) = match w {
+            Work::Msg(m, t) => (m, t),
             Work::Stop => break,
         };
+        let started = std::time::Instant::now();
+        let queue_us = started
+            .duration_since(arrived)
+            .as_micros()
+            .min(u32::MAX as u128) as u32;
         match msg {
             Msg::Forward {
                 epoch: e,
@@ -71,6 +79,7 @@ fn run(
                 payload,
                 want_logits,
                 sample,
+                mut trace,
             } => {
                 if e != epoch {
                     continue; // stale work from a previous plan
@@ -80,7 +89,7 @@ fn run(
                         samplers.insert(seq, Sampler::new(s.params.clone(), &s.history));
                     }
                 }
-                let result = (|| -> anyhow::Result<Option<Msg>> {
+                let mut result = (|| -> anyhow::Result<Option<Msg>> {
                     let n_in;
                     let input = match payload {
                         Payload::Tokens(t) => {
@@ -101,6 +110,7 @@ fn run(
                             payload: Payload::Hidden(WireTensor::from_tensor(&h)?),
                             want_logits,
                             sample,
+                            trace: Vec::new(),
                         })),
                         StageOutput::Logits(mut l) => {
                             let s = samplers
@@ -112,11 +122,24 @@ fn run(
                                 seq,
                                 pos: pos + n_in as u32 - 1,
                                 token,
+                                trace: Vec::new(),
                             }))
                         }
                         StageOutput::Nothing => Ok(None),
                     }
                 })();
+                // Stamp this stage's timing onto the outgoing message.
+                let me = StageTime {
+                    stage: index,
+                    queue_us,
+                    compute_us: started.elapsed().as_micros().min(u32::MAX as u128) as u32,
+                };
+                trace.push(me);
+                if let Ok(Some(Msg::Forward { trace: t, .. } | Msg::Token { trace: t, .. })) =
+                    &mut result
+                {
+                    *t = std::mem::take(&mut trace);
+                }
                 match result {
                     Ok(Some(m)) => {
                         let _ = out.send(m);

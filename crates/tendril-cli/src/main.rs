@@ -1,5 +1,7 @@
 //! tendril — plan and run LLMs across the machines you already have.
 
+mod bench;
+mod bench_report;
 mod catalog;
 mod client;
 mod common;
@@ -48,6 +50,8 @@ enum Cmd {
     Chat(client::ChatArgs),
     /// Show a running server's machines, plan and traffic.
     Status(client::StatusArgs),
+    /// Measure a server (or a model in-process): latency, throughput, where time goes.
+    Bench(bench::BenchArgs),
     /// Download a model from HuggingFace.
     Pull(PullArgs),
     /// Check that a split pipeline computes exactly what one machine would.
@@ -58,6 +62,8 @@ enum Cmd {
         dir: std::path::PathBuf,
         #[arg(long, default_value_t = 4)]
         layers: usize,
+        #[arg(long, default_value_t = 64)]
+        hidden: usize,
     },
     /// Decide how to run a model on your machines, and explain why.
     Plan(plan::PlanArgs),
@@ -103,15 +109,24 @@ fn main() {
         Cmd::Pull(a) => models::ensure_local(&a.model, true)
             .map(|(d, n)| println!("{} {n} is ready at {}", ui::ok_mark(), d.display())),
         Cmd::Verify(a) => verify::run(a),
-        Cmd::DevTinyModel { dir, layers } => {
-            tendril_engine::testing::write_tiny_llama(&dir, layers, 64, 1, candle_core::DType::BF16)
-                .map(|_| {
-                    println!(
-                        "wrote a random {layers}-layer test model to {}",
-                        dir.display()
-                    )
-                })
-        }
+        Cmd::Bench(a) => bench::run(a),
+        Cmd::DevTinyModel {
+            dir,
+            layers,
+            hidden,
+        } => tendril_engine::testing::write_tiny_llama(
+            &dir,
+            layers,
+            hidden,
+            1,
+            candle_core::DType::BF16,
+        )
+        .map(|_| {
+            println!(
+                "wrote a random {layers}-layer test model to {}",
+                dir.display()
+            )
+        }),
         Cmd::Plan(a) => plan::run(a),
         Cmd::Fit(a) => fit::run(a),
         Cmd::Inspect(a) => inspect::run(a),

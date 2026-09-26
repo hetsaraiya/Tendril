@@ -268,7 +268,53 @@ pub fn detect_local(consider_free_memory: bool) -> NodeProfile {
         node.bandwidth_gbs = if total.0 >= 128 * GIB { 120.0 } else { 40.0 };
     }
     node.recompute_usable();
+    apply_saved_measurements(&mut node);
     node
+}
+
+/// Measurements from `tendril node --probe`, reused for two weeks.
+#[derive(Serialize, Deserialize)]
+struct SavedProbe {
+    bandwidth_gbs: f64,
+    measured_unix: u64,
+}
+
+fn probe_path() -> Option<std::path::PathBuf> {
+    Some(dirs::config_dir()?.join("tendril").join("probe.json"))
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Remember a measured bandwidth for this machine.
+pub fn save_probe(bandwidth_gbs: f64) {
+    if let Some(p) = probe_path() {
+        if let Some(d) = p.parent() {
+            let _ = std::fs::create_dir_all(d);
+        }
+        let s = SavedProbe {
+            bandwidth_gbs,
+            measured_unix: now_unix(),
+        };
+        if let Ok(j) = serde_json::to_vec_pretty(&s) {
+            let _ = std::fs::write(p, j);
+        }
+    }
+}
+
+fn apply_saved_measurements(node: &mut NodeProfile) {
+    let Some(p) = probe_path() else { return };
+    let Ok(b) = std::fs::read(p) else { return };
+    let Ok(s) = serde_json::from_slice::<SavedProbe>(&b) else {
+        return;
+    };
+    if now_unix().saturating_sub(s.measured_unix) < 14 * 86400 && s.bandwidth_gbs > 0.0 {
+        node.measured_bandwidth_gbs = Some(s.bandwidth_gbs);
+    }
 }
 
 fn sysctl(key: &str) -> Option<String> {

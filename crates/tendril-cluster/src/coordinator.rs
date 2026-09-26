@@ -2,7 +2,8 @@
 //! pipeline and drives generation for every request.
 
 use crate::agent::{connect_retry, pump};
-use crate::proto::{Msg, NextHop, Payload, SampleSetup, TensorEntry, PROTOCOL};
+use crate::calibration::Calibration;
+use crate::proto::{Msg, NextHop, Payload, SampleSetup, StageTime, TensorEntry, PROTOCOL};
 use crate::shard::{model_key, stage_tensors};
 use crate::worker::StageWorker;
 use crate::{token, wire};
@@ -153,6 +154,8 @@ pub struct GenRequest {
     pub params: SamplingParams,
     pub max_tokens: usize,
     pub stop: Vec<String>,
+    /// Keep generating past end-of-sequence tokens (benchmarks).
+    pub ignore_eos: bool,
 }
 
 #[derive(Debug)]
@@ -204,6 +207,7 @@ struct Pipeline {
     /// Keeps the in-process stage alive.
     _local: Option<Arc<StageWorker>>,
     ready_at: Instant,
+    telemetry: StdMutex<Telemetry>,
 }
 
 enum Entry {
@@ -221,8 +225,46 @@ impl Entry {
 }
 
 enum SeqEvent {
-    Token(u32),
+    Token(u32, Vec<StageTime>),
     Error(String),
+}
+
+/// Measured per-token timings of the running pipeline (decode steps only).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Telemetry {
+    pub samples: u64,
+    /// Coordinator-observed time per decode step, ms.
+    pub step_ms: f64,
+    /// Per-stage compute time per decode step, ms (stage order).
+    pub compute_ms: Vec<f64>,
+    /// Per-stage queueing delay, ms.
+    pub queue_ms: Vec<f64>,
+    /// Step time not spent computing: network, serialization, scheduling, ms.
+    pub transfer_ms: f64,
+}
+
+impl Telemetry {
+    fn record(&mut self, step_ms: f64, trace: &[StageTime], stages: usize) {
+        if self.compute_ms.len() != stages {
+            self.compute_ms = vec![0.0; stages];
+            self.queue_ms = vec![0.0; stages];
+        }
+        self.samples += 1;
+        // Running mean for the first samples, then an exponential average.
+        let a = (1.0 / self.samples as f64).max(0.02);
+        let mix = |old: &mut f64, new: f64| *old += a * (new - *old);
+        mix(&mut self.step_ms, step_ms);
+        let mut busy = 0.0;
+        for t in trace {
+            let i = t.stage as usize;
+            if i < stages {
+                mix(&mut self.compute_ms[i], t.compute_us as f64 / 1000.0);
+                mix(&mut self.queue_ms[i], t.queue_us as f64 / 1000.0);
+                busy += (t.compute_us + t.queue_us) as f64 / 1000.0;
+            }
+        }
+        mix(&mut self.transfer_ms, (step_ms - busy).max(0.0));
+    }
 }
 
 pub struct Inner {
@@ -249,6 +291,7 @@ pub struct Inner {
     replan: Notify,
     last_plan: StdMutex<Option<PlanResult>>,
     started: Instant,
+    calibration: StdMutex<Calibration>,
 }
 
 #[derive(Clone)]
@@ -307,6 +350,7 @@ impl Coordinator {
             replan: Notify::new(),
             last_plan: StdMutex::new(None),
             started: Instant::now(),
+            calibration: StdMutex::new(Calibration::load()),
         });
         let c = Coordinator { inner };
 
@@ -749,7 +793,16 @@ impl Coordinator {
 
     fn cluster_snapshot(&self) -> (Cluster, Vec<u32>) {
         let nodes = self.inner.nodes.lock().unwrap();
-        let profiles: Vec<NodeProfile> = nodes.iter().map(|n| n.profile.clone()).collect();
+        let cal = self.inner.calibration.lock().unwrap();
+        let profiles: Vec<NodeProfile> = nodes
+            .iter()
+            .map(|n| {
+                let mut p = n.profile.clone();
+                cal.apply(&mut p);
+                p
+            })
+            .collect();
+        drop(cal);
         let ids: Vec<u32> = nodes.iter().map(|n| n.id).collect();
         let default = self
             .inner
@@ -1163,6 +1216,7 @@ impl Coordinator {
             permits: Arc::new(Semaphore::new(self.inner.opts.concurrency.max(1))),
             _local: local_worker,
             ready_at: Instant::now(),
+            telemetry: StdMutex::new(Telemetry::default()),
         };
         *self.inner.pipeline.write().await = Some(Arc::new(pipeline));
         self.set_status(Status::Ready {
@@ -1373,7 +1427,9 @@ impl Coordinator {
 
     fn route(&self, m: Msg) {
         let (seq, ev) = match m {
-            Msg::Token { seq, token, .. } => (seq, SeqEvent::Token(token)),
+            Msg::Token {
+                seq, token, trace, ..
+            } => (seq, SeqEvent::Token(token, trace)),
             Msg::StageError {
                 seq, stage, error, ..
             } => (
@@ -1494,6 +1550,7 @@ impl Coordinator {
                 payload: Payload::Tokens(req.prompt[pos..pos + nchunk].to_vec()),
                 want_logits: last,
                 sample: if first { Some(setup.clone()) } else { None },
+                trace: Vec::new(),
             });
             first = false;
             pos += nchunk;
@@ -1502,6 +1559,7 @@ impl Coordinator {
         let mut stop = StopMatcher::new(req.stop.clone());
         let mut reason = FinishReason::Length;
         let mut error: Option<String> = None;
+        let mut step_sent: Option<Instant> = None;
         loop {
             let ev = match tokio::time::timeout(Duration::from_secs(300), srx.recv()).await {
                 Ok(Some(e)) => e,
@@ -1515,7 +1573,21 @@ impl Coordinator {
                 }
             };
             let tok = match ev {
-                SeqEvent::Token(t) => t,
+                SeqEvent::Token(t, trace) => {
+                    if let Some(sent) = step_sent.take().filter(|_| pos <= 2048) {
+                        // Calibrate on typical contexts only; very long ones are attention-bound.
+                        let step_ms = sent.elapsed().as_secs_f64() * 1000.0;
+                        let samples = {
+                            let mut tel = p.telemetry.lock().unwrap();
+                            tel.record(step_ms, &trace, p.slots.len());
+                            tel.samples
+                        };
+                        if samples == 64 || samples % 512 == 0 {
+                            self.calibrate(&p);
+                        }
+                    }
+                    t
+                }
                 SeqEvent::Error(e) => {
                     error = Some(e);
                     break;
@@ -1525,7 +1597,7 @@ impl Coordinator {
                 timing.ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
             }
             timing.completion_tokens += 1;
-            if self.inner.tok.is_stop(tok) {
+            if self.inner.tok.is_stop(tok) && !req.ignore_eos {
                 reason = FinishReason::Stop;
                 break;
             }
@@ -1549,7 +1621,9 @@ impl Coordinator {
                 payload: Payload::Tokens(vec![tok]),
                 want_logits: true,
                 sample: None,
+                trace: Vec::new(),
             });
+            step_sent = Some(Instant::now());
             pos += 1;
         }
         let rest = stop.flush();
@@ -1592,6 +1666,60 @@ impl Coordinator {
                 let _ = out.send(GenOut::Done { reason, timing }).await;
             }
         }
+    }
+
+    /// Compare measured stage speed with the plan's prediction and remember
+    /// the difference, so future plans use how fast machines really are.
+    fn calibrate(&self, p: &Pipeline) {
+        let tel = p.telemetry.lock().unwrap().clone();
+        let names: Vec<(String, String)> = {
+            let nodes = self.inner.nodes.lock().unwrap();
+            p.slots
+                .iter()
+                .map(|s| {
+                    nodes
+                        .iter()
+                        .find(|n| n.id == s.node_id)
+                        .map(|n| (n.profile.name.clone(), n.profile.chip.clone()))
+                        .unwrap_or_default()
+                })
+                .collect()
+        };
+        let mut notes = Vec::new();
+        {
+            let mut cal = self.inner.calibration.lock().unwrap();
+            for (i, st) in p.plan.stages.iter().enumerate() {
+                let measured = tel.compute_ms.get(i).copied().unwrap_or(0.0);
+                if measured <= 0.0 || st.decode_ms <= 0.0 {
+                    continue;
+                }
+                let (name, chip) = &names[i];
+                if let Some(f) = cal.observe(name, chip, measured / st.decode_ms, tel.samples) {
+                    notes.push(format!(
+                        "{name} computes its part in {} vs {} predicted ({f:.2}× the spec-sheet estimate)",
+                        fmt_ms(measured),
+                        fmt_ms(st.decode_ms)
+                    ));
+                }
+            }
+            cal.save();
+        }
+        for n in notes {
+            self.event(
+                "info",
+                format!("Calibrated: {n}; future plans use the measured speed"),
+            );
+        }
+    }
+
+    /// Measured timings of the running pipeline.
+    pub async fn telemetry(&self) -> Option<(Plan, Telemetry)> {
+        self.inner
+            .pipeline
+            .read()
+            .await
+            .as_ref()
+            .map(|p| (p.plan.clone(), p.telemetry.lock().unwrap().clone()))
     }
 
     /// Seconds since the pipeline became ready.

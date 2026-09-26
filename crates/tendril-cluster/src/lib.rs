@@ -8,6 +8,7 @@
 )]
 
 pub mod agent;
+pub mod calibration;
 pub mod coordinator;
 pub mod http;
 pub mod proto;

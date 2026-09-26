@@ -19,6 +19,7 @@ pub fn run(a: NodeArgs) -> Result<()> {
     if a.probe {
         let bw = probe_memory_bandwidth();
         n.measured_bandwidth_gbs = Some(bw);
+        tendril_core::hardware::save_probe(bw);
     }
     if a.json {
         println!("{}", serde_json::to_string_pretty(&n)?);

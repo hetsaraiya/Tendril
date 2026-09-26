@@ -394,8 +394,10 @@ function renderStatus(s) {
   const ordered = stages.map(g => ({ g, n: byName[g.node] })).filter(x => x.n);
   const idle = s.nodes.filter(n => !stages.some(g => g.node === n.name));
   let html = '';
+  const tel = s.telemetry && s.telemetry.samples > 0 ? s.telemetry : null;
   ordered.forEach(({ g, n }, i) => {
     const pct = Math.min(100, Math.round(g.peak / g.usable * 100));
+    const measured = tel?.stages?.[i]?.compute_ms;
     if (i > 0) {
       const link = n.local ? byName[ordered[i - 1].n.name] : n;
       html += `<div class="link">${link?.rtt_ms != null ? fmtMs(link.rtt_ms) + ' · ' + (link.bandwidth_gbps || 0).toFixed(1) + ' Gb/s' : 'activations'} ↓</div>`;
@@ -403,12 +405,15 @@ function renderStatus(s) {
     html += `<div class="node active"><div class="top"><span class="name">${esc(n.name)}${n.local ? ' <span class="tag">this server</span>' : ''}</span><span class="chip">${esc(shortChip(n.chip))} · ${n.backend}</span></div>
       <div class="role">${esc(g.components)}</div>
       <div class="bar ${pct > 90 ? 'warn' : ''}"><div style="width:${pct}%"></div></div>
-      <div class="chip">${fmtBytes(g.peak)} of ${fmtBytes(g.usable)} · ${fmtMs(g.decode_ms)}/token${n.on_battery ? ' · on battery' : ''}</div></div>`;
+      <div class="chip">${fmtBytes(g.peak)} of ${fmtBytes(g.usable)} · ${measured != null ? `${fmtMs(measured)}/token measured (${fmtMs(g.decode_ms)} predicted)` : `${fmtMs(g.decode_ms)}/token predicted`}${n.on_battery ? ' · on battery' : ''}</div></div>`;
   });
   idle.forEach(n => {
     html += `<div class="node" style="margin-top:10px"><div class="top"><span class="name">${esc(n.name)}</span><span class="chip">${esc(shortChip(n.chip))} · ${n.backend}</span></div>
       <div class="role idle">idle · ${esc(n.usable)} available${n.rtt_ms != null ? ' · ' + fmtMs(n.rtt_ms) : ''}</div></div>`;
   });
+  if (tel && ordered.length > 1) {
+    html += `<div class="sub" style="margin-top:10px">Per token: ${fmtMs(tel.step_ms)} measured (${fmtMs(tel.predicted_step_ms)} predicted), of which ${fmtMs(tel.transfer_ms)} network &amp; scheduling.</div>`;
+  }
   $('pipeline').innerHTML = html || '<div class="sub">No machines yet.</div>';
 }
 
