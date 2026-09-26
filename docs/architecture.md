@@ -63,6 +63,35 @@ coordinator ──tokens──▶ stage 0 ──hidden──▶ stage 1 ──hi
   rebuilt KV is identical on CPU) and continues sampling. Each request only accepts
   results stamped with the epoch it currently runs on.
 
+## Model pools
+
+`tendril serve A B C` starts one coordinator per model. Each has its own pipeline,
+batching, prefix cache and recovery. A `Pool` sits in front of them:
+
+- **Control port:** the pool accepts every agent connection. It reads the `Hello`, which
+  names a model and carries the agent's random per-process **machine id**, and hands the
+  session to that model's coordinator. `Welcome` lists every model, and the agent opens
+  one session per model (each with its own data port and stage).
+- **Allocation:** when any model's machines change, the pool merges what every model
+  sees into one cluster (machines keyed by machine id, links from whichever model
+  measured them). It then runs `tendril_core::pool::allocate`:
+  - every placement order is tried (listed order and largest-first when there are more
+    than five models);
+  - in each order, a model is planned with the ordinary planner on the memory the
+    previous models left;
+  - its **budget** on a machine is its stage's peak ÷ (1 − safety) plus 32 MiB, so
+    re-planning inside the budget finds the same split;
+  - the winner places the most models, then prefers earlier-listed models, then the
+    highest summed log-throughput;
+  - a model already running stays on its machines unless moving is ≥25% faster.
+- **Planning inside a share:** a coordinator's cluster snapshot drops machines where its
+  budget is zero and caps `usable_memory` at the budget elsewhere. If the running
+  pipeline no longer fits its budget, the coordinator tears it down (requests resume via
+  recovery). Budgets that shrink are applied 1.5 s before budgets that grow, so memory
+  is freed before another model loads into it.
+- **Events** carry an optional `model` tag. Machine join and leave events come only from
+  the first model, so a machine is reported once.
+
 ## Security
 
 - One cluster token (generated on first `serve`, stored with 0600 permissions). Every

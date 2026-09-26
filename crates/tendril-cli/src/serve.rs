@@ -9,6 +9,7 @@ use std::time::Duration;
 use tendril_cluster::agent::{AgentEvent, AgentOptions};
 use tendril_cluster::coordinator::{Coordinator, ServeOptions, Status};
 use tendril_cluster::http::{router, AppState};
+use tendril_cluster::pool::Pool;
 use tendril_core::units::{parse_tokens, Bytes};
 use tendril_core::{Goal, Link};
 use tendril_engine::linear::WeightFormat;
@@ -17,8 +18,10 @@ pub const CONTROL_PORT: u16 = 7420;
 
 #[derive(Args, Debug)]
 pub struct ServeArgs {
-    /// Model: HuggingFace id, catalog name or local folder.
-    pub model: String,
+    /// Model(s): HuggingFace id, catalog name or local folder. Give several to
+    /// serve them all from the same machines (the first is the default).
+    #[arg(required = true, num_args = 1.., value_name = "MODEL")]
+    pub models: Vec<String>,
     /// HTTP port for the web chat and the OpenAI-compatible API.
     #[arg(long, default_value_t = 8080)]
     pub port: u16,
@@ -137,48 +140,54 @@ pub fn serve(a: ServeArgs) -> Result<()> {
         ),
         None => None,
     };
-    let (dir, name) = ensure_local(&a.model, !a.offline)?;
     let token = match &a.token {
         Some(t) => t.clone(),
         None => tendril_cluster::token::load_or_create()?,
     };
-    let opts = ServeOptions {
-        model_dir: dir,
-        model_name: name.clone(),
-        format,
-        context,
-        concurrency: a.concurrency.max(1),
-        goal,
-        safety: 0.05,
-        control_port: a.cluster_port,
-        data_port: 0,
-        token: token.clone(),
-        device: a.device.clone(),
-        use_local: !a.no_local,
-        link,
-        name: a.name.clone(),
-        min_stages: a.min_machines.max(1),
-        max_memory,
-        prefix_cache: !a.no_prefix_cache,
-        speculate: !a.no_speculate,
-        draft_tokens: a.draft_tokens.clamp(1, 16),
-        recovery_timeout: Duration::from_secs(a.recovery_timeout),
-        kv_disk: Bytes::parse(&a.kv_disk)
-            .ok_or_else(|| anyhow::anyhow!("cannot parse --kv-disk '{}'", a.kv_disk))?,
-    };
+    let kv_disk = Bytes::parse(&a.kv_disk)
+        .ok_or_else(|| anyhow::anyhow!("cannot parse --kv-disk '{}'", a.kv_disk))?;
+    let mut all = Vec::new();
+    for m in &a.models {
+        let (dir, name) = ensure_local(m, !a.offline)?;
+        all.push(ServeOptions {
+            model_dir: dir,
+            model_name: name.clone(),
+            format,
+            context,
+            concurrency: a.concurrency.max(1),
+            goal,
+            safety: 0.05,
+            control_port: a.cluster_port,
+            data_port: 0,
+            token: token.clone(),
+            device: a.device.clone(),
+            use_local: !a.no_local,
+            name: a.name.clone(),
+            min_stages: a.min_machines.max(1),
+            max_memory,
+            prefix_cache: !a.no_prefix_cache,
+            speculate: !a.no_speculate,
+            draft_tokens: a.draft_tokens.clamp(1, 16),
+            recovery_timeout: Duration::from_secs(a.recovery_timeout),
+            kv_disk,
+            link: link.clone(),
+        });
+    }
+    let names: Vec<String> = all.iter().map(|o| o.model_name.clone()).collect();
+    let multi = names.len() > 1;
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        let coord = Coordinator::start(opts).await?;
+        let pool = Pool::start(all).await?;
         let ip = lan_ip();
         let join = format!("tendril join --token {token}");
         let join_direct = format!("tendril join {ip}:{} --token {token}", a.cluster_port);
         // Let machines on the LAN find this cluster by its token fingerprint.
         {
-            let c = coord.clone();
+            let p = pool.clone();
             let fp = tendril_cluster::discovery::fingerprint(&token);
-            let model = name.clone();
+            let model = names.join(", ");
             let host = ip.clone();
             let cport = a.cluster_port;
             tokio::spawn(async move {
@@ -191,28 +200,24 @@ pub fn serve(a: ServeArgs) -> Result<()> {
                         host: host.clone(),
                         control_port: cport,
                         fingerprint: fp.clone(),
-                        machines: c.nodes().len(),
-                        state: match c.status() {
-                            Status::Ready { .. } => "ready",
-                            Status::Loading { .. } => "loading",
-                            Status::Waiting { .. } => "waiting for machines",
-                            Status::Failed { .. } => "failed",
-                            Status::Starting => "starting",
-                        }
-                        .into(),
+                        machines: p.machine_count(),
+                        state: p.state().into(),
                     }
                 })
                 .await
             });
         }
-        let state = AppState { coord: coord.clone(), join_command: join.clone(), model_id: name.clone() };
+        let state = AppState { pool: pool.clone(), join_command: join.clone() };
         let app = router(state);
         let listener = tokio::net::TcpListener::bind((a.host.as_str(), a.port))
             .await
             .with_context(|| format!("port {} is busy — pick another with --port", a.port))?;
         let shown_host = if a.host == "0.0.0.0" { ip.clone() } else { a.host.clone() };
         println!();
-        println!("{} {}", bold("Tendril · serving"), bold(cyan(&name)));
+        println!("{} {}", bold("Tendril · serving"), bold(cyan(names.join(" + "))));
+        if multi {
+            println!("  {}  {}", dim("Models   "), dim(format!("one pool of machines; the API picks by the `model` field (default {})", names[0])));
+        }
         println!("  {}  {}", dim("Web chat "), bold(format!("http://{shown_host}:{}", a.port)));
         println!("  {}  http://{shown_host}:{}/v1  {}", dim("API      "), a.port, dim("(OpenAI-compatible)"));
         println!("  {}  run this on another machine on your network to add it:", dim("Add more "));
@@ -224,21 +229,27 @@ pub fn serve(a: ServeArgs) -> Result<()> {
         });
 
         // Mirror cluster events in the terminal.
-        let mut events = coord.subscribe();
-        for e in coord.history() {
-            println!("{} {} {}", dim(&e.at), level_mark(e.level), e.text);
+        let tag = move |m: &Option<String>| -> String {
+            match m {
+                Some(m) if multi => format!("{} ", cyan(format!("[{}]", short_name(m)))),
+                _ => String::new(),
+            }
+        };
+        let mut events = pool.subscribe();
+        for e in pool.history() {
+            println!("{} {} {}{}", dim(&e.at), level_mark(e.level), tag(&e.model), e.text);
         }
-        let c2 = coord.clone();
+        let p2 = pool.clone();
         let port = a.port;
         let printer = tokio::spawn(async move {
-            let mut last_progress = String::new();
+            let mut last_progress: std::collections::HashMap<String, String> = Default::default();
             let mut tick = tokio::time::interval(Duration::from_secs(2));
-            let mut waiting_shown = false;
+            let mut waiting_shown: std::collections::HashSet<String> = Default::default();
             loop {
                 tokio::select! {
                     e = events.recv() => match e {
                         Ok(e) => {
-                            println!("{} {} {}", dim(&e.at), level_mark(e.level), e.text);
+                            println!("{} {} {}{}", dim(&e.at), level_mark(e.level), tag(&e.model), e.text);
                             if e.text.starts_with("Ready in") {
                                 println!("{}", green(format!("         Chat at http://{shown_host}:{port} or run `tendril chat`")));
                             }
@@ -246,7 +257,8 @@ pub fn serve(a: ServeArgs) -> Result<()> {
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(_) => break,
                     },
-                    _ = tick.tick() => {
+                    _ = tick.tick() => for c2 in p2.models() {
+                        let label = if multi { format!("{}: ", short_name(&c2.inner.opts.model_name)) } else { String::new() };
                         match c2.status() {
                             Status::Loading { stages, .. } => {
                                 let line = stages.iter().filter(|s| s.phase != "ready").map(|s| {
@@ -256,18 +268,19 @@ pub fn serve(a: ServeArgs) -> Result<()> {
                                         format!("{} {}", s.node, s.phase)
                                     }
                                 }).collect::<Vec<_>>().join(" · ");
-                                if !line.is_empty() && line != last_progress {
-                                    println!("{} {} {}", dim(chrono_now()), dim("…"), dim(&line));
-                                    last_progress = line;
+                                let key = c2.inner.opts.model_name.clone();
+                                if !line.is_empty() && last_progress.get(&key) != Some(&line) {
+                                    println!("{} {} {}{}", dim(chrono_now()), dim("…"), dim(&label), dim(&line));
+                                    last_progress.insert(key, line);
                                 }
                             }
-                            Status::Waiting { advice, .. } if !waiting_shown && !advice.is_empty() => {
-                                waiting_shown = true;
+                            Status::Waiting { advice, .. } if !waiting_shown.contains(&c2.inner.opts.model_name) && !advice.is_empty() => {
+                                waiting_shown.insert(c2.inner.opts.model_name.clone());
                                 for adv in advice.iter().take(3) {
                                     println!("         {} {}", cyan("→"), dim(adv));
                                 }
                             }
-                            Status::Ready { .. } => waiting_shown = false,
+                            Status::Ready { .. } => { waiting_shown.remove(&c2.inner.opts.model_name); }
                             _ => {}
                         }
                     }
@@ -277,10 +290,15 @@ pub fn serve(a: ServeArgs) -> Result<()> {
         tokio::signal::ctrl_c().await.ok();
         println!();
         println!("{}", dim("Stopping… (telling joined machines to unload)"));
-        coord.shutdown().await;
+        pool.shutdown().await;
         printer.abort();
         Ok::<_, anyhow::Error>(())
     })
+}
+
+/// "Qwen/Qwen2.5-7B-Instruct" → "Qwen2.5-7B-Instruct".
+fn short_name(m: &str) -> &str {
+    m.rsplit('/').next().unwrap_or(m)
 }
 
 fn chrono_now() -> String {
@@ -329,7 +347,12 @@ pub fn join(a: JoinArgs) -> Result<()> {
         once: false,
         max_memory,
     };
-    let ev: tendril_cluster::agent::EventFn = Arc::new(|e: AgentEvent| {
+    let ev: tendril_cluster::agent::EventFn = Arc::new(|model: &str, e: AgentEvent| {
+        let of = if model.is_empty() {
+            String::new()
+        } else {
+            format!(" of {}", short_name(model))
+        };
         let t = tendril_cluster::coordinator::clock();
         let line = match e {
             AgentEvent::Connecting { addr } => format!("{} connecting to {addr}…", dim("·")),
@@ -348,7 +371,7 @@ pub fn join(a: JoinArgs) -> Result<()> {
                 )
             }
             AgentEvent::Receiving { spec, done, total } => format!(
-                "{} receiving weights for {}: {}/{} ({:.0}%)",
+                "{} receiving weights for {}{of}: {}/{} ({:.0}%)",
                 dim("↓"),
                 tendril_cluster::coordinator::spec_label(&spec),
                 Bytes(done),
@@ -356,7 +379,7 @@ pub fn join(a: JoinArgs) -> Result<()> {
                 done as f64 / total.max(1) as f64 * 100.0
             ),
             AgentEvent::Loading { spec, cached } => format!(
-                "{} loading {}{}",
+                "{} loading {}{of}{}",
                 dim("◌"),
                 tendril_cluster::coordinator::spec_label(&spec),
                 if cached {
@@ -371,14 +394,14 @@ pub fn join(a: JoinArgs) -> Result<()> {
                 load_ms,
                 device,
             } => format!(
-                "{} running {} ({}, {}) — ready in {:.1} s",
+                "{} running {}{of} ({}, {}) — ready in {:.1} s",
                 ok_mark(),
                 bold(tendril_cluster::coordinator::spec_label(&spec)),
                 Bytes(weight_bytes),
                 device,
                 load_ms as f64 / 1000.0
             ),
-            AgentEvent::Unloaded => format!("{} unloaded", dim("·")),
+            AgentEvent::Unloaded => format!("{} unloaded{of}", dim("·")),
             AgentEvent::Failed { error } => format!("{} {error}", bad_mark()),
         };
         println!("{} {line}", dim(t));
@@ -432,13 +455,14 @@ pub async fn start_local_for_bench(
         draft_tokens: 6,
         recovery_timeout: Duration::from_secs(60),
     };
-    let coord = Coordinator::start(opts).await?;
+    let _ = name;
+    let pool = Pool::start(vec![opts]).await?;
+    let coord = pool.primary().clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let app = router(AppState {
-        coord: coord.clone(),
+        pool,
         join_command: String::new(),
-        model_id: name,
     });
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
