@@ -8,7 +8,9 @@ use crate::proto::Draft;
 use crate::proto::{
     KvOpKind, Msg, NextHop, Payload, SampleSetup, StageTime, TensorEntry, PROTOCOL,
 };
-use crate::shard::{model_key, stage_tensors};
+use crate::shard::{
+    is_complete, model_key, shard_path, stage_tensors, ModelWeights, RemoteWeights,
+};
 use crate::speculate::{lookup, Controller};
 use crate::worker::StageWorker;
 use crate::{token, wire};
@@ -22,6 +24,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tendril_core::cluster::{Cluster, Link};
 use tendril_core::hardware::NodeProfile;
+use tendril_core::model::source::RemoteTensor;
 use tendril_core::model::{ModelSpec, Quant};
 use tendril_core::planner::{self, Goal, Plan, PlanOptions, PlanResult, Workload};
 use tendril_core::units::{fmt_ms, Bytes};
@@ -68,6 +71,20 @@ pub struct ServeOptions {
     pub draft_tokens: usize,
     /// How long in-flight requests wait for the cluster to recover.
     pub recovery_timeout: Duration,
+    /// Weights that are not on this machine: every machine (this one too)
+    /// downloads only the tensors of its own stage. `model_dir` then holds
+    /// just the config and tokenizer.
+    pub remote: Option<RemoteModel>,
+}
+
+/// A checkpoint known from its headers, downloaded per stage on demand.
+#[derive(Clone, Debug)]
+pub struct RemoteModel {
+    /// `<endpoint>/<repo>/resolve/<revision>`.
+    pub base_url: String,
+    pub tensors: Vec<RemoteTensor>,
+    /// Where this machine keeps the shards it downloads.
+    pub cache: PathBuf,
 }
 
 /// Human-readable log of what the cluster is doing.
@@ -351,7 +368,7 @@ pub struct Inner {
     pub cfg: Arc<ModelConfig>,
     config_json: String,
     pub tok: Arc<Tok>,
-    ws: Arc<WeightStore>,
+    ws: Arc<ModelWeights>,
     model_key: String,
     pub spec: ModelSpec,
     psk: [u8; 32],
@@ -404,9 +421,31 @@ impl Coordinator {
         let cfg = Arc::new(ModelConfig::from_file(&dir.join("config.json"))?);
         let config_json = std::fs::read_to_string(dir.join("config.json"))?;
         let tok = Arc::new(Tok::from_dir(&dir, &cfg.eos_token_ids, cfg.bos_token_id)?);
-        let ws = Arc::new(WeightStore::open_dir(&dir)?);
+        let (ws, mut spec) = match &opts.remote {
+            None => (
+                ModelWeights::Local(Arc::new(WeightStore::open_dir(&dir)?)),
+                tendril_core::model::source::inspect_local_dir(&dir)?,
+            ),
+            Some(r) => {
+                let raw: serde_json::Value = serde_json::from_str(&config_json)?;
+                let mut spec = tendril_core::model::config::spec_from_config(
+                    &opts.model_name,
+                    "huggingface (headers only)",
+                    &raw,
+                )?;
+                let infos: Vec<_> = r.tensors.iter().map(RemoteTensor::info).collect();
+                tendril_core::model::source::apply_measured(&mut spec, &infos);
+                (
+                    ModelWeights::Remote(RemoteWeights::new(
+                        r.base_url.clone(),
+                        r.tensors.clone(),
+                    )?),
+                    spec,
+                )
+            }
+        };
+        let ws = Arc::new(ws);
         let key = model_key(&config_json, &ws)?;
-        let mut spec = tendril_core::model::source::inspect_local_dir(&dir)?;
         spec.id = opts.model_name.clone();
         let spec = match opts.format {
             WeightFormat::Native => spec,
@@ -1326,8 +1365,17 @@ impl Coordinator {
                     )));
                 }
                 None => {
+                    let ws = match &*self.inner.ws {
+                        ModelWeights::Local(ws) => ws.clone(),
+                        ModelWeights::Remote(rw) => {
+                            let path = self.download_local_stage(i, rw, spec).await?;
+                            Arc::new(
+                                tokio::task::spawn_blocking(move || WeightStore::open(&[path]))
+                                    .await??,
+                            )
+                        }
+                    };
                     self.update_stage(i, |s| s.phase = "loading".into());
-                    let ws = self.inner.ws.clone();
                     let cfg = self.inner.cfg.clone();
                     let device = self.inner.opts.device.clone();
                     let fmt = self.inner.opts.format;
@@ -1491,6 +1539,44 @@ impl Coordinator {
             .unwrap_or_else(|| format!("node{id}"))
     }
 
+    /// Download this machine's own stage from the model's source (cached).
+    async fn download_local_stage(
+        &self,
+        idx: usize,
+        rw: &RemoteWeights,
+        spec: StageSpec,
+    ) -> Result<PathBuf> {
+        let tensors = stage_tensors(&self.inner.ws, &self.inner.cfg, &spec)?;
+        let cache = match &self.inner.opts.remote {
+            Some(r) => r.cache.clone(),
+            None => crate::shard::default_cache(),
+        };
+        let path = shard_path(&cache, &self.inner.model_key, &tensors);
+        if is_complete(&path) {
+            return Ok(path);
+        }
+        let total: u64 = tensors.iter().map(|t| t.len).sum();
+        self.update_stage(idx, |s| {
+            s.phase = "downloading".into();
+            s.total = total;
+        });
+        let source = crate::proto::WeightSource {
+            base_url: rw.base_url.clone(),
+            files: tensors
+                .iter()
+                .map(|t| rw.tensor(&t.name).map(|x| (x.file.clone(), x.offset)))
+                .collect::<Result<_>>()?,
+        };
+        let c = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let client = crate::fetch::client_for(&source.base_url)?;
+            crate::fetch::download_shard(&client, &source, &tensors, &path, &mut |done, _| {
+                c.update_stage(idx, |s| s.done = done);
+            })
+        })
+        .await?
+    }
+
     async fn load_remote(
         self,
         idx: usize,
@@ -1521,6 +1607,16 @@ impl Coordinator {
             device: "auto".into(),
             tensors: tensors.clone(),
             next,
+            source: match &*self.inner.ws {
+                ModelWeights::Local(_) => None,
+                ModelWeights::Remote(rw) => Some(crate::proto::WeightSource {
+                    base_url: rw.base_url.clone(),
+                    files: tensors
+                        .iter()
+                        .map(|t| rw.tensor(&t.name).map(|x| (x.file.clone(), x.offset)))
+                        .collect::<Result<_>>()?,
+                }),
+            },
         })
         .await
         .map_err(|_| anyhow!("{name} disconnected"))?;
@@ -1546,6 +1642,9 @@ impl Coordinator {
                         );
                         continue;
                     }
+                    let ModelWeights::Local(ws) = &*self.inner.ws else {
+                        bail!("{name} asked for weights this machine doesn't have");
+                    };
                     self.event(
                         "info",
                         format!(
@@ -1559,7 +1658,7 @@ impl Coordinator {
                     let t0 = Instant::now();
                     const CHUNK: usize = 4 << 20;
                     for nm in names {
-                        let (_, _, data) = self.inner.ws.raw(&nm)?;
+                        let (_, _, data) = ws.raw(&nm)?;
                         for (k, part) in data.chunks(CHUNK).enumerate() {
                             r.tx.send(Msg::WeightData {
                                 epoch,
@@ -1588,9 +1687,18 @@ impl Coordinator {
                     );
                 }
                 Msg::LoadProgress {
-                    epoch: e, phase, ..
+                    epoch: e,
+                    phase,
+                    done,
+                    total,
                 } if e == epoch => {
-                    self.update_stage(idx, |s| s.phase = phase);
+                    self.update_stage(idx, |s| {
+                        if total > 0 {
+                            s.done = done;
+                            s.total = total;
+                        }
+                        s.phase = phase;
+                    });
                 }
                 Msg::StageReady {
                     epoch: e,

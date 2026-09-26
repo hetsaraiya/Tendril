@@ -53,6 +53,24 @@ tendril run ~/models/my-model -p "Hello!"    # one-shot answer from a local fold
 
 ## Run a model across machines
 
+### Friends first, model later
+
+Nobody downloads the whole model: each machine fetches only its own layers.
+
+```bash
+tendril serve                                  # 1. you: open an empty pool
+tendril join --token XXXX-XXXX-XXXX-XXXX       # 2. each friend: join (same network)
+tendril load Qwen/Qwen2.5-14B-Instruct         # 3. you: pick the model
+```
+
+`load` fetches only the model's config, tokenizer and tensor headers, plans the split
+over the machines present, and then every machine (yours too) downloads just the byte
+ranges of its own layers from HuggingFace. `load` must run with the cluster token (it
+reads the one `serve` saved, or `--token`). For gated models (Llama, Gemma) every
+machine needs its own `HF_TOKEN`; yours is never sent to anyone.
+
+### Model first
+
 On the machine with the model (the **coordinator**):
 
 ```text

@@ -32,9 +32,6 @@ impl Bytes {
     pub fn as_gib(self) -> f64 {
         self.0 as f64 / GIB as f64
     }
-    pub fn as_mib(self) -> f64 {
-        self.0 as f64 / MIB as f64
-    }
     pub fn saturating_sub(self, o: Bytes) -> Bytes {
         Bytes(self.0.saturating_sub(o.0))
     }

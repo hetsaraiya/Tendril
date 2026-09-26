@@ -355,9 +355,129 @@ pub fn fetch_range(
     Ok(body)
 }
 
+/// Base URL of a repo's files: `<endpoint>/<repo>/resolve/<revision>`.
+pub fn hf_resolve_base(repo: &str, revision: &str) -> String {
+    format!("{}/{repo}/resolve/{revision}", hf_endpoint())
+}
+
+/// A client for large downloads: no overall timeout, only a connect timeout.
+pub fn download_client() -> Result<reqwest::blocking::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(t) = hf_token() {
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {t}")) {
+            headers.insert(reqwest::header::AUTHORIZATION, v);
+        }
+    }
+    Ok(reqwest::blocking::Client::builder()
+        .user_agent(concat!("tendril/", env!("CARGO_PKG_VERSION")))
+        .default_headers(headers)
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(None)
+        .build()?)
+}
+
+/// One tensor of a remote checkpoint and where its bytes live.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct RemoteTensor {
+    pub name: String,
+    pub dtype: String,
+    pub shape: Vec<u64>,
+    /// Checkpoint file inside the repo, e.g. `model-00001-of-00004.safetensors`.
+    pub file: String,
+    /// Absolute byte offset of the tensor's data in `file`.
+    pub offset: u64,
+    pub len: u64,
+}
+
+impl RemoteTensor {
+    /// The header entry in the form the inspector works with.
+    pub fn info(&self) -> TensorInfo {
+        TensorInfo {
+            name: self.name.clone(),
+            dtype: self.dtype.clone(),
+            shape: self.shape.clone(),
+            start: 0,
+            end: self.len,
+        }
+    }
+}
+
+/// The checkpoint files of a repo: from the shard index, else `model.safetensors`.
+fn hf_checkpoint_files(client: &reqwest::blocking::Client, base: &str) -> Result<Vec<String>> {
+    Ok(
+        match client
+            .get(format!("{base}/model.safetensors.index.json"))
+            .send()
+        {
+            Ok(r) if r.status().is_success() => {
+                let idx: serde_json::Value = r.json()?;
+                let mut s: Vec<String> = idx
+                    .get("weight_map")
+                    .and_then(|w| w.as_object())
+                    .map(|m| {
+                        m.values()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                s.sort();
+                s.dedup();
+                s
+            }
+            _ => vec!["model.safetensors".to_string()],
+        },
+    )
+}
+
+/// Every tensor of a HuggingFace safetensors checkpoint with its location,
+/// read from the file headers alone (two small range requests per file).
+pub fn hf_tensor_index(repo: &str, revision: &str) -> Result<Vec<RemoteTensor>> {
+    let client = http_client()?;
+    let base = hf_resolve_base(repo, revision);
+    let mut out = Vec::new();
+    for file in hf_checkpoint_files(&client, &base)? {
+        out.extend(remote_header(&client, &base, &file)?);
+    }
+    if out.is_empty() {
+        bail!("{repo} has no safetensors weights");
+    }
+    Ok(out)
+}
+
+fn remote_header(
+    client: &reqwest::blocking::Client,
+    base: &str,
+    file: &str,
+) -> Result<Vec<RemoteTensor>> {
+    if file.contains("..") || file.starts_with('/') {
+        bail!("{file}: invalid checkpoint file name");
+    }
+    let url = format!("{base}/{file}");
+    let head = fetch_range(client, &url, 0, 8)?;
+    if head.len() != 8 {
+        bail!("{file}: short read");
+    }
+    let n = u64::from_le_bytes(head.try_into().unwrap());
+    if n > safetensors::MAX_HEADER {
+        bail!("{file}: implausible header size {n}");
+    }
+    let json = fetch_range(client, &url, 8, n)?;
+    Ok(safetensors::parse_header(&json)?
+        .into_iter()
+        .map(|t| RemoteTensor {
+            offset: 8 + n + t.start,
+            len: t.len(),
+            name: t.name,
+            dtype: t.dtype,
+            shape: t.shape,
+            file: file.to_string(),
+        })
+        .collect())
+}
+
 fn inspect_hf_repo(repo: &str, revision: &str) -> Result<ModelSpec> {
     let client = http_client()?;
-    let base = format!("{}/{repo}/resolve/{revision}", hf_endpoint());
+    let base = hf_resolve_base(repo, revision);
     let cfg: serde_json::Value = check(
         client
             .get(format!("{base}/config.json"))
@@ -368,47 +488,17 @@ fn inspect_hf_repo(repo: &str, revision: &str) -> Result<ModelSpec> {
     .json()
     .context("config.json is not valid JSON")?;
     let mut spec = spec_from_config(repo, "huggingface (headers only)", &cfg)?;
-
-    // Shards: index file first, else a single model.safetensors.
-    let shards: Vec<String> = match client
-        .get(format!("{base}/model.safetensors.index.json"))
-        .send()
-    {
-        Ok(r) if r.status().is_success() => {
-            let idx: serde_json::Value = r.json()?;
-            let mut s: Vec<String> = idx
-                .get("weight_map")
-                .and_then(|w| w.as_object())
-                .map(|m| {
-                    m.values()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-            s.sort();
-            s.dedup();
-            s
-        }
-        _ => vec!["model.safetensors".to_string()],
-    };
+    let files = hf_checkpoint_files(&client, &base)?;
     let mut tensors = Vec::new();
-    for shard in &shards {
-        let url = format!("{base}/{shard}");
-        let head = match fetch_range(&client, &url, 0, 8) {
-            Ok(h) if h.len() == 8 => h,
-            Ok(_) | Err(_) if shards.len() == 1 => {
+    for file in &files {
+        match remote_header(&client, &base, file) {
+            Ok(t) => tensors.extend(t.iter().map(RemoteTensor::info)),
+            Err(_) if files.len() == 1 => {
                 spec.notes.push("No safetensors weights found in the repo; sizes are estimated from config.json.".into());
                 return Ok(spec);
             }
-            Ok(_) => bail!("{shard}: short read"),
             Err(e) => return Err(e),
-        };
-        let n = u64::from_le_bytes(head.try_into().unwrap());
-        if n > safetensors::MAX_HEADER {
-            bail!("{shard}: implausible header size {n}");
         }
-        let json = fetch_range(&client, &url, 8, n)?;
-        tensors.extend(safetensors::parse_header(&json)?);
     }
     apply_measured(&mut spec, &tensors);
     Ok(spec)

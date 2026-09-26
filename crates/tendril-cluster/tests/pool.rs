@@ -45,6 +45,7 @@ fn opts(dir: &std::path::Path, name: &str, port: u16) -> ServeOptions {
         speculate: true,
         draft_tokens: 4,
         recovery_timeout: Duration::from_secs(30),
+        remote: None,
     }
 }
 
@@ -117,7 +118,7 @@ async fn two_models_share_the_machines_and_route_by_name() {
         },
         Arc::new(|m: &str, e| eprintln!("agent[{m}]: {e:?}")),
     ));
-    for c in pool.models() {
+    for c in &pool.models() {
         wait_ready(c).await;
         let nodes = c.nodes();
         assert_eq!(nodes.len(), 2, "{nodes:?}");
@@ -216,4 +217,182 @@ async fn two_models_share_the_machines_and_route_by_name() {
 
     pool.shutdown().await;
     agent.abort();
+}
+
+/// Serve `file` over HTTP with byte ranges; count the bytes sent.
+fn range_server(file: Vec<u8>) -> (String, Arc<std::sync::atomic::AtomicU64>) {
+    use std::io::{BufRead, BufReader, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!(
+        "http://{}/org/tiny/resolve/main",
+        listener.local_addr().unwrap()
+    );
+    let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counter = served.clone();
+    std::thread::spawn(move || {
+        for s in listener.incoming() {
+            let mut s = s.unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let (mut line, mut range) = (String::new(), None);
+            r.read_line(&mut line).unwrap();
+            loop {
+                let mut h = String::new();
+                r.read_line(&mut h).unwrap();
+                if h.trim().is_empty() {
+                    break;
+                }
+                if let Some(v) = h.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                    let (a, b) = v.trim().split_once('-').unwrap();
+                    range = Some((a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()));
+                }
+            }
+            let (a, b) = range.expect("only range requests");
+            let body = &file[a..=b];
+            counter.fetch_add(body.len() as u64, std::sync::atomic::Ordering::SeqCst);
+            let _ = write!(
+                s,
+                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = s.write_all(body);
+        }
+    });
+    (base, served)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn machines_join_first_then_each_downloads_only_its_layers() {
+    use tendril_cluster::coordinator::RemoteModel;
+    use tendril_core::model::source::RemoteTensor;
+    // The "HuggingFace" copy of the model, and a folder with only config +
+    // tokenizer, like `tendril serve` keeps for a remote model.
+    let full = tempfile::tempdir().unwrap();
+    tendril_engine::testing::write_tiny_llama(full.path(), 6, 64, 5, candle_core::DType::F32)
+        .unwrap();
+    let meta = tempfile::tempdir().unwrap();
+    for f in std::fs::read_dir(full.path()).unwrap().flatten() {
+        if f.path().extension().is_some_and(|e| e != "safetensors") {
+            std::fs::copy(f.path(), meta.path().join(f.file_name())).unwrap();
+        }
+    }
+    let st = full.path().join("model.safetensors");
+    let (infos, data_start) = tendril_core::model::safetensors::read_local_header(&st).unwrap();
+    let tensors: Vec<RemoteTensor> = infos
+        .into_iter()
+        .map(|t| RemoteTensor {
+            offset: data_start + t.start,
+            len: t.len(),
+            file: "model.safetensors".into(),
+            name: t.name,
+            dtype: t.dtype,
+            shape: t.shape,
+        })
+        .collect();
+    let file = std::fs::read(&st).unwrap();
+    let file_len = file.len() as u64;
+    let (base_url, served) = range_server(file);
+
+    // 1. An empty pool; a machine joins before any model is chosen.
+    let port = free_port();
+    let pool = Pool::open(port, "POOL-TEST".into(), None).await.unwrap();
+    let agent_cache = tempfile::tempdir().unwrap();
+    let agent = tokio::spawn(agent::run(
+        AgentOptions {
+            coordinator: format!("127.0.0.1:{port}"),
+            token: "pool-test".into(),
+            name: Some("friend".into()),
+            device: "cpu".into(),
+            data_port: 0,
+            cache: agent_cache.path().to_path_buf(),
+            once: false,
+            max_memory: None,
+        },
+        Arc::new(|m: &str, e| eprintln!("agent[{m}]: {e:?}")),
+    ));
+    for _ in 0..100 {
+        if pool.machines().len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(pool.machines().len(), 1, "the machine waits in the pool");
+    assert_eq!(pool.state(), "waiting for a model");
+
+    // 2. Pick the model: split across both machines, weights fetched by range.
+    let coord_cache = tempfile::tempdir().unwrap();
+    let mut o = opts(meta.path(), "org/tiny", port);
+    o.remote = Some(RemoteModel {
+        base_url,
+        tensors,
+        cache: coord_cache.path().to_path_buf(),
+    });
+    pool.add(o).await.unwrap();
+    let c = pool.models()[0].clone();
+    wait_ready(&c).await;
+    assert!(
+        c.nodes().iter().all(|n| n.role != "idle"),
+        "{:?}",
+        c.nodes()
+    );
+
+    // Output is exactly what one machine with the whole model computes.
+    let prompt = c.inner.tok.encode_prompt("hello pool").unwrap();
+    let mut rx = c
+        .generate(tendril_cluster::coordinator::GenRequest {
+            prompt: prompt.clone(),
+            params: SamplingParams::greedy(),
+            max_tokens: 16,
+            stop: vec![],
+            ignore_eos: true,
+        })
+        .await
+        .unwrap();
+    let mut text = String::new();
+    while let Some(out) = rx.recv().await {
+        match out {
+            tendril_cluster::coordinator::GenOut::Text(t) => text.push_str(&t),
+            tendril_cluster::coordinator::GenOut::Done { .. } => break,
+            tendril_cluster::coordinator::GenOut::Error(e) => panic!("{e}"),
+        }
+    }
+    assert_eq!(text, reference(full.path(), &prompt, 16));
+
+    // Each machine downloaded only its own stage: a shard smaller than the
+    // checkpoint, and together not much more than one copy.
+    let shard_size = |dir: &std::path::Path| -> u64 {
+        walk(dir)
+            .iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
+            .map(|p| std::fs::metadata(p).unwrap().len())
+            .sum()
+    };
+    let (mine, theirs) = (
+        shard_size(coord_cache.path()),
+        shard_size(agent_cache.path()),
+    );
+    assert!(mine > 0 && theirs > 0, "both machines hold a shard");
+    assert!(
+        mine < file_len && theirs < file_len,
+        "{mine} {theirs} of {file_len}"
+    );
+    let got = served.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        got < file_len * 12 / 10,
+        "downloaded {got} bytes for a {file_len}-byte checkpoint"
+    );
+
+    pool.shutdown().await;
+    agent.abort();
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = vec![];
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        if e.path().is_dir() {
+            out.extend(walk(&e.path()));
+        } else {
+            out.push(e.path());
+        }
+    }
+    out
 }

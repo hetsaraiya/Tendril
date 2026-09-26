@@ -33,8 +33,8 @@ struct Target {
 fn target(s: &AppState, model: Option<&str>) -> Result<Target, Response> {
     match s.pool.get(model) {
         Ok(c) => Ok(Target {
-            coord: c.clone(),
             model: c.inner.opts.model_name.clone(),
+            coord: c,
         }),
         Err(m) => Err(err(StatusCode::NOT_FOUND, "model_not_found", m)),
     }
@@ -61,6 +61,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/status", get(status))
         .route("/api/events", get(events))
         .route("/v1/models", get(models))
+        .route("/api/models", post(load_model))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(completions))
         .route("/tokenize", post(tokenize))
@@ -93,7 +94,64 @@ fn serve_err(e: ServeError) -> Response {
     }
 }
 
+/// `{"model": "org/name"}` with `Authorization: Bearer <cluster token>`:
+/// start serving another model on the pool's machines.
+async fn load_model(
+    State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let given = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if crate::token::normalize(given) != crate::token::normalize(&s.pool.token) {
+        return err(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "loading a model needs the cluster token (Authorization: Bearer <token>)",
+        );
+    }
+    let Some(model) = model_field(&body) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "`model` is required",
+        );
+    };
+    match s.pool.load(model).await {
+        Ok(name) => Json(json!({"loaded": name})).into_response(),
+        Err(e) => err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            format!("{e:#}"),
+        ),
+    }
+}
+
 async fn status(State(s): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
+    if s.pool.models().is_empty() {
+        // No model yet: the machines waiting in the pool.
+        let nodes: Vec<Value> = s
+            .pool
+            .machines()
+            .iter()
+            .map(|p| {
+                json!({
+                    "name": p.name, "chip": p.chip, "backend": p.backend.label(),
+                    "usable": p.usable_memory.to_string(), "local": false,
+                })
+            })
+            .collect();
+        return Json(json!({
+            "model": null, "models": [], "architecture": "", "params": 0, "format": "native", "context": 0,
+            "status": {"state": "waiting", "reason": "No model chosen yet. On the server run: tendril load <model>", "advice": []},
+            "plan": null, "nodes": nodes, "metrics": crate::coordinator::Metrics::default(),
+            "events": s.pool.history(), "join": s.join_command, "version": env!("CARGO_PKG_VERSION"),
+        }))
+        .into_response();
+    }
     let t = match target(&s, q.get("model").map(String::as_str)) {
         Ok(t) => t,
         Err(r) => return r,

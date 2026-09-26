@@ -5,7 +5,7 @@ use tendril_core::NodeProfile;
 use tendril_engine::model::StageSpec;
 use tendril_engine::sampler::SamplingParams;
 
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 /// Activation tensors on the wire (raw little-endian bytes).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,6 +36,16 @@ pub struct TensorEntry {
     pub dtype: String,
     pub shape: Vec<usize>,
     pub len: u64,
+}
+
+/// Where a stage can download its tensors itself instead of receiving them
+/// from the coordinator: `files[i]` locates `tensors[i]` of the `LoadStage`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct WeightSource {
+    /// `<endpoint>/<repo>/resolve/<revision>`.
+    pub base_url: String,
+    /// (checkpoint file, absolute byte offset of the tensor's data).
+    pub files: Vec<(String, u64)>,
 }
 
 /// Time one stage spent on one message, microseconds.
@@ -127,6 +137,9 @@ pub enum Msg {
         device: String,
         tensors: Vec<TensorEntry>,
         next: NextHop,
+        /// Download the tensors from here; ask the coordinator (NeedWeights)
+        /// only if that fails. None: the coordinator sends them.
+        source: Option<WeightSource>,
     },
     /// Agent → coordinator: send me these tensors (not cached locally).
     NeedWeights {
@@ -222,6 +235,13 @@ pub enum Msg {
         seq: u64,
         stage: u32,
         error: String,
+    },
+
+    // ---- pool membership (kept last: variant indices above are stable) ----
+    /// Pool → agent: the models the pool serves now. The agent opens a
+    /// session for each one it doesn't serve yet.
+    Models {
+        models: Vec<String>,
     },
 }
 

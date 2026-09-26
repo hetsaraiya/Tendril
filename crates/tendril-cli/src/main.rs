@@ -27,8 +27,9 @@ use clap::{Parser, Subcommand};
                   on one machine, split across several, or not at all — and explains why.",
     after_help = "Examples:\n  \
         tendril run qwen2.5-0.5b                       chat with a small model on this machine\n  \
-        tendril serve Qwen/Qwen2.5-7B-Instruct         serve it; other machines can join\n  \
+        tendril serve                                  open a pool; other machines can join\n  \
         tendril join --token XXXX-XXXX-XXXX-XXXX      (on another machine) contribute it\n  \
+        tendril load Qwen/Qwen2.5-7B-Instruct          pick the model; each machine fetches its layers\n  \
         tendril serve llama-3.2-3b qwen2.5-1.5b       several models sharing the same machines\n  \
         tendril plan gemma-2-9b --node air=m4:16 --node mini=m5:16 --link thunderbolt\n  \
         tendril fit llama-3.1-70b --node studio=m2-ultra:192\n  \
@@ -49,6 +50,8 @@ enum Cmd {
     Join(serve::JoinArgs),
     /// List Tendril clusters on the local network.
     Discover(serve::DiscoverArgs),
+    /// Pick a model for a running server; each machine downloads only its layers.
+    Load(client::LoadArgs),
     /// Chat with a running server from the terminal.
     Chat(client::ChatArgs),
     /// Show a running server's machines, plan and traffic.
@@ -108,6 +111,7 @@ fn main() {
         Cmd::Serve(a) => serve::serve(a),
         Cmd::Join(a) => serve::join(a),
         Cmd::Discover(a) => serve::discover_cmd(a),
+        Cmd::Load(a) => client::load(a),
         Cmd::Chat(a) => client::chat(a),
         Cmd::Status(a) => client::status(a),
         Cmd::Pull(a) => models::ensure_local(&a.model, true)

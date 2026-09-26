@@ -12,6 +12,7 @@ pub mod agent;
 pub mod calibration;
 pub mod coordinator;
 pub mod discovery;
+pub mod fetch;
 pub mod http;
 pub mod pool;
 pub mod prefix;

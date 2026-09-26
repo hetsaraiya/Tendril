@@ -1,0 +1,90 @@
+name: Release
+
+# Push a tag like v0.1.0 (matching Cargo.toml) to publish binaries and update
+# `brew install hetsaraiya/tap/tendril`. Binaries are released on the public
+# tap repo because this repo is private.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            name: macos-arm64
+            features: --features metal
+          - runner: macos-15-intel
+            name: macos-x86_64
+            features: ""
+          - runner: ubuntu-latest
+            name: linux-x86_64
+            features: ""
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match the crate version
+        run: |
+          want="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          [ "$GITHUB_REF_NAME" = "$want" ] || { echo "::error::tag $GITHUB_REF_NAME but Cargo.toml says $want"; exit 1; }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked -p tendril-cli ${{ matrix.features }}
+      - name: Package
+        run: |
+          mkdir -p dist
+          tar -czf "dist/tendril-${GITHUB_REF_NAME}-${{ matrix.name }}.tar.gz" -C target/release tendril
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tendril-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: macos-15
+    env:
+      GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tendril-*
+          path: dist
+          merge-multiple: true
+      - name: Require the tap token
+        run: |
+          [ -n "$GH_TOKEN" ] || { echo "::error::set the HOMEBREW_TAP_TOKEN secret (a token that can push to hetsaraiya/homebrew-tap)"; exit 1; }
+      - name: Release binaries on the tap repo
+        run: |
+          tag="tendril-${GITHUB_REF_NAME}"
+          if gh release view "$tag" -R hetsaraiya/homebrew-tap >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber -R hetsaraiya/homebrew-tap
+          else
+            gh release create "$tag" dist/* -R hetsaraiya/homebrew-tap --title "Tendril ${GITHUB_REF_NAME}" --notes "Install: brew install hetsaraiya/tap/tendril"
+          fi
+      - uses: actions/checkout@v4
+        with:
+          repository: hetsaraiya/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+      - name: Update the formula
+        run: |
+          sha() { shasum -a 256 "dist/tendril-${GITHUB_REF_NAME}-$1.tar.gz" | awk '{print $1}'; }
+          mkdir -p homebrew-tap/Formula
+          sed -e "s/__VERSION__/${GITHUB_REF_NAME#v}/g" \
+              -e "s/__MACOS_ARM64_SHA256__/$(sha macos-arm64)/" \
+              -e "s/__MACOS_X86_64_SHA256__/$(sha macos-x86_64)/" \
+              -e "s/__LINUX_X86_64_SHA256__/$(sha linux-x86_64)/" \
+              packaging/homebrew/tendril.rb > homebrew-tap/Formula/tendril.rb
+          ruby -c homebrew-tap/Formula/tendril.rb
+          cd homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/tendril.rb
+          git diff --cached --quiet || { git commit -m "Update tendril to ${GITHUB_REF_NAME#v}"; git push; }

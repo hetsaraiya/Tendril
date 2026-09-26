@@ -4,22 +4,102 @@
 use crate::proto::TensorEntry;
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tendril_core::model::safetensors::{classify, Component};
+use tendril_core::model::source::RemoteTensor;
 use tendril_engine::config::ModelConfig;
 use tendril_engine::model::StageSpec;
-use tendril_engine::weights::WeightStore;
+use tendril_engine::weights::{find_head_name, WeightStore};
+
+/// A model's weights as the coordinator knows them.
+pub enum ModelWeights {
+    /// Every checkpoint file is on this machine.
+    Local(Arc<WeightStore>),
+    /// Only the headers are known: each machine downloads its own tensors.
+    Remote(RemoteWeights),
+}
+
+/// A checkpoint on HuggingFace (or a mirror), known from its headers.
+pub struct RemoteWeights {
+    /// `<endpoint>/<repo>/resolve/<revision>`: files are `<base_url>/<file>`.
+    pub base_url: String,
+    tensors: BTreeMap<String, RemoteTensor>,
+    head_name: Option<String>,
+}
+
+impl RemoteWeights {
+    pub fn new(base_url: String, tensors: Vec<RemoteTensor>) -> Result<RemoteWeights> {
+        let mut map = BTreeMap::new();
+        for t in tensors {
+            if map.insert(t.name.clone(), t).is_some() {
+                bail!("the checkpoint lists a tensor twice");
+            }
+        }
+        if map.is_empty() {
+            bail!("the checkpoint has no tensors");
+        }
+        let head_name = find_head_name(map.keys().map(String::as_str));
+        Ok(RemoteWeights {
+            base_url,
+            tensors: map,
+            head_name,
+        })
+    }
+
+    pub fn tensor(&self, name: &str) -> Result<&RemoteTensor> {
+        self.tensors
+            .get(name)
+            .with_context(|| format!("missing tensor {name}"))
+    }
+}
+
+impl ModelWeights {
+    /// Tensor names in a stable (sorted) order.
+    pub fn names(&self) -> Vec<&String> {
+        match self {
+            ModelWeights::Local(ws) => ws.all_names().collect(),
+            ModelWeights::Remote(r) => r.tensors.keys().collect(),
+        }
+    }
+
+    /// (dtype, shape, byte length) of a tensor.
+    pub fn meta(&self, name: &str) -> Result<(String, Vec<usize>, u64)> {
+        match self {
+            ModelWeights::Local(ws) => {
+                let (dt, shape, data) = ws.raw(name)?;
+                Ok((format!("{dt:?}"), shape, data.len() as u64))
+            }
+            ModelWeights::Remote(r) => {
+                let t = r.tensor(name)?;
+                Ok((
+                    t.dtype.clone(),
+                    t.shape.iter().map(|&d| d as usize).collect(),
+                    t.len,
+                ))
+            }
+        }
+    }
+
+    pub fn head_name(&self) -> Option<&str> {
+        match self {
+            ModelWeights::Local(ws) => ws.head_name(),
+            ModelWeights::Remote(r) => r.head_name.as_deref(),
+        }
+    }
+}
 
 /// Tensors a stage needs, in a stable order.
 pub fn stage_tensors(
-    ws: &WeightStore,
+    ws: &ModelWeights,
     cfg: &ModelConfig,
     spec: &StageSpec,
 ) -> Result<Vec<TensorEntry>> {
     let head_name = ws.head_name().map(String::from);
     let mut out = Vec::new();
-    for name in ws.all_names() {
+    for name in ws.names() {
         let keep = match classify(name) {
             Component::Embed => {
                 spec.embed || (spec.head && (cfg.tie_embeddings || head_name.is_none()))
@@ -30,12 +110,12 @@ pub fn stage_tensors(
             Component::Ignored => false,
         };
         if keep {
-            let (dt, shape, data) = ws.raw(name)?;
+            let (dtype, shape, len) = ws.meta(name)?;
             out.push(TensorEntry {
                 name: name.clone(),
-                dtype: format!("{dt:?}"),
+                dtype,
                 shape,
-                len: data.len() as u64,
+                len,
             });
         }
     }
@@ -46,12 +126,14 @@ pub fn stage_tensors(
 }
 
 /// Identity of a model's weights (not its path): config + tensor table.
-pub fn model_key(config_json: &str, ws: &WeightStore) -> Result<String> {
+/// The same checkpoint gets the same key whether it is local or remote, so
+/// machines reuse cached shards either way.
+pub fn model_key(config_json: &str, ws: &ModelWeights) -> Result<String> {
     let mut h = Sha256::new();
     h.update(config_json.as_bytes());
-    for n in ws.all_names() {
-        let (dt, shape, data) = ws.raw(n)?;
-        h.update(format!("{n}:{dt:?}:{shape:?}:{};", data.len()).as_bytes());
+    for n in ws.names() {
+        let (dt, shape, len) = ws.meta(n)?;
+        h.update(format!("{n}:{dt}:{shape:?}:{len};").as_bytes());
     }
     Ok(hex(&h.finalize()[..12]))
 }
@@ -149,6 +231,11 @@ impl ShardWriter {
 
     pub fn written(&self) -> u64 {
         self.written
+    }
+
+    /// Forget bytes written since `written` (a tensor is being re-fetched).
+    pub fn rewind(&mut self, written: u64) {
+        self.written = written;
     }
 
     pub fn finish(mut self) -> Result<PathBuf> {

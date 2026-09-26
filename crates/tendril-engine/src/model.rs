@@ -512,10 +512,6 @@ impl Stage {
         self.seqs.contains_key(&id)
     }
 
-    pub fn seq_pos(&self, id: u64) -> Option<usize> {
-        self.seqs.get(&id).map(|s| s.pos)
-    }
-
     pub fn release(&mut self, id: u64) {
         self.seqs.remove(&id);
     }

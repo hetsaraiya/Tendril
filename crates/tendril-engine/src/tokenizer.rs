@@ -130,10 +130,6 @@ impl Tok {
         })
     }
 
-    pub fn has_chat_template(&self) -> bool {
-        self.template.is_some()
-    }
-
     pub fn vocab_size(&self) -> usize {
         self.inner.get_vocab_size(true)
     }

@@ -247,22 +247,17 @@ async fn session(
                 },
             );
             // Serve every model of the pool: one session (and stage) each.
-            let mut known = sessions.lock().unwrap();
-            known.insert(cluster.clone());
-            for (i, m) in models.iter().enumerate() {
-                if known.insert(m.clone()) {
-                    let mut o = opts.clone();
-                    if o.data_port != 0 {
-                        o.data_port = o.data_port.saturating_add(i as u16);
-                    }
-                    spawn_sibling(o, m.clone(), machine, ev.clone(), sessions.clone());
-                }
+            if !cluster.is_empty() {
+                sessions.lock().unwrap().insert(cluster.clone());
             }
+            open_sessions(opts, &models, machine, ev, sessions);
             cluster
         }
         Msg::Reject { reason } => return Ok(Some(reason)),
         other => bail!("unexpected reply {other:?}"),
     };
+    // Sessions opened later report under their own model's name.
+    let root_ev = ev.clone();
     let ev: EventFn = {
         let ev = ev.clone();
         let label = label.clone();
@@ -302,6 +297,7 @@ async fn session(
                 device,
                 tensors,
                 next,
+                source,
             } => {
                 drop(active.lock().unwrap().take());
                 let (wtx, wrx) = mpsc::unbounded_channel();
@@ -320,6 +316,7 @@ async fn session(
                     },
                     tensors,
                     next,
+                    source,
                 };
                 tokio::spawn(load_stage(
                     job,
@@ -343,12 +340,34 @@ async fn session(
                     ev(&label, AgentEvent::Unloaded);
                 }
             }
+            Msg::Models { models } => open_sessions(opts, &models, machine, &root_ev, sessions),
             Msg::Bye { .. } => break Ok(None),
             _ => {}
         }
     };
     writer_task.abort();
     result
+}
+
+/// Open a session for each of the pool's models this machine doesn't serve yet.
+/// With a fixed `--data-port`, the model at position i listens on port + 1 + i.
+fn open_sessions(
+    opts: &AgentOptions,
+    models: &[String],
+    machine: u64,
+    ev: &EventFn,
+    sessions: &Sessions,
+) {
+    let mut known = sessions.lock().unwrap();
+    for (i, m) in models.iter().enumerate() {
+        if known.insert(m.clone()) {
+            let mut o = opts.clone();
+            if o.data_port != 0 {
+                o.data_port = o.data_port.saturating_add(1 + i as u16);
+            }
+            spawn_sibling(o, m.clone(), machine, ev.clone(), sessions.clone());
+        }
+    }
 }
 
 struct LoadJob {
@@ -361,6 +380,7 @@ struct LoadJob {
     device: String,
     tensors: Vec<crate::proto::TensorEntry>,
     next: NextHop,
+    source: Option<crate::proto::WeightSource>,
 }
 
 async fn load_stage(
@@ -378,7 +398,10 @@ async fn load_stage(
         let t0 = Instant::now();
         let path = shard_path(&cache, &job.model_key, &job.tensors);
         let cached = is_complete(&path);
-        if !cached {
+        if let (false, Some(src)) = (cached, &job.source) {
+            // Fetch only this stage's tensors from the model's source ourselves.
+            download_direct(src, &job, &path, epoch, spec, &out, &ev).await?;
+        } else if !cached {
             let names = job.tensors.iter().map(|t| t.name.clone()).collect();
             out.send(Msg::NeedWeights { epoch, names })?;
             let mut w = ShardWriter::create(&path, &job.tensors)?;
@@ -425,7 +448,7 @@ async fn load_stage(
                 },
             );
             w.finish()?;
-        } else {
+        } else if cached {
             out.send(Msg::NeedWeights {
                 epoch,
                 names: vec![],
@@ -505,6 +528,40 @@ async fn load_stage(
         );
         let _ = out.send(Msg::LoadFailed { epoch, error });
     }
+}
+
+/// Download a stage's shard from `src`, reporting progress to the coordinator.
+async fn download_direct(
+    src: &crate::proto::WeightSource,
+    job: &LoadJob,
+    path: &std::path::Path,
+    epoch: u64,
+    spec: StageSpec,
+    out: &mpsc::UnboundedSender<Msg>,
+    ev: &EventFn,
+) -> Result<()> {
+    let (src, entries, path) = (src.clone(), job.tensors.clone(), path.to_path_buf());
+    let (out, ev) = (out.clone(), ev.clone());
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let client = crate::fetch::client_for(&src.base_url)?;
+        let mut last: Option<Instant> = None;
+        let mut report = |done: u64, total: u64| {
+            if last.is_none_or(|t| t.elapsed() > Duration::from_millis(250)) || done == total {
+                last = Some(Instant::now());
+                let _ = out.send(Msg::LoadProgress {
+                    epoch,
+                    phase: "downloading".into(),
+                    done,
+                    total,
+                });
+                ev("", AgentEvent::Receiving { spec, done, total });
+            }
+        };
+        report(0, entries.iter().map(|e| e.len).sum());
+        crate::fetch::download_shard(&client, &src, &entries, &path, &mut report)?;
+        Ok(())
+    })
+    .await?
 }
 
 pub(crate) async fn connect_retry(

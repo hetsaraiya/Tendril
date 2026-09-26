@@ -7,6 +7,7 @@
 //! coordinator then plans inside its share like it would on a smaller machine.
 
 use crate::coordinator::{read_hello, Coordinator, Event, PoolLink, ServeOptions, Status};
+use crate::proto::Msg;
 use crate::{token, wire};
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -18,7 +19,10 @@ use tendril_core::hardware::NodeProfile;
 use tendril_core::pool::{allocate, PoolModel};
 use tendril_core::units::Bytes;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, mpsc, Notify};
+
+/// Turns what a user typed into serve options (fetching the model's config).
+pub type Resolver = Arc<dyn Fn(&str) -> Result<ServeOptions> + Send + Sync>;
 
 /// One model's slice of the pool, for status pages.
 #[derive(Clone, Debug, Serialize)]
@@ -31,112 +35,151 @@ pub struct Share {
 }
 
 pub struct Pool {
-    models: Vec<Coordinator>,
-    links: Vec<Arc<PoolLink>>,
+    models: StdMutex<Vec<Coordinator>>,
+    links: StdMutex<Vec<Arc<PoolLink>>>,
     shares: StdMutex<Vec<Share>>,
     events: broadcast::Sender<Event>,
     history: Arc<StdMutex<VecDeque<Event>>>,
+    changed: Arc<Notify>,
+    /// Each joined machine's first session, by machine id: machines wait
+    /// here for models and hear about new ones.
+    lobby: StdMutex<HashMap<u64, (NodeProfile, mpsc::UnboundedSender<Msg>)>>,
+    adding: tokio::sync::Mutex<()>,
+    control_port: u16,
+    /// The cluster token (also guards the model-loading API).
+    pub token: String,
+    resolve: Option<Resolver>,
 }
 
 impl Pool {
     /// Start serving `opts` (one entry per model; the first one's ports,
     /// token and machine settings apply to the pool).
     pub async fn start(opts: Vec<ServeOptions>) -> Result<Arc<Pool>> {
-        if opts.is_empty() {
-            bail!("no model to serve");
+        let first = opts.first().context("no model to serve")?;
+        let pool = Pool::open(first.control_port, first.token.clone(), None).await?;
+        for o in opts {
+            pool.add(o).await?;
         }
-        let names: Vec<String> = opts.iter().map(|o| o.model_name.clone()).collect();
-        for (i, n) in names.iter().enumerate() {
-            if names[..i].contains(n) {
-                bail!("{n} is listed twice");
-            }
-        }
-        let (events, _) = broadcast::channel(512);
-        let history = Arc::new(StdMutex::new(VecDeque::new()));
-        if opts.len() == 1 {
-            let c = Coordinator::start(opts.into_iter().next().unwrap()).await?;
-            let pool = Arc::new(Pool {
-                models: vec![c],
-                links: vec![],
-                shares: StdMutex::new(vec![]),
-                events,
-                history,
-            });
-            pool.forward_events();
-            return Ok(pool);
-        }
-        let changed = Arc::new(Notify::new());
-        let control_port = opts[0].control_port;
-        let psk = token::psk(&opts[0].token);
+        Ok(pool)
+    }
+
+    /// An empty pool: machines can join now, models are added later.
+    pub async fn open(
+        control_port: u16,
+        token: String,
+        resolve: Option<Resolver>,
+    ) -> Result<Arc<Pool>> {
         let control = TcpListener::bind(("0.0.0.0", control_port))
             .await
             .with_context(|| {
                 format!("cannot listen on port {control_port} (is another Tendril running?)")
             })?;
-        let mut models = Vec::new();
-        let mut links = Vec::new();
-        for (i, o) in opts.into_iter().enumerate() {
-            let link = Arc::new(PoolLink {
-                index: i,
-                models: names.clone(),
-                budgets: StdMutex::new(None),
-                note: StdMutex::new(None),
-                changed: changed.clone(),
-            });
-            models.push(Coordinator::start_with(o, Some(link.clone())).await?);
-            links.push(link);
-        }
+        let (events, _) = broadcast::channel(512);
+        let changed = Arc::new(Notify::new());
         let pool = Arc::new(Pool {
-            shares: StdMutex::new(
-                names
-                    .iter()
-                    .map(|n| Share {
-                        model: n.clone(),
-                        placed: false,
-                        reason: None,
-                        machines: vec![],
-                    })
-                    .collect(),
-            ),
-            models,
-            links,
+            models: StdMutex::new(vec![]),
+            links: StdMutex::new(vec![]),
+            shares: StdMutex::new(vec![]),
             events,
-            history,
+            history: Arc::new(StdMutex::new(VecDeque::new())),
+            changed: changed.clone(),
+            lobby: StdMutex::new(HashMap::new()),
+            adding: tokio::sync::Mutex::new(()),
+            control_port,
+            token: token.clone(),
+            resolve,
         });
-        pool.forward_events();
-        tokio::spawn(pool.clone().control_loop(control, psk));
-        tokio::spawn(pool.clone().allocator_loop(changed.clone()));
-        changed.notify_one();
+        tokio::spawn(pool.clone().control_loop(control, token::psk(&token)));
+        tokio::spawn(pool.clone().allocator_loop(changed));
         Ok(pool)
     }
 
-    pub fn primary(&self) -> &Coordinator {
-        &self.models[0]
+    /// Resolve `name` (downloading its config, not its weights) and serve it.
+    pub async fn load(&self, name: &str) -> Result<String> {
+        let resolve = self
+            .resolve
+            .clone()
+            .context("this server can't load models on request")?;
+        let name = name.to_string();
+        let opts = tokio::task::spawn_blocking(move || resolve(&name)).await??;
+        let model = opts.model_name.clone();
+        self.add(opts).await?;
+        Ok(model)
     }
 
-    pub fn models(&self) -> &[Coordinator] {
-        &self.models
+    /// Serve one more model on the pool's machines.
+    pub async fn add(&self, mut opts: ServeOptions) -> Result<()> {
+        let _one_at_a_time = self.adding.lock().await;
+        let mut names = self.names();
+        if names.contains(&opts.model_name) {
+            bail!("{} is already loaded", opts.model_name);
+        }
+        names.push(opts.model_name.clone());
+        opts.control_port = self.control_port;
+        let link = Arc::new(PoolLink {
+            index: names.len() - 1,
+            models: names.clone(),
+            budgets: StdMutex::new(None),
+            note: StdMutex::new(None),
+            changed: self.changed.clone(),
+        });
+        let c = Coordinator::start_with(opts, Some(link.clone())).await?;
+        self.forward_events(&c);
+        self.shares.lock().unwrap().push(Share {
+            model: c.inner.opts.model_name.clone(),
+            placed: false,
+            reason: None,
+            machines: vec![],
+        });
+        self.models.lock().unwrap().push(c);
+        self.links.lock().unwrap().push(link);
+        // Joined machines open a session for the new model.
+        for (_, tx) in self.lobby.lock().unwrap().values() {
+            let _ = tx.send(Msg::Models {
+                models: names.clone(),
+            });
+        }
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    pub fn models(&self) -> Vec<Coordinator> {
+        self.models.lock().unwrap().clone()
     }
 
     pub fn names(&self) -> Vec<String> {
-        self.models
+        self.models()
             .iter()
             .map(|c| c.inner.opts.model_name.clone())
             .collect()
     }
 
+    /// Machines waiting in (or joined to) the pool, as the lobby sees them.
+    pub fn machines(&self) -> Vec<NodeProfile> {
+        self.lobby
+            .lock()
+            .unwrap()
+            .values()
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+
     pub fn is_multi(&self) -> bool {
-        self.models.len() > 1
+        self.models.lock().unwrap().len() > 1
     }
 
     /// The coordinator for an API request's `model` field. With a single
     /// model any name is accepted (clients often send their own label).
-    pub fn get(&self, name: Option<&str>) -> Result<&Coordinator, String> {
-        let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
-            return Ok(self.primary());
+    pub fn get(&self, name: Option<&str>) -> Result<Coordinator, String> {
+        let models = self.models();
+        let Some(first) = models.first() else {
+            return Err("no model is loaded yet — run `tendril load <model>` on the server".into());
         };
-        if !self.is_multi() {
-            return Ok(self.primary());
+        let Some(name) = name.map(str::trim).filter(|n| !n.is_empty()) else {
+            return Ok(first.clone());
+        };
+        if models.len() == 1 {
+            return Ok(first.clone());
         }
         let names = self.names();
         let norm = |s: &str| s.to_ascii_lowercase();
@@ -156,7 +199,7 @@ impl Pool {
                 (hits.len() == 1).then(|| hits[0])
             });
         match pick {
-            Some(i) => Ok(&self.models[i]),
+            Some(i) => Ok(models[i].clone()),
             None => Err(format!(
                 "model '{name}' is not served here; available: {}",
                 names.join(", ")
@@ -203,32 +246,32 @@ impl Pool {
         Self::push_event(&self.events, &self.history, e);
     }
 
-    /// Merge the models' event streams into the pool's.
-    fn forward_events(&self) {
-        for c in &self.models {
-            // Events logged before we subscribed.
-            for e in c.history() {
-                Self::push_event(&self.events, &self.history, e);
-            }
-            let mut rx = c.subscribe();
-            let tx = self.events.clone();
-            let history = self.history.clone();
-            tokio::spawn(async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(e) => Self::push_event(&tx, &history, e),
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(_) => break,
-                    }
-                }
-            });
+    /// Merge a model's event stream into the pool's.
+    fn forward_events(&self, c: &Coordinator) {
+        // Events logged before we subscribed.
+        for e in c.history() {
+            Self::push_event(&self.events, &self.history, e);
         }
+        let mut rx = c.subscribe();
+        let tx = self.events.clone();
+        let history = self.history.clone();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(e) => Self::push_event(&tx, &history, e),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => break,
+                }
+            }
+        });
     }
 
     /// One short word for the whole pool (discovery, terminal).
     pub fn state(&self) -> &'static str {
-        let st: Vec<Status> = self.models.iter().map(|c| c.status()).collect();
-        if st.iter().all(|s| matches!(s, Status::Ready { .. })) {
+        let st: Vec<Status> = self.models().iter().map(|c| c.status()).collect();
+        if st.is_empty() {
+            "waiting for a model"
+        } else if st.iter().all(|s| matches!(s, Status::Ready { .. })) {
             "ready"
         } else if st.iter().any(|s| matches!(s, Status::Loading { .. })) {
             "loading"
@@ -245,17 +288,24 @@ impl Pool {
 
     /// Distinct machines in the pool.
     pub fn machine_count(&self) -> usize {
-        self.models
+        // ponytail: counts this machine even with --no-local.
+        let joined = self.lobby.lock().unwrap().len() + 1;
+        self.models()
             .iter()
             .map(|c| c.nodes().len())
-            .max()
-            .unwrap_or(0)
+            .fold(joined, usize::max)
     }
 
     pub async fn shutdown(&self) {
-        for c in &self.models {
+        for c in self.models() {
             c.shutdown().await;
         }
+        for (_, tx) in self.lobby.lock().unwrap().values() {
+            let _ = tx.send(Msg::Bye {
+                reason: "coordinator shutting down".into(),
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 
     // ------------------------------------------------------------------
@@ -279,17 +329,17 @@ impl Pool {
         let conn = match wire::accept(s, &psk).await {
             Ok(c) => c,
             Err(e) => {
-                self.primary()
-                    .event("warn", format!("Rejected a connection: {e:#}"));
+                self.event("warn", format!("Rejected a connection: {e:#}"));
                 return Err(e);
             }
         };
         let peer_ip = conn.peer.ip();
         let (mut reader, mut writer) = (conn.reader, conn.writer);
         let (hello, model) = read_hello(&mut reader, &mut writer).await?;
+        let models = self.models();
         let coord = match &model {
-            None => self.primary(),
-            Some(m) => match self.models.iter().find(|c| &c.inner.opts.model_name == m) {
+            None => return self.lobby_session(reader, writer, hello).await,
+            Some(m) => match models.iter().find(|c| &c.inner.opts.model_name == m) {
                 Some(c) => c,
                 None => {
                     let reason = format!("this cluster doesn't serve {m} any more");
@@ -307,10 +357,69 @@ impl Pool {
             .await
     }
 
+    /// A machine's first session: keep it alive and tell it about models.
+    async fn lobby_session(
+        &self,
+        mut reader: wire::Reader,
+        mut writer: wire::Writer,
+        hello: crate::coordinator::HelloInfo,
+    ) -> Result<()> {
+        let name = hello.profile.name.clone();
+        writer
+            .send(&Msg::Welcome {
+                node_id: 0,
+                name: name.clone(),
+                cluster: String::new(),
+                models: self.names(),
+            })
+            .await?;
+        let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+        self.lobby
+            .lock()
+            .unwrap()
+            .insert(hello.machine, (hello.profile.clone(), tx.clone()));
+        if self.models().is_empty() {
+            self.event(
+                "ok",
+                format!(
+                    "{name} joined — {} · {} for models. Waiting for a model: `tendril load <model>`",
+                    hello.profile.chip, hello.profile.usable_memory
+                ),
+            );
+        }
+        let pump = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                let m = tokio::select! {
+                    m = rx.recv() => match m { Some(m) => m, None => break },
+                    _ = tick.tick() => Msg::Ping { t: 0 },
+                };
+                if writer.send(&m).await.is_err() {
+                    break;
+                }
+            }
+        });
+        // Pongs keep the session alive; silence means the machine is gone.
+        while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(20), reader.recv()).await {}
+        pump.abort();
+        let mut lobby = self.lobby.lock().unwrap();
+        if lobby
+            .get(&hello.machine)
+            .is_some_and(|(_, t)| t.same_channel(&tx))
+        {
+            lobby.remove(&hello.machine);
+        }
+        drop(lobby);
+        if self.models().is_empty() {
+            self.event("warn", format!("{name} left the pool"));
+        }
+        Ok(())
+    }
+
     /// Every machine any model sees, with the best-known links between them.
-    fn merged_cluster(&self) -> (Cluster, Vec<u64>) {
+    fn merged_cluster(&self, models: &[Coordinator]) -> (Cluster, Vec<u64>) {
         let snaps: Vec<(Cluster, Vec<u32>, Vec<u64>)> =
-            self.models.iter().map(|c| c.raw_snapshot()).collect();
+            models.iter().map(|c| c.raw_snapshot()).collect();
         let mut machines: Vec<u64> = Vec::new();
         let mut nodes: Vec<NodeProfile> = Vec::new();
         for (c, _, ms) in &snaps {
@@ -341,15 +450,22 @@ impl Pool {
     }
 
     async fn allocator_loop(self: Arc<Self>, changed: Arc<Notify>) {
-        let mut last: Vec<HashMap<u64, Bytes>> = vec![HashMap::new(); self.models.len()];
+        let mut last: Vec<HashMap<u64, Bytes>> = vec![];
         let mut first = true;
         loop {
             changed.notified().await;
             // Let a machine's sessions for every model arrive.
             tokio::time::sleep(Duration::from_millis(600)).await;
-            let (cluster, machines) = self.merged_cluster();
-            let specs: Vec<_> = self
-                .models
+            let models = self.models();
+            let links = self.links.lock().unwrap().clone();
+            if models.is_empty() {
+                continue;
+            }
+            // A model added since the last round starts with no share.
+            let grew = last.len() < models.len();
+            last.resize(models.len(), HashMap::new());
+            let (cluster, machines) = self.merged_cluster(&models);
+            let specs: Vec<_> = models
                 .iter()
                 .zip(&last)
                 .map(|(c, prev)| {
@@ -403,7 +519,7 @@ impl Pool {
                 });
             }
             *self.shares.lock().unwrap() = shares.clone();
-            if next == last && !first {
+            if next == last && !first && !grew {
                 continue;
             }
             first = false;
@@ -450,10 +566,10 @@ impl Pool {
                     .any(|(m, b)| next[i].get(m).is_none_or(|nb| nb < b))
             };
             let (shrinking, rest): (Vec<usize>, Vec<usize>) =
-                (0..self.models.len()).partition(|&i| shrinks(i));
+                (0..models.len()).partition(|&i| shrinks(i));
             let apply = |i: usize| {
                 let placed = alloc.placements[i].plan.is_some();
-                *self.links[i].note.lock().unwrap() = if placed {
+                *links[i].note.lock().unwrap() = if placed {
                     None
                 } else {
                     Some(
@@ -463,8 +579,8 @@ impl Pool {
                             .unwrap_or_else(|| "not enough memory in the pool".into()),
                     )
                 };
-                *self.links[i].budgets.lock().unwrap() = Some(next[i].clone());
-                self.models[i].replan();
+                *links[i].budgets.lock().unwrap() = Some(next[i].clone());
+                models[i].replan();
             };
             for &i in &shrinking {
                 apply(i);

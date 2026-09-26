@@ -5,8 +5,10 @@ use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
-use tendril_core::model::source::{hf_cache_snapshot, hf_endpoint, http_client, resolve, ModelRef};
+use tendril_core::model::source::{
+    download_client, hf_cache_snapshot, hf_endpoint, hf_resolve_base, hf_tensor_index, http_client,
+    resolve, ModelRef, RemoteTensor,
+};
 use tendril_core::units::Bytes;
 
 pub fn models_dir() -> PathBuf {
@@ -66,8 +68,31 @@ pub fn ensure_local(name: &str, allow_download: bool) -> Result<(PathBuf, String
     if !allow_download {
         bail!("{repo} is not downloaded yet. Run: tendril pull {repo}");
     }
-    pull(&repo, &revision, &dir)?;
+    pull(&repo, &revision, &dir, true)?;
     Ok((dir, repo))
+}
+
+/// For serving: a local model as is, else just its config and tokenizer plus
+/// the tensor table, so each machine downloads only its own layers.
+/// Returns (directory, display name, remote weights: (base URL, tensors)).
+#[allow(clippy::type_complexity)]
+pub fn ensure_meta(name: &str) -> Result<(PathBuf, String, Option<(String, Vec<RemoteTensor>)>)> {
+    let (repo, revision) = match resolve(name)? {
+        ModelRef::HfRepo { repo, revision } => (repo, revision),
+        ModelRef::Catalog(e) => (e.repo.to_string(), "main".to_string()),
+        _ => return ensure_local(name, false).map(|(d, n)| (d, n, None)),
+    };
+    let dir = models_dir().join(repo.replace('/', "--"));
+    if complete(&dir) || hf_cache_snapshot(&repo, &revision).is_some_and(|s| usable_snapshot(&s)) {
+        return ensure_local(name, false).map(|(d, n)| (d, n, None));
+    }
+    pull(&repo, &revision, &dir, false)?;
+    let tensors = hf_tensor_index(&repo, &revision)?;
+    Ok((
+        dir,
+        repo.clone(),
+        Some((hf_resolve_base(&repo, &revision), tensors)),
+    ))
 }
 
 fn display_name(p: &Path) -> String {
@@ -88,7 +113,8 @@ const WANTED: &[&str] = &[
 ];
 
 /// Download the files needed to run `repo` into `dir`, resuming partial files.
-pub fn pull(repo: &str, revision: &str, dir: &Path) -> Result<()> {
+/// Without `weights`, only the config and tokenizer files.
+pub fn pull(repo: &str, revision: &str, dir: &Path, weights: bool) -> Result<()> {
     let client = http_client()?;
     let api = format!("{}/api/models/{repo}/revision/{revision}", hf_endpoint());
     let info: serde_json::Value = client
@@ -122,10 +148,11 @@ pub fn pull(repo: &str, revision: &str, dir: &Path) -> Result<()> {
     let mut want: Vec<(String, u64)> = files
         .into_iter()
         .filter(|(n, _)| {
-            WANTED.contains(&n.as_str()) || (n.ends_with(".safetensors") && !n.contains('/'))
+            WANTED.contains(&n.as_str())
+                || (weights && n.ends_with(".safetensors") && !n.contains('/'))
         })
         .collect();
-    if !want.iter().any(|(n, _)| n.ends_with(".safetensors")) {
+    if weights && !want.iter().any(|(n, _)| n.ends_with(".safetensors")) {
         bail!("{repo} has no .safetensors weights at the top level (Tendril can't run .bin/.gguf-only repos yet)");
     }
     if !want.iter().any(|(n, _)| n == "tokenizer.json") {
@@ -165,20 +192,7 @@ pub fn pull(repo: &str, revision: &str, dir: &Path) -> Result<()> {
         .unwrap()
         .progress_chars("█▉▊▋▌▍▎▏ "),
     );
-    let big_client = reqwest::blocking::Client::builder()
-        .user_agent(concat!("tendril/", env!("CARGO_PKG_VERSION")))
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(None)
-        .default_headers({
-            let mut h = reqwest::header::HeaderMap::new();
-            if let Some(t) = tendril_core::model::source::hf_token() {
-                if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {t}")) {
-                    h.insert(reqwest::header::AUTHORIZATION, v);
-                }
-            }
-            h
-        })
-        .build()?;
+    let big_client = download_client()?;
     for (name, size) in &want {
         pb.set_message(name.clone());
         let dest = dir.join(name);
@@ -223,7 +237,9 @@ pub fn pull(repo: &str, revision: &str, dir: &Path) -> Result<()> {
         std::fs::rename(&part, &dest)?;
     }
     pb.finish_and_clear();
-    std::fs::write(dir.join(".tendril-complete"), repo)?;
-    println!("{} Downloaded {repo}", ok_mark());
+    if weights {
+        std::fs::write(dir.join(".tendril-complete"), repo)?;
+        println!("{} Downloaded {repo}", ok_mark());
+    }
     Ok(())
 }

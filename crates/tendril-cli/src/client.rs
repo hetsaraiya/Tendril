@@ -38,6 +38,50 @@ pub struct StatusArgs {
     pub json: bool,
 }
 
+#[derive(Args, Debug)]
+pub struct LoadArgs {
+    /// HuggingFace id, catalog name or a folder on the server.
+    pub model: String,
+    #[arg(long, default_value = "http://127.0.0.1:8080", env = "TENDRIL_URL")]
+    pub url: String,
+    /// Cluster token (default: the one `tendril serve` saved on this machine).
+    #[arg(long, env = "TENDRIL_TOKEN")]
+    pub token: Option<String>,
+}
+
+/// `tendril load`: ask a running server to serve another model.
+pub fn load(a: LoadArgs) -> Result<()> {
+    let token = match a.token {
+        Some(t) => t,
+        None => tendril_cluster::token::load_or_create()?,
+    };
+    let r = client()?
+        .post(format!("{}/api/models", a.url.trim_end_matches('/')))
+        .bearer_auth(token)
+        .json(&json!({"model": a.model}))
+        .send()
+        .with_context(|| {
+            format!(
+                "no Tendril server at {} — start one with `tendril serve`",
+                a.url
+            )
+        })?;
+    let ok = r.status().is_success();
+    let v: Value = r.json()?;
+    if !ok {
+        bail!(
+            "{}",
+            v["error"]["message"].as_str().unwrap_or("request failed")
+        );
+    }
+    println!(
+        "{} Loading {} — the server plans it across the pool; watch with `tendril status`",
+        ok_mark(),
+        bold(v["loaded"].as_str().unwrap_or(&a.model))
+    );
+    Ok(())
+}
+
 fn client() -> Result<reqwest::blocking::Client> {
     Ok(reqwest::blocking::Client::builder()
         .timeout(None)
@@ -265,7 +309,9 @@ pub fn status(a: StatusArgs) -> Result<()> {
     println!(
         "{} {}",
         bold("Tendril ·"),
-        bold(cyan(st["model"].as_str().unwrap_or("")))
+        bold(cyan(
+            st["model"].as_str().unwrap_or("pool open, no model yet")
+        ))
     );
     let state = st["status"]["state"].as_str().unwrap_or("?");
     let line = match state {

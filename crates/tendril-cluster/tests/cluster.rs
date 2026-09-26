@@ -41,6 +41,7 @@ fn serve_opts(dir: &std::path::Path, port: u16, local: bool, min_stages: usize) 
         speculate: true,
         draft_tokens: 6,
         recovery_timeout: Duration::from_secs(30),
+        remote: None,
     }
 }
 

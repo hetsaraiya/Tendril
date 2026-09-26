@@ -6,6 +6,20 @@ use candle_core::{DType, Device, Tensor};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+/// The output head's tensor name among a checkpoint's tensors, if untied.
+pub fn find_head_name<'a>(names: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    const HEADS: [&str; 3] = [
+        "lm_head.weight",
+        "language_model.lm_head.weight",
+        "model.lm_head.weight",
+    ];
+    let names: BTreeSet<&str> = names.into_iter().collect();
+    HEADS
+        .into_iter()
+        .find(|n| names.contains(n))
+        .map(String::from)
+}
+
 pub struct WeightStore {
     st: MmapedSafetensors,
     names: BTreeSet<String>,
@@ -52,14 +66,7 @@ impl WeightStore {
                 })
             })
             .unwrap_or_else(|| "model.".to_string());
-        let head_name = [
-            "lm_head.weight",
-            "language_model.lm_head.weight",
-            "model.lm_head.weight",
-        ]
-        .into_iter()
-        .find(|n| names.contains(*n))
-        .map(String::from);
+        let head_name = find_head_name(names.iter().map(String::as_str));
         Ok(WeightStore {
             st,
             names,

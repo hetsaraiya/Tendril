@@ -1,15 +1,15 @@
 //! `tendril serve` and `tendril join`: run a model across machines.
 
-use crate::models::ensure_local;
+use crate::models::{ensure_local, ensure_meta};
 use crate::ui::*;
 use anyhow::{Context, Result};
 use clap::Args;
 use std::sync::Arc;
 use std::time::Duration;
 use tendril_cluster::agent::{AgentEvent, AgentOptions};
-use tendril_cluster::coordinator::{Coordinator, ServeOptions, Status};
+use tendril_cluster::coordinator::{Coordinator, RemoteModel, ServeOptions, Status};
 use tendril_cluster::http::{router, AppState};
-use tendril_cluster::pool::Pool;
+use tendril_cluster::pool::{Pool, Resolver};
 use tendril_core::units::{parse_tokens, Bytes};
 use tendril_core::{Goal, Link};
 use tendril_engine::linear::WeightFormat;
@@ -20,7 +20,8 @@ pub const CONTROL_PORT: u16 = 7420;
 pub struct ServeArgs {
     /// Model(s): HuggingFace id, catalog name or local folder. Give several to
     /// serve them all from the same machines (the first is the default).
-    #[arg(required = true, num_args = 1.., value_name = "MODEL")]
+    /// Give none to let machines join first, then pick with `tendril load`.
+    #[arg(value_name = "MODEL")]
     pub models: Vec<String>,
     /// HTTP port for the web chat and the OpenAI-compatible API.
     #[arg(long, default_value_t = 8080)]
@@ -99,7 +100,8 @@ pub struct JoinArgs {
     /// Most memory Tendril may use on this machine, e.g. 8gb.
     #[arg(long)]
     pub max_memory: Option<String>,
-    /// Port for activations from other machines (0 = any free port).
+    /// Port for activations from other machines (0 = any free port). Each
+    /// served model uses the next port up.
     #[arg(long, default_value_t = 0)]
     pub data_port: u16,
 }
@@ -146,40 +148,59 @@ pub fn serve(a: ServeArgs) -> Result<()> {
     };
     let kv_disk = Bytes::parse(&a.kv_disk)
         .ok_or_else(|| anyhow::anyhow!("cannot parse --kv-disk '{}'", a.kv_disk))?;
-    let mut all = Vec::new();
-    for m in &a.models {
-        let (dir, name) = ensure_local(m, !a.offline)?;
-        all.push(ServeOptions {
-            model_dir: dir,
-            model_name: name.clone(),
-            format,
-            context,
-            concurrency: a.concurrency.max(1),
-            goal,
-            safety: 0.05,
-            control_port: a.cluster_port,
-            data_port: 0,
-            token: token.clone(),
-            device: a.device.clone(),
-            use_local: !a.no_local,
-            name: a.name.clone(),
-            min_stages: a.min_machines.max(1),
-            max_memory,
-            prefix_cache: !a.no_prefix_cache,
-            speculate: !a.no_speculate,
-            draft_tokens: a.draft_tokens.clamp(1, 16),
-            recovery_timeout: Duration::from_secs(a.recovery_timeout),
-            kv_disk,
-            link: link.clone(),
-        });
-    }
-    let names: Vec<String> = all.iter().map(|o| o.model_name.clone()).collect();
-    let multi = names.len() > 1;
+    let base = ServeOptions {
+        model_dir: Default::default(),
+        model_name: String::new(),
+        format,
+        context,
+        concurrency: a.concurrency.max(1),
+        goal,
+        safety: 0.05,
+        control_port: a.cluster_port,
+        data_port: 0,
+        token: token.clone(),
+        device: a.device.clone(),
+        use_local: !a.no_local,
+        name: a.name.clone(),
+        min_stages: a.min_machines.max(1),
+        max_memory,
+        prefix_cache: !a.no_prefix_cache,
+        speculate: !a.no_speculate,
+        draft_tokens: a.draft_tokens.clamp(1, 16),
+        recovery_timeout: Duration::from_secs(a.recovery_timeout),
+        kv_disk,
+        link: link.clone(),
+        remote: None,
+    };
+    // Models not on this machine are fetched as config + tokenizer + tensor
+    // table only; each machine then downloads just its own layers.
+    let offline = a.offline;
+    let resolve: Resolver = Arc::new(move |name: &str| {
+        let (model_dir, model_name, remote) = if offline {
+            let (d, n) = ensure_local(name, false)?;
+            (d, n, None)
+        } else {
+            ensure_meta(name)?
+        };
+        Ok(ServeOptions {
+            model_dir,
+            model_name,
+            remote: remote.map(|(base_url, tensors)| RemoteModel {
+                base_url,
+                tensors,
+                cache: tendril_cluster::shard::default_cache(),
+            }),
+            ..base.clone()
+        })
+    });
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        let pool = Pool::start(all).await?;
+        let pool = Pool::open(a.cluster_port, token.clone(), Some(resolve)).await?;
+        for m in &a.models {
+            pool.load(m).await?;
+        }
         let ip = lan_ip();
         let join = format!("tendril join --token {token}");
         let join_direct = format!("tendril join {ip}:{} --token {token}", a.cluster_port);
@@ -187,7 +208,6 @@ pub fn serve(a: ServeArgs) -> Result<()> {
         {
             let p = pool.clone();
             let fp = tendril_cluster::discovery::fingerprint(&token);
-            let model = names.join(", ");
             let host = ip.clone();
             let cport = a.cluster_port;
             tokio::spawn(async move {
@@ -196,7 +216,7 @@ pub fn serve(a: ServeArgs) -> Result<()> {
                         app: "tendril".into(),
                         protocol: tendril_cluster::proto::PROTOCOL,
                         version: env!("CARGO_PKG_VERSION").into(),
-                        model: model.clone(),
+                        model: p.names().join(", "),
                         host: host.clone(),
                         control_port: cport,
                         fingerprint: fp.clone(),
@@ -213,9 +233,15 @@ pub fn serve(a: ServeArgs) -> Result<()> {
             .await
             .with_context(|| format!("port {} is busy — pick another with --port", a.port))?;
         let shown_host = if a.host == "0.0.0.0" { ip.clone() } else { a.host.clone() };
+        let names = pool.names();
         println!();
-        println!("{} {}", bold("Tendril · serving"), bold(cyan(names.join(" + "))));
-        if multi {
+        if names.is_empty() {
+            println!("{}", bold("Tendril · pool open, no model yet"));
+            println!("  {}  add machines below, then pick a model: {}", dim("Next     "), cyan("tendril load <model>"));
+        } else {
+            println!("{} {}", bold("Tendril · serving"), bold(cyan(names.join(" + "))));
+        }
+        if names.len() > 1 {
             println!("  {}  {}", dim("Models   "), dim(format!("one pool of machines; the API picks by the `model` field (default {})", names[0])));
         }
         println!("  {}  {}", dim("Web chat "), bold(format!("http://{shown_host}:{}", a.port)));
@@ -229,9 +255,10 @@ pub fn serve(a: ServeArgs) -> Result<()> {
         });
 
         // Mirror cluster events in the terminal.
+        let p1 = pool.clone();
         let tag = move |m: &Option<String>| -> String {
             match m {
-                Some(m) if multi => format!("{} ", cyan(format!("[{}]", short_name(m)))),
+                Some(m) if p1.is_multi() => format!("{} ", cyan(format!("[{}]", short_name(m)))),
                 _ => String::new(),
             }
         };
@@ -258,11 +285,11 @@ pub fn serve(a: ServeArgs) -> Result<()> {
                         Err(_) => break,
                     },
                     _ = tick.tick() => for c2 in p2.models() {
-                        let label = if multi { format!("{}: ", short_name(&c2.inner.opts.model_name)) } else { String::new() };
+                        let label = if p2.is_multi() { format!("{}: ", short_name(&c2.inner.opts.model_name)) } else { String::new() };
                         match c2.status() {
                             Status::Loading { stages, .. } => {
                                 let line = stages.iter().filter(|s| s.phase != "ready").map(|s| {
-                                    if s.total > 0 && s.phase == "sending" {
+                                    if s.total > 0 && (s.phase == "sending" || s.phase == "downloading") {
                                         format!("{} {} {}/{} ({:.0}%)", s.node, s.phase, Bytes(s.done), Bytes(s.total), s.done as f64 / s.total as f64 * 100.0)
                                     } else {
                                         format!("{} {}", s.node, s.phase)
@@ -454,10 +481,11 @@ pub async fn start_local_for_bench(
         speculate: true,
         draft_tokens: 6,
         recovery_timeout: Duration::from_secs(60),
+        remote: None,
     };
     let _ = name;
     let pool = Pool::start(vec![opts]).await?;
-    let coord = pool.primary().clone();
+    let coord = pool.models()[0].clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let app = router(AppState {

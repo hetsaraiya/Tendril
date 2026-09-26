@@ -172,10 +172,6 @@ impl NodeProfile {
             }
         }
     }
-
-    pub fn is_laptop_class(&self) -> bool {
-        matches!(self.backend, Backend::Metal) && !self.chip.contains("Ultra")
-    }
 }
 
 /// Detect the local machine.
@@ -185,7 +181,13 @@ pub fn detect_local(consider_free_memory: bool) -> NodeProfile {
     sys.refresh_memory();
     sys.refresh_cpu_list(sysinfo::CpuRefreshKind::nothing());
     let total = Bytes(sys.total_memory());
-    let avail = Bytes(sys.available_memory());
+    // sysinfo undercounts on recent macOS (inactive pages, which apps get
+    // back on demand, are left out), so ask vm_stat there.
+    let avail = Bytes(
+        run_with_timeout("vm_stat", &[], Duration::from_secs(2))
+            .and_then(|t| vm_stat_available(&t))
+            .unwrap_or_else(|| sys.available_memory()),
+    );
     let cpu_cores = sys.cpus().len().max(1) as u32;
     let cpu_brand = sys
         .cpus()
@@ -212,7 +214,7 @@ pub fn detect_local(consider_free_memory: bool) -> NodeProfile {
         gpu_cores: None,
         total_memory: total,
         accel_memory: None,
-        available_memory: if consider_free_memory {
+        available_memory: if consider_free_memory && avail.0 > 0 {
             Some(avail)
         } else {
             None
@@ -373,6 +375,22 @@ fn detect_battery() -> Option<bool> {
     }
 }
 
+/// Free + reclaimable (inactive, speculative) memory from `vm_stat` output.
+fn vm_stat_available(text: &str) -> Option<u64> {
+    let page: u64 = text
+        .split("page size of ")
+        .nth(1)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let pages = |key: &str| -> Option<u64> {
+        let line = text.lines().find(|l| l.starts_with(key))?;
+        line[key.len()..].trim().trim_end_matches('.').parse().ok()
+    };
+    Some(page * (pages("Pages free:")? + pages("Pages inactive:")? + pages("Pages speculative:")?))
+}
+
 fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Option<String> {
     use std::process::Stdio;
     let mut child = Command::new(cmd)
@@ -435,6 +453,13 @@ pub fn probe_memory_bandwidth() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vm_stat_counts_reclaimable_pages() {
+        let t = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:  10.\nPages active: 99.\nPages inactive:  20.\nPages speculative:  2.\n";
+        assert_eq!(vm_stat_available(t), Some(16384 * 32));
+        assert_eq!(vm_stat_available("garbage"), None);
+    }
 
     #[test]
     fn detect_runs() {

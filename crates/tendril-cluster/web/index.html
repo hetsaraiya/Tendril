@@ -390,7 +390,8 @@ function renderStatus(s) {
   $('pill').className = 'pill ' + state; $('pillText').textContent = pillLabel[state] || state;
   renderModels(s);
   $('input').placeholder = multi() ? `Message ${short(s.model)}…` : 'Message the model…';
-  $('model').textContent = `${multi() ? '' : s.model + ' · '}${s.architecture} · ${fmtParams(s.params)} params · ${s.format === 'native' ? 'full precision' : s.format} · ${s.context.toLocaleString()} ctx`;
+  $('model').textContent = !s.model ? 'No model yet — run `tendril load <model>` on the server'
+    : `${multi() ? '' : s.model + ' · '}${s.architecture} · ${fmtParams(s.params)} params · ${s.format === 'native' ? 'full precision' : s.format} · ${s.context.toLocaleString()} ctx`;
   $('joinCmd').textContent = s.join;
   $('hint').textContent = ready ? 'Enter to send · Shift+Enter for a new line' : (state === 'loading' ? 'The model is loading — this takes a moment the first time.' : state === 'waiting' ? 'Waiting for enough machines to run this model.' : 'Starting…');
   updateSend();
@@ -401,12 +402,12 @@ function renderStatus(s) {
     card = `<div class="big">${st.predicted_tps.toFixed(1)} <span class="sub">tok/s predicted</span></div>
       <div class="sub">${esc(st.plan)}${m ? ` · last reply ${m.decode_tps.toFixed(1)} tok/s, first token ${fmtMs(m.ttft_ms)}` : ''}</div>`;
   } else if (state === 'waiting') {
-    card = `<div style="font-weight:600">${multi() ? 'Waiting for room in the pool' : 'Not enough memory yet'}</div><div class="sub">${esc(st.reason)}</div>
+    card = `<div style="font-weight:600">${!s.model ? 'No model chosen yet' : multi() ? 'Waiting for room in the pool' : 'Not enough memory yet'}</div><div class="sub">${esc(st.reason)}</div>
       ${st.advice?.length ? '<ul class="advice">' + st.advice.slice(0, 3).map(a => '<li>' + esc(a) + '</li>').join('') + '</ul>' : ''}`;
   } else if (state === 'loading') {
     card = `<div style="font-weight:600">Loading ${esc(st.plan)}</div>` + st.stages.map(g => {
       const pct = g.total ? Math.round(g.done / g.total * 100) : (g.phase === 'ready' ? 100 : 0);
-      return `<div class="sub" style="margin-top:8px">${esc(g.node)} — ${esc(g.phase)}${g.total && g.phase === 'sending' ? ` ${fmtBytes(g.done)} / ${fmtBytes(g.total)}` : ''}</div><div class="bar"><div style="width:${pct}%"></div></div>`;
+      return `<div class="sub" style="margin-top:8px">${esc(g.node)} — ${esc(g.phase)}${g.total && (g.phase === 'sending' || g.phase === 'downloading') ? ` ${fmtBytes(g.done)} / ${fmtBytes(g.total)}` : ''}</div><div class="bar"><div style="width:${pct}%"></div></div>`;
     }).join('');
   } else if (state === 'failed') {
     card = `<div class="error">${esc(st.error)}</div>`;
