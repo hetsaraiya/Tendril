@@ -50,6 +50,18 @@ pub struct StageTime {
     pub batch: u16,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub enum KvOpKind {
+    /// Keep only the first `len` positions (reuse a shared prompt prefix).
+    Truncate { len: u32 },
+    /// Move the KV to this machine's disk and free memory.
+    Spill,
+    /// Load spilled KV back into memory.
+    Restore,
+    /// Delete a spilled sequence's files.
+    Drop,
+}
+
 /// Where a stage sends its output.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum NextHop {
@@ -170,6 +182,15 @@ pub enum Msg {
     Release {
         epoch: u64,
         seq: u64,
+    },
+    /// Manage a parked sequence's KV on every stage (travels down the chain;
+    /// the last stage returns it to the coordinator as an acknowledgement).
+    KvOp {
+        epoch: u64,
+        seq: u64,
+        op: KvOpKind,
+        ok: bool,
+        error: Option<String>,
     },
     /// A stage failed on a sequence (travels down the chain to the coordinator).
     StageError {

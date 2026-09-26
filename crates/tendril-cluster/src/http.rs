@@ -402,7 +402,8 @@ async fn run(s: AppState, prompt: Vec<u32>, params: CommonParams, chat: bool) ->
                         "id": id, "object": object, "created": created, "model": model,
                         "choices": [choice],
                         "usage": {"prompt_tokens": timing.prompt_tokens, "completion_tokens": timing.completion_tokens,
-                                  "total_tokens": timing.prompt_tokens + timing.completion_tokens},
+                                  "total_tokens": timing.prompt_tokens + timing.completion_tokens,
+                                  "prompt_tokens_details": {"cached_tokens": timing.cached_tokens}},
                         "tendril": {"ttft_ms": timing.ttft_ms, "decode_tokens_per_sec": timing.decode_tps(), "total_ms": timing.total_ms, "queue_ms": timing.queue_ms},
                     }))
                     .into_response();
@@ -447,7 +448,8 @@ async fn run(s: AppState, prompt: Vec<u32>, params: CommonParams, chat: bool) ->
                     if include_usage {
                         let u = json!({"id": id, "object": chunk_object, "created": created, "model": model, "choices": [],
                             "usage": {"prompt_tokens": timing.prompt_tokens, "completion_tokens": timing.completion_tokens,
-                                      "total_tokens": timing.prompt_tokens + timing.completion_tokens},
+                                      "total_tokens": timing.prompt_tokens + timing.completion_tokens,
+                                      "prompt_tokens_details": {"cached_tokens": timing.cached_tokens}},
                             "tendril": {"ttft_ms": timing.ttft_ms, "decode_tokens_per_sec": timing.decode_tps(), "total_ms": timing.total_ms}});
                         yield Ok(SseEvent::default().data(u.to_string()));
                     }

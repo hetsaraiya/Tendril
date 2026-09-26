@@ -160,6 +160,7 @@ dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16
         <div class="stat card"><div class="v" id="sTok">0</div><div class="k">tokens out</div></div>
       </div>
       <svg class="spark" id="spark" viewBox="0 0 100 40" preserveAspectRatio="none"></svg>
+      <div class="sub" id="cacheLine" style="margin-top:6px"></div>
     </div>
     <div class="section"><h3>Pipeline</h3><div id="pipeline"></div></div>
     <div class="section"><h3>Add a machine</h3>
@@ -253,7 +254,7 @@ function msgEl(m, i) {
   if (m.role !== 'user' && (m.stats || m.content)) {
     const meta = document.createElement('div');
     meta.className = 'meta';
-    if (m.stats) meta.innerHTML = `<span>${m.stats.tokens} tokens · ${m.stats.tps.toFixed(1)} tok/s · first token ${fmtMs(m.stats.ttft)}</span>`;
+    if (m.stats) meta.innerHTML = `<span>${m.stats.tokens} tokens · ${m.stats.tps.toFixed(1)} tok/s · first token ${fmtMs(m.stats.ttft)}${m.stats.cached ? ` · ${m.stats.cached} prompt tokens from cache` : ''}</span>`;
     const copy = document.createElement('button'); copy.textContent = 'Copy';
     copy.onclick = () => { navigator.clipboard?.writeText(m.content); copy.textContent = 'Copied'; setTimeout(() => copy.textContent = 'Copy', 1200); };
     meta.appendChild(copy);
@@ -331,7 +332,7 @@ async function generate() {
             reply.content += d;
             if (!pending) { pending = true; requestAnimationFrame(() => { bubble.innerHTML = md(reply.content); pending = false; scrollDown(); }); }
           }
-          if (j.usage) reply.stats = { tokens: j.usage.completion_tokens, tps: j.tendril?.decode_tokens_per_sec || 0, ttft: j.tendril?.ttft_ms ?? first };
+          if (j.usage) reply.stats = { tokens: j.usage.completion_tokens, tps: j.tendril?.decode_tokens_per_sec || 0, ttft: j.tendril?.ttft_ms ?? first, cached: j.usage.prompt_tokens_details?.cached_tokens || 0 };
         }
       }
     }
@@ -381,6 +382,10 @@ function renderStatus(s) {
   $('sTps').textContent = last ? last.decode_tps.toFixed(1) : '–';
   $('sReq').textContent = m.requests;
   $('sTok').textContent = m.completion_tokens > 9999 ? (m.completion_tokens / 1000).toFixed(1) + 'k' : m.completion_tokens;
+  const fmtK = (n) => n > 9999 ? (n / 1000).toFixed(1) + 'k' : n;
+  $('cacheLine').textContent = m.prefix_hits
+    ? `Prefix cache: ${m.prefix_hits} turn${m.prefix_hits === 1 ? '' : 's'} resumed · ${fmtK(m.cached_tokens)} prompt tokens not recomputed · ${m.parked_ram} parked in memory, ${m.parked_disk} on disk`
+    : (m.parked_ram || m.parked_disk ? `Prefix cache: ${m.parked_ram} conversation(s) parked in memory, ${m.parked_disk} on disk` : '');
   const pts = m.recent.map(r => r.decode_tps).slice(-30);
   if (pts.length > 1) {
     const max = Math.max(...pts, 1);

@@ -518,6 +518,116 @@ impl Stage {
         self.seqs.remove(&id);
     }
 
+    /// Keep only the first `len` positions of a sequence, so a new request that
+    /// shares that prefix can continue from it without re-running prefill.
+    pub fn truncate(&mut self, id: u64, len: usize) -> Result<()> {
+        let st = self.seqs.get_mut(&id).context("unknown sequence")?;
+        if len > st.pos {
+            bail!(
+                "cannot truncate sequence {id} to {len}: it only has {} positions",
+                st.pos
+            );
+        }
+        for kv in st.kv.iter() {
+            if len < kv.offset {
+                bail!("the start of this conversation already left the sliding-window cache");
+            }
+        }
+        for kv in st.kv.iter_mut() {
+            kv.len = len - kv.offset;
+        }
+        st.pos = len;
+        Ok(())
+    }
+
+    /// Write a sequence's KV cache to `path` and free it from memory.
+    pub fn spill(&mut self, id: u64, path: &std::path::Path) -> Result<u64> {
+        let st = self.seqs.get(&id).context("unknown sequence")?;
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(b"TKV1");
+        buf.extend_from_slice(&(st.pos as u64).to_le_bytes());
+        buf.extend_from_slice(&(st.kv.len() as u32).to_le_bytes());
+        for kv in &st.kv {
+            buf.extend_from_slice(&(kv.offset as u64).to_le_bytes());
+            buf.extend_from_slice(&(kv.len as u64).to_le_bytes());
+            match (&kv.k, &kv.v) {
+                (Some(k), Some(v)) if kv.len > 0 => {
+                    for t in [k, v] {
+                        let part = t.narrow(2, 0, kv.len)?.contiguous()?;
+                        let (code, bytes) = tensor_bytes(&part)?;
+                        let dims = part.dims4()?;
+                        buf.extend_from_slice(&code.to_le_bytes());
+                        buf.extend_from_slice(&(dims.1 as u32).to_le_bytes());
+                        buf.extend_from_slice(&(dims.3 as u32).to_le_bytes());
+                        buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+                        buf.extend_from_slice(&bytes);
+                    }
+                }
+                _ => buf.extend_from_slice(&u32::MAX.to_le_bytes()),
+            }
+        }
+        if let Some(d) = path.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        std::fs::write(path, &buf).with_context(|| format!("write {}", path.display()))?;
+        self.seqs.remove(&id);
+        Ok(buf.len() as u64)
+    }
+
+    /// Bring a spilled sequence back into memory.
+    pub fn restore(&mut self, id: u64, path: &std::path::Path) -> Result<()> {
+        let data = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+        let mut r = Cursor { b: &data, i: 0 };
+        if r.take(4)? != b"TKV1" {
+            bail!("not a Tendril KV file");
+        }
+        let pos = r.u64()? as usize;
+        let layers = r.u32()? as usize;
+        if layers != self.layers.len() {
+            bail!(
+                "KV file has {layers} layers, this stage has {}",
+                self.layers.len()
+            );
+        }
+        let mut kvs = Vec::with_capacity(layers);
+        for _ in 0..layers {
+            let offset = r.u64()? as usize;
+            let len = r.u64()? as usize;
+            let mut lk = LayerKv::new();
+            lk.offset = offset;
+            let code = r.u32()?;
+            if code != u32::MAX {
+                let mut parts = Vec::new();
+                let mut c = code;
+                for _ in 0..2 {
+                    let heads = r.u32()? as usize;
+                    let hd = r.u32()? as usize;
+                    let n = r.u64()? as usize;
+                    let bytes = r.take(n)?;
+                    parts.push(
+                        tensor_from_bytes(c, bytes, (1, heads, len, hd), &self.device)?
+                            .to_dtype(self.dtype)?,
+                    );
+                    if parts.len() == 1 {
+                        c = r.u32()?;
+                    }
+                }
+                let cap = len.next_power_of_two().max(256);
+                let (_, h, _, d) = parts[0].dims4()?;
+                let k = Tensor::zeros((1, h, cap, d), self.dtype, &self.device)?;
+                let v = Tensor::zeros((1, h, cap, d), self.dtype, &self.device)?;
+                k.slice_set(&parts[0], 2, 0)?;
+                v.slice_set(&parts[1], 2, 0)?;
+                lk.k = Some(k);
+                lk.v = Some(v);
+                lk.len = len;
+            }
+            kvs.push(lk);
+        }
+        self.seqs.insert(id, SeqState { kv: kvs, pos });
+        Ok(())
+    }
+
     pub fn active_seqs(&self) -> usize {
         self.seqs.len()
     }
@@ -729,6 +839,96 @@ impl Stage {
             })
             .collect())
     }
+}
+
+struct Cursor<'a> {
+    b: &'a [u8],
+    i: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        if self.i + n > self.b.len() {
+            bail!("truncated KV file");
+        }
+        let s = &self.b[self.i..self.i + n];
+        self.i += n;
+        Ok(s)
+    }
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    fn u64(&mut self) -> Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+}
+
+fn tensor_bytes(t: &Tensor) -> Result<(u32, Vec<u8>)> {
+    let flat = t.flatten_all()?;
+    Ok(match t.dtype() {
+        DType::F32 => (
+            0,
+            flat.to_vec1::<f32>()?
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect(),
+        ),
+        DType::BF16 => (
+            1,
+            flat.to_vec1::<half::bf16>()?
+                .iter()
+                .flat_map(|x| x.to_bits().to_le_bytes())
+                .collect(),
+        ),
+        DType::F16 => (
+            2,
+            flat.to_vec1::<half::f16>()?
+                .iter()
+                .flat_map(|x| x.to_bits().to_le_bytes())
+                .collect(),
+        ),
+        other => bail!("cannot store {other:?} KV"),
+    })
+}
+
+/// `b` as little-endian N-byte words.
+fn le_words<const N: usize>(b: &[u8]) -> impl Iterator<Item = [u8; N]> + '_ {
+    (0..b.len() / N).map(move |i| {
+        let mut w = [0u8; N];
+        w.copy_from_slice(&b[i * N..i * N + N]);
+        w
+    })
+}
+
+fn tensor_from_bytes(
+    code: u32,
+    b: &[u8],
+    shape: (usize, usize, usize, usize),
+    dev: &Device,
+) -> Result<Tensor> {
+    let n = shape.0 * shape.1 * shape.2 * shape.3;
+    Ok(match code {
+        0 if b.len() == n * 4 => Tensor::from_vec(
+            le_words::<4>(b).map(f32::from_le_bytes).collect::<Vec<_>>(),
+            shape,
+            dev,
+        )?,
+        1 if b.len() == n * 2 => Tensor::from_vec(
+            le_words::<2>(b)
+                .map(|c| half::bf16::from_bits(u16::from_le_bytes(c)))
+                .collect::<Vec<_>>(),
+            shape,
+            dev,
+        )?,
+        2 if b.len() == n * 2 => Tensor::from_vec(
+            le_words::<2>(b)
+                .map(|c| half::f16::from_bits(u16::from_le_bytes(c)))
+                .collect::<Vec<_>>(),
+            shape,
+            dev,
+        )?,
+        _ => bail!("corrupt KV file"),
+    })
 }
 
 /// One sequence's work in a batched stage call.

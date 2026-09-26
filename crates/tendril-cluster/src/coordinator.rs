@@ -3,7 +3,10 @@
 
 use crate::agent::{connect_retry, pump};
 use crate::calibration::Calibration;
-use crate::proto::{Msg, NextHop, Payload, SampleSetup, StageTime, TensorEntry, PROTOCOL};
+use crate::prefix::{Evict, Hit, PrefixCache};
+use crate::proto::{
+    KvOpKind, Msg, NextHop, Payload, SampleSetup, StageTime, TensorEntry, PROTOCOL,
+};
 use crate::shard::{model_key, stage_tensors};
 use crate::worker::StageWorker;
 use crate::{token, wire};
@@ -53,6 +56,10 @@ pub struct ServeOptions {
     pub min_stages: usize,
     /// Cap on memory Tendril may use on this machine.
     pub max_memory: Option<Bytes>,
+    /// Keep finished conversations' KV to skip re-prefilling shared prefixes.
+    pub prefix_cache: bool,
+    /// Disk each machine may use for parked conversations (0 = never spill).
+    pub kv_disk: Bytes,
 }
 
 /// Human-readable log of what the cluster is doing.
@@ -124,12 +131,22 @@ pub struct Metrics {
     pub completion_tokens: u64,
     pub errors: u64,
     pub recent: VecDeque<RequestRecord>,
+    /// Requests that reused a parked conversation's KV.
+    pub prefix_hits: u64,
+    /// Prompt tokens not recomputed thanks to the prefix cache.
+    pub cached_tokens: u64,
+    pub kv_spills: u64,
+    pub kv_restores: u64,
+    /// Conversations parked in memory / on disk right now.
+    pub parked_ram: usize,
+    pub parked_disk: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct RequestRecord {
     pub at: String,
     pub prompt_tokens: usize,
+    pub cached_tokens: usize,
     pub completion_tokens: usize,
     pub ttft_ms: f64,
     pub decode_tps: f64,
@@ -208,6 +225,7 @@ struct Pipeline {
     _local: Option<Arc<StageWorker>>,
     ready_at: Instant,
     telemetry: StdMutex<Telemetry>,
+    prefix: StdMutex<Option<PrefixCache>>,
 }
 
 enum Entry {
@@ -227,6 +245,7 @@ impl Entry {
 enum SeqEvent {
     Token(u32, Vec<StageTime>),
     Error(String),
+    KvAck { ok: bool, error: Option<String> },
 }
 
 /// Measured per-token timings of the running pipeline (decode steps only).
@@ -1221,6 +1240,20 @@ impl Coordinator {
             _local: local_worker,
             ready_at: Instant::now(),
             telemetry: StdMutex::new(Telemetry::default()),
+            prefix: StdMutex::new(self.inner.opts.prefix_cache.then(|| {
+                let per_token = self
+                    .inner
+                    .spec
+                    .kv_bytes(0..self.inner.spec.num_layers as usize, 1, 1, 4)
+                    .0
+                    .max(1);
+                let window = self.inner.cfg.layer_window.iter().flatten().min().copied();
+                PrefixCache::new(
+                    self.inner.opts.concurrency,
+                    (self.inner.opts.kv_disk.0 / per_token) as usize,
+                    window,
+                )
+            })),
         };
         *self.inner.pipeline.write().await = Some(Arc::new(pipeline));
         self.set_status(Status::Ready {
@@ -1440,6 +1473,7 @@ impl Coordinator {
                 seq,
                 SeqEvent::Error(format!("stage {} failed: {error}", stage + 1)),
             ),
+            Msg::KvOp { seq, ok, error, .. } => (seq, SeqEvent::KvAck { ok, error }),
             _ => return,
         };
         if let Some(tx) = self.inner.router.lock().unwrap().get(&seq) {
@@ -1494,7 +1528,24 @@ impl Coordinator {
             }
         };
         let (tx, rx) = mpsc::channel(64);
-        let seq = self.inner.next_seq.fetch_add(1, Ordering::Relaxed);
+        // Continue a parked conversation that shares this prompt's prefix, or
+        // make room for a new one within the planned KV memory.
+        let active = self.inner.opts.concurrency - p.permits.available_permits();
+        let (hit, evictions) = {
+            let mut guard = p.prefix.lock().unwrap();
+            match guard.as_mut() {
+                Some(cache) => match cache.lookup(&req.prompt) {
+                    Some(h) => (Some(h), Vec::new()),
+                    None => (None, cache.enforce(active)),
+                },
+                None => (None, Vec::new()),
+            }
+        };
+        self.evict(&p, evictions);
+        let seq = match &hit {
+            Some(h) => h.seq,
+            None => self.inner.next_seq.fetch_add(1, Ordering::Relaxed),
+        };
         let (stx, srx) = mpsc::unbounded_channel();
         self.inner.router.lock().unwrap().insert(seq, stx);
         let c = self.clone();
@@ -1504,6 +1555,7 @@ impl Coordinator {
                 p,
                 permit,
                 seq,
+                hit,
                 GenRequest { max_tokens, ..req },
                 srx,
                 tx,
@@ -1520,6 +1572,7 @@ impl Coordinator {
         p: Arc<Pipeline>,
         _permit: OwnedSemaphorePermit,
         seq: u64,
+        hit: Option<Hit>,
         req: GenRequest,
         mut srx: mpsc::UnboundedReceiver<SeqEvent>,
         out: mpsc::Sender<GenOut>,
@@ -1538,6 +1591,28 @@ impl Coordinator {
         };
         let epoch = p.epoch;
         let mut pos = 0usize;
+        if let Some(h) = hit {
+            match self.resume(&p, seq, &h, &mut srx).await {
+                Ok(()) => {
+                    pos = h.reuse;
+                    timing.cached_tokens = h.reuse;
+                    let mut m = self.inner.metrics.lock().unwrap();
+                    m.prefix_hits += 1;
+                    m.cached_tokens += h.reuse as u64;
+                    if h.restore {
+                        m.kv_restores += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "prefix cache: could not resume conversation ({e}); recomputing"
+                    );
+                    p.entry.send(Msg::Release { epoch, seq });
+                }
+            }
+        }
+        // KV the stages hold for this sequence, token by token.
+        let mut fed: Vec<u32> = req.prompt.clone();
         let setup = SampleSetup {
             params: req.params.clone(),
             history: req.prompt.clone(),
@@ -1596,6 +1671,7 @@ impl Coordinator {
                     error = Some(e);
                     break;
                 }
+                SeqEvent::KvAck { .. } => continue,
             };
             if timing.completion_tokens == 0 {
                 timing.ttft_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -1628,15 +1704,32 @@ impl Coordinator {
                 trace: Vec::new(),
             });
             step_sent = Some(Instant::now());
+            fed.push(tok);
             pos += 1;
         }
         let rest = stop.flush();
         if !rest.is_empty() && reason != FinishReason::Stop && error.is_none() {
             let _ = out.send(GenOut::Text(rest)).await;
         }
-        // Free KV along the whole chain.
-        p.entry.send(Msg::Release { epoch, seq });
         self.inner.router.lock().unwrap().remove(&seq);
+        // Park the conversation for its next turn, or free its KV along the chain.
+        let parked = error.is_none() && {
+            let mut guard = p.prefix.lock().unwrap();
+            match guard.as_mut() {
+                Some(cache) => {
+                    cache.insert(seq, fed);
+                    let active = self.inner.opts.concurrency - p.permits.available_permits() - 1;
+                    let ev = cache.enforce(active);
+                    drop(guard);
+                    self.evict(&p, ev);
+                    true
+                }
+                None => false,
+            }
+        };
+        if !parked {
+            p.entry.send(Msg::Release { epoch, seq });
+        }
         timing.total_ms = t0.elapsed().as_secs_f64() * 1000.0;
         {
             let mut m = self.inner.metrics.lock().unwrap();
@@ -1649,6 +1742,7 @@ impl Coordinator {
             m.recent.push_back(RequestRecord {
                 at: now(),
                 prompt_tokens: timing.prompt_tokens,
+                cached_tokens: timing.cached_tokens,
                 completion_tokens: timing.completion_tokens,
                 ttft_ms: timing.ttft_ms,
                 decode_tps: timing.decode_tps(),
@@ -1669,6 +1763,81 @@ impl Coordinator {
             None => {
                 let _ = out.send(GenOut::Done { reason, timing }).await;
             }
+        }
+    }
+
+    /// Bring a parked conversation back: restore from disk and/or cut it back to
+    /// the shared prefix, waiting for every stage to confirm.
+    async fn resume(
+        &self,
+        p: &Pipeline,
+        seq: u64,
+        h: &Hit,
+        srx: &mut mpsc::UnboundedReceiver<SeqEvent>,
+    ) -> Result<(), String> {
+        let mut ops = Vec::new();
+        if h.restore {
+            ops.push(KvOpKind::Restore);
+        }
+        if h.truncate {
+            ops.push(KvOpKind::Truncate {
+                len: h.reuse as u32,
+            });
+        }
+        for op in ops {
+            p.entry.send(Msg::KvOp {
+                epoch: p.epoch,
+                seq,
+                op,
+                ok: true,
+                error: None,
+            });
+            loop {
+                match tokio::time::timeout(Duration::from_secs(60), srx.recv()).await {
+                    Ok(Some(SeqEvent::KvAck { ok: true, .. })) => break,
+                    Ok(Some(SeqEvent::KvAck { error, .. })) => {
+                        return Err(error.unwrap_or_else(|| "failed".into()))
+                    }
+                    Ok(Some(SeqEvent::Error(e))) => return Err(e),
+                    Ok(Some(_)) => continue,
+                    _ => return Err("no answer from the stages".into()),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn evict(&self, p: &Pipeline, evictions: Vec<Evict>) {
+        for e in evictions {
+            let msg = match e {
+                Evict::Spill(seq) => {
+                    self.inner.metrics.lock().unwrap().kv_spills += 1;
+                    Msg::KvOp {
+                        epoch: p.epoch,
+                        seq,
+                        op: KvOpKind::Spill,
+                        ok: true,
+                        error: None,
+                    }
+                }
+                Evict::Release(seq) => Msg::Release {
+                    epoch: p.epoch,
+                    seq,
+                },
+                Evict::DropDisk(seq) => Msg::KvOp {
+                    epoch: p.epoch,
+                    seq,
+                    op: KvOpKind::Drop,
+                    ok: true,
+                    error: None,
+                },
+            };
+            p.entry.send(msg);
+        }
+        if let Some(c) = p.prefix.lock().unwrap().as_ref() {
+            let mut m = self.inner.metrics.lock().unwrap();
+            m.parked_ram = c.ram_entries();
+            m.parked_disk = c.disk_entries();
         }
     }
 

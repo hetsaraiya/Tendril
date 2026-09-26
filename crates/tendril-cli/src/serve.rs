@@ -61,6 +61,12 @@ pub struct ServeArgs {
     /// Name this machine in the cluster.
     #[arg(long)]
     pub name: Option<String>,
+    /// Don't keep finished conversations to speed up their next turn.
+    #[arg(long)]
+    pub no_prefix_cache: bool,
+    /// Disk each machine may use for idle conversations' KV (0 = never spill).
+    #[arg(long, default_value = "8gb")]
+    pub kv_disk: String,
     #[arg(long)]
     pub offline: bool,
 }
@@ -144,6 +150,9 @@ pub fn serve(a: ServeArgs) -> Result<()> {
         name: a.name.clone(),
         min_stages: a.min_machines.max(1),
         max_memory,
+        prefix_cache: !a.no_prefix_cache,
+        kv_disk: Bytes::parse(&a.kv_disk)
+            .ok_or_else(|| anyhow::anyhow!("cannot parse --kv-disk '{}'", a.kv_disk))?,
     };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -372,6 +381,8 @@ pub async fn start_local_for_bench(
         name: None,
         min_stages: 1,
         max_memory: None,
+        prefix_cache: true,
+        kv_disk: Bytes::gib(1.0),
     };
     let coord = Coordinator::start(opts).await?;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

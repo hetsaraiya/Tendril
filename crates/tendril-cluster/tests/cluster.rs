@@ -36,6 +36,8 @@ fn serve_opts(dir: &std::path::Path, port: u16, local: bool, min_stages: usize) 
         name: Some("coord".into()),
         min_stages,
         max_memory: None,
+        prefix_cache: true,
+        kv_disk: tendril_core::Bytes::mib(64.0),
     }
 }
 
@@ -104,6 +106,7 @@ fn reference(dir: &std::path::Path, prompt: &[u32], max: usize) -> String {
             params: SamplingParams::greedy(),
             max_tokens: max,
             stop: vec![],
+            ignore_eos: false,
         },
         |e| {
             if let GenEvent::Text(t) = e {
@@ -206,5 +209,104 @@ async fn three_remote_stages() {
     assert_eq!(tel.compute_ms.len(), plan.stages.len());
     assert!(tel.compute_ms.iter().all(|&m| m > 0.0));
     assert!(tel.step_ms >= tel.compute_ms.iter().sum::<f64>() * 0.5);
+    c.shutdown().await;
+}
+
+async fn collect_with_timing(
+    c: &Coordinator,
+    prompt: Vec<u32>,
+    max: usize,
+) -> (String, tendril_engine::generate::Timing) {
+    let mut rx = c
+        .generate(GenRequest {
+            prompt,
+            params: SamplingParams::greedy(),
+            max_tokens: max,
+            stop: vec![],
+            ignore_eos: true,
+        })
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let mut s = String::new();
+    while let Some(o) = rx.recv().await {
+        match o {
+            GenOut::Text(t) => s.push_str(&t),
+            GenOut::Done { timing, .. } => return (s, timing),
+            GenOut::Error(e) => panic!("{e}"),
+        }
+    }
+    panic!("no Done")
+}
+
+fn reference_ignore_eos(dir: &std::path::Path, prompt: &[u32], max: usize) -> String {
+    let mut m = LocalModel::load(
+        ModelFiles::new(dir).unwrap(),
+        candle_core::Device::Cpu,
+        WeightFormat::Native,
+        None,
+    )
+    .unwrap();
+    let mut s = String::new();
+    m.generate(
+        GenerateRequest {
+            prompt: prompt.to_vec(),
+            params: SamplingParams::greedy(),
+            max_tokens: max,
+            stop: vec![],
+            ignore_eos: true,
+        },
+        |e| {
+            if let GenEvent::Text(t) = e {
+                s.push_str(t);
+            }
+            true
+        },
+    )
+    .unwrap();
+    s
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prefix_cache_reuses_spills_and_restores() {
+    let dir = tempfile::tempdir().unwrap();
+    tendril_engine::testing::write_tiny_llama(dir.path(), 4, 64, 21, candle_core::DType::F32)
+        .unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    std::env::set_var("TENDRIL_CACHE", cache.path());
+    let port = free_port();
+    let mut opts = serve_opts(dir.path(), port, true, 2);
+    opts.concurrency = 1; // one KV slot: parking a second conversation forces a spill
+    let c = Coordinator::start(opts).await.unwrap();
+    let _a = spawn_agent(port, "helper", cache.path());
+    wait_ready(&c).await;
+
+    let turn1: Vec<u32> = (0..60).map(|i| 5 + (i * 7 % 200) as u32).collect();
+    let (_, t1) = collect_with_timing(&c, turn1.clone(), 8).await;
+    assert_eq!(t1.cached_tokens, 0);
+    // Turn 2 extends turn 1: its first 60 tokens come from the cache.
+    let mut turn2 = turn1.clone();
+    turn2.extend([40, 41, 42, 43, 44, 45]);
+    let (text2, t2) = collect_with_timing(&c, turn2.clone(), 10).await;
+    assert!(t2.cached_tokens >= 60, "cached {}", t2.cached_tokens);
+    let fresh = reference_ignore_eos(dir.path(), &turn2, 10);
+    assert_eq!(
+        text2, fresh,
+        "reusing the prefix must not change the output"
+    );
+    // An unrelated request needs the only memory slot: turn 2 spills to disk.
+    let other: Vec<u32> = (0..30).map(|i| 200 + i as u32).collect();
+    collect_with_timing(&c, other, 4).await;
+    assert!(c.metrics().kv_spills >= 1, "{:?}", c.metrics());
+    // Turn 3 restores it from disk and continues.
+    let mut turn3 = turn2.clone();
+    turn3.extend([50, 51, 52]);
+    let (text3, t3) = collect_with_timing(&c, turn3.clone(), 10).await;
+    assert!(t3.cached_tokens >= 66, "cached {}", t3.cached_tokens);
+    assert!(c.metrics().kv_restores >= 1);
+    let fresh3 = reference_ignore_eos(dir.path(), &turn3, 10);
+    assert_eq!(
+        text3, fresh3,
+        "restoring from disk must not change the output"
+    );
     c.shutdown().await;
 }

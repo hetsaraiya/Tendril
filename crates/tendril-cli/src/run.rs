@@ -173,6 +173,7 @@ fn answer(
             params: params.clone(),
             max_tokens: max,
             stop: vec![],
+            ignore_eos: false,
         },
         |e| {
             if let GenEvent::Text(t) = e {

@@ -11,6 +11,7 @@ pub mod agent;
 pub mod calibration;
 pub mod coordinator;
 pub mod http;
+pub mod prefix;
 pub mod proto;
 pub mod shard;
 pub mod token;
