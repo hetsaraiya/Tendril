@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tendril</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M16 29c0-9 0-14 6-19M16 20c-2-4-6-6-10-6 1 5 4 8 10 6zM22 10c2-3 5-4 8-4-1 4-4 6-8 4z' fill='none' stroke='%2322c55e' stroke-width='2.5' stroke-linecap='round'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f7f7f5; --panel: #ffffff; --panel2: #f1f1ee; --text: #1c1c1a; --muted: #6b6b66; --line: #e3e3de;
+  --accent: #16a34a; --accent-soft: #dcfce7; --warn: #d97706; --warn-soft: #fef3c7; --err: #dc2626; --err-soft: #fee2e2;
+  --user: #1c1c1a; --user-text: #fafaf9; --code: #f4f4f0; --shadow: 0 1px 2px rgba(0,0,0,.04), 0 4px 16px rgba(0,0,0,.04);
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #111210; --panel: #181917; --panel2: #1f201e; --text: #ececea; --muted: #9a9a93; --line: #2c2d2a;
+    --accent: #22c55e; --accent-soft: #14301f; --warn: #f59e0b; --warn-soft: #3a2a0c; --err: #f87171; --err-soft: #3b1515;
+    --user: #ececea; --user-text: #111210; --code: #1f201e; --shadow: none; }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
+button { font: inherit; color: inherit; cursor: pointer; }
+.app { display: grid; grid-template-columns: minmax(0, 1fr) 400px; grid-template-rows: 56px minmax(0, 1fr); height: 100vh; }
+header { grid-column: 1 / -1; display: flex; align-items: center; gap: 14px; padding: 0 18px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 650; letter-spacing: -.01em; }
+.brand svg { width: 22px; height: 22px; }
+.model { color: var(--muted); font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.spacer { flex: 1; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: 13px; font-weight: 550; background: var(--panel2); color: var(--muted); white-space: nowrap; }
+.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.pill.ready { background: var(--accent-soft); color: var(--accent); }
+.pill.loading, .pill.waiting, .pill.starting { background: var(--warn-soft); color: var(--warn); }
+.pill.loading .dot { animation: pulse 1s infinite; }
+.pill.failed { background: var(--err-soft); color: var(--err); }
+@keyframes pulse { 50% { opacity: .3; } }
+.iconbtn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 10px; font-size: 13px; }
+.iconbtn:hover { background: var(--panel2); }
+.tabs { display: none; }
+
+/* chat */
+.chat { display: flex; flex-direction: column; min-height: 0; }
+.messages { flex: 1; overflow-y: auto; padding: 28px 0 12px; scroll-behavior: smooth; }
+.inner { max-width: 760px; margin: 0 auto; padding: 0 20px; }
+.empty { text-align: center; color: var(--muted); padding-top: 12vh; }
+.empty h1 { color: var(--text); font-size: 26px; letter-spacing: -.02em; margin: 12px 0 6px; font-weight: 650; }
+.empty .sugg { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 22px; }
+.empty .sugg button { border: 1px solid var(--line); background: var(--panel); border-radius: 10px; padding: 8px 12px; font-size: 14px; color: var(--text); }
+.empty .sugg button:hover { border-color: var(--accent); }
+.msg { margin: 0 0 22px; display: flex; flex-direction: column; }
+.msg.user { align-items: flex-end; }
+.msg.user .bubble { background: var(--user); color: var(--user-text); border-radius: 16px 16px 4px 16px; padding: 9px 14px; max-width: 85%; white-space: pre-wrap; word-wrap: break-word; }
+.msg.ai .bubble { max-width: 100%; word-wrap: break-word; }
+.bubble p { margin: 0 0 10px; } .bubble p:last-child { margin-bottom: 0; }
+.bubble pre { background: var(--code); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; overflow-x: auto; font: 13px/1.5 var(--mono); position: relative; }
+.bubble code { font: 13px var(--mono); background: var(--code); padding: 1px 5px; border-radius: 5px; }
+.bubble pre code { background: none; padding: 0; }
+.bubble ul, .bubble ol { margin: 0 0 10px; padding-left: 22px; }
+.bubble h1, .bubble h2, .bubble h3 { font-size: 16px; margin: 14px 0 6px; }
+.caret::after { content: "▍"; animation: pulse .9s infinite; color: var(--accent); }
+.meta { font-size: 12px; color: var(--muted); margin-top: 6px; display: flex; gap: 12px; align-items: center; }
+.meta button { border: none; background: none; color: var(--muted); padding: 0; font-size: 12px; }
+.meta button:hover { color: var(--text); }
+.error { color: var(--err); background: var(--err-soft); border-radius: 10px; padding: 8px 12px; font-size: 14px; }
+.composer { padding: 10px 0 18px; }
+.box { display: flex; align-items: flex-end; gap: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 8px 8px 8px 14px; box-shadow: var(--shadow); }
+.box:focus-within { border-color: var(--accent); }
+textarea { flex: 1; border: none; outline: none; resize: none; background: transparent; color: var(--text); font: inherit; max-height: 220px; padding: 6px 0; }
+.send { border: none; background: var(--accent); color: white; border-radius: 10px; width: 36px; height: 36px; display: grid; place-items: center; flex: none; }
+.send:disabled { opacity: .35; cursor: default; }
+.send.stop { background: var(--text); color: var(--bg); }
+.hint { text-align: center; font-size: 12px; color: var(--muted); margin-top: 8px; }
+
+/* cluster panel */
+aside { border-left: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 18px; min-height: 0; }
+.section { margin-bottom: 22px; }
+.section h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
+.card { background: var(--panel2); border-radius: 12px; padding: 12px 14px; }
+.big { font-size: 22px; font-weight: 650; letter-spacing: -.02em; }
+.sub { color: var(--muted); font-size: 13px; }
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.stat .v { font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; }
+.stat .k { font-size: 12px; color: var(--muted); }
+.node { background: var(--panel2); border-radius: 12px; padding: 12px 14px; border: 1px solid transparent; }
+.node.active { border-color: var(--accent); }
+.node .top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.node .name { font-weight: 620; }
+.node .chip { color: var(--muted); font-size: 12.5px; }
+.node .role { font-size: 13px; margin-top: 4px; }
+.tag { font-size: 11px; font-weight: 550; color: var(--accent); background: var(--accent-soft); border-radius: 6px; padding: 1px 6px; margin-left: 4px; vertical-align: 1px; }
+.node .role.idle { color: var(--muted); }
+.bar { height: 6px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 8px 0 4px; }
+.bar > div { height: 100%; background: var(--accent); border-radius: 99px; transition: width .4s; }
+.bar.warn > div { background: var(--warn); }
+.link { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; padding: 5px 0 5px 18px; }
+.link::before { content: ""; width: 2px; height: 18px; background: var(--line); border-radius: 2px; }
+.join { font: 12.5px var(--mono); background: var(--panel2); border-radius: 10px; padding: 10px 12px; word-break: break-all; position: relative; padding-right: 60px; }
+.join button { position: absolute; right: 8px; top: 8px; border: 1px solid var(--line); background: var(--panel); border-radius: 7px; padding: 2px 8px; font: 12px inherit; font-family: inherit; }
+.events { font-size: 12.5px; max-height: 260px; overflow-y: auto; }
+.ev { display: grid; grid-template-columns: 58px 14px 1fr; gap: 4px; padding: 3px 0; border-bottom: 1px dashed var(--line); }
+.ev .t { color: var(--muted); font: 11.5px var(--mono); padding-top: 2px; }
+.ev.ok .i { color: var(--accent); } .ev.warn .i { color: var(--warn); } .ev.error .i { color: var(--err); } .ev.info .i { color: var(--muted); }
+.advice { font-size: 13px; margin: 8px 0 0; padding-left: 18px; color: var(--muted); }
+.advice li { margin-bottom: 4px; }
+svg.spark { width: 100%; height: 40px; display: block; margin-top: 8px; }
+
+/* settings */
+dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); color: var(--text); padding: 20px; width: min(440px, 92vw); }
+dialog::backdrop { background: rgba(0,0,0,.35); }
+dialog label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 4px; }
+dialog input, dialog textarea { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; background: var(--bg); color: var(--text); font: inherit; }
+dialog textarea { min-height: 70px; }
+dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+@media (max-width: 900px) {
+  .app { grid-template-columns: 1fr; grid-template-rows: 56px 44px minmax(0, 1fr); }
+  .tabs { display: flex; grid-column: 1; border-bottom: 1px solid var(--line); background: var(--panel); }
+  .tabs button { flex: 1; border: none; background: none; padding: 10px; color: var(--muted); font-weight: 550; border-bottom: 2px solid transparent; }
+  .tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
+  aside { border-left: none; display: none; }
+  body.show-cluster aside { display: block; } body.show-cluster .chat { display: none; }
+  .model { display: none; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <div class="brand">
+      <svg viewBox="0 0 32 32"><path d="M16 29c0-9 0-14 6-19M16 20c-2-4-6-6-10-6 1 5 4 8 10 6zM22 10c2-3 5-4 8-4-1 4-4 6-8 4z" fill="none" stroke="#22c55e" stroke-width="2.5" stroke-linecap="round"/></svg>
+      Tendril
+    </div>
+    <div class="model" id="model">connecting…</div>
+    <div class="spacer"></div>
+    <span class="pill starting" id="pill"><span class="dot"></span><span id="pillText">Starting</span></span>
+    <button class="iconbtn" id="newChat" title="New chat">New chat</button>
+    <button class="iconbtn" id="settingsBtn" title="Settings">Settings</button>
+  </header>
+  <nav class="tabs"><button class="on" data-tab="chat">Chat</button><button data-tab="cluster">Cluster</button></nav>
+
+  <main class="chat">
+    <div class="messages" id="messages"><div class="inner" id="thread"></div></div>
+    <div class="composer"><div class="inner">
+      <div class="box">
+        <textarea id="input" rows="1" placeholder="Message the model…" autofocus></textarea>
+        <button class="send" id="send" title="Send (Enter)" disabled>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+      <div class="hint" id="hint">Enter to send · Shift+Enter for a new line</div>
+    </div></div>
+  </main>
+
+  <aside id="cluster">
+    <div class="section"><h3>Status</h3><div class="card" id="statusCard"><div class="sub">Connecting to the server…</div></div></div>
+    <div class="section"><h3>Throughput</h3>
+      <div class="stats">
+        <div class="stat card"><div class="v" id="sTps">–</div><div class="k">tok/s (last)</div></div>
+        <div class="stat card"><div class="v" id="sReq">0</div><div class="k">requests</div></div>
+        <div class="stat card"><div class="v" id="sTok">0</div><div class="k">tokens out</div></div>
+      </div>
+      <svg class="spark" id="spark" viewBox="0 0 100 40" preserveAspectRatio="none"></svg>
+    </div>
+    <div class="section"><h3>Pipeline</h3><div id="pipeline"></div></div>
+    <div class="section"><h3>Add a machine</h3>
+      <div class="sub" style="margin-bottom:8px">Run this on any computer on your network:</div>
+      <div class="join"><span id="joinCmd">…</span><button id="copyJoin">Copy</button></div>
+    </div>
+    <div class="section"><h3>Activity</h3><div class="events" id="events"></div></div>
+  </aside>
+</div>
+
+<dialog id="settings">
+  <div style="font-weight:650;font-size:16px">Settings</div>
+  <label for="sys">System prompt</label>
+  <textarea id="sys" placeholder="You are a helpful assistant."></textarea>
+  <label for="temp">Temperature <span id="tempV"></span></label>
+  <input id="temp" type="range" min="0" max="1.5" step="0.05">
+  <label for="maxTok">Max tokens per reply</label>
+  <input id="maxTok" type="number" min="1" max="32768">
+  <div class="row"><button class="iconbtn" id="closeSettings">Done</button></div>
+</dialog>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const store = { get(k, d) { try { const v = localStorage.getItem('tendril.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+                set(k, v) { try { localStorage.setItem('tendril.' + k, JSON.stringify(v)); } catch {} } };
+let settings = Object.assign({ system: '', temperature: 0.7, maxTokens: 1024 }, store.get('settings', {}));
+let history = store.get('history', []);
+let busy = false, controller = null, lastStatus = null, ready = false;
+
+function esc(s) { return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+function fmtBytes(b) { if (!b) return '0'; const u = ['B','KiB','MiB','GiB','TiB']; let i = 0; while (b >= 1024 && i < 4) { b /= 1024; i++; } return (b >= 100 ? b.toFixed(0) : b >= 10 ? b.toFixed(1) : b.toFixed(2)) + ' ' + u[i]; }
+function fmtParams(n) { return n >= 1e9 ? (n / 1e9).toFixed(n >= 1e10 ? 0 : 1) + 'B' : n >= 1e6 ? Math.round(n / 1e6) + 'M' : Math.round(n / 1e3) + 'K'; }
+function shortChip(c) { return c.replace(/\((R|TM)\)/g, '').replace(/NVIDIA GeForce |NVIDIA |Apple /, '').replace(/ (CPU|Processor)\b.*$/, '').replace(/\s+/g, ' ').trim(); }
+function fmtMs(ms) { if (ms == null) return '–'; if (ms >= 1000) return (ms/1000).toFixed(2) + ' s'; if (ms >= 1) return ms.toFixed(ms < 10 ? 1 : 0) + ' ms'; return Math.round(ms*1000) + ' µs'; }
+
+// Tiny, safe markdown: code fences, inline code, bold/italic, headings, lists, paragraphs.
+function md(src) {
+  const parts = src.split(/```/);
+  let html = '';
+  parts.forEach((p, i) => {
+    if (i % 2 === 1) {
+      const nl = p.indexOf('\n'); const body = nl >= 0 ? p.slice(nl + 1) : p;
+      html += '<pre><code>' + esc(body.replace(/\n$/, '')) + '</code></pre>';
+      return;
+    }
+    const blocks = p.split(/\n{2,}/);
+    for (const b of blocks) {
+      if (!b.trim()) continue;
+      const lines = b.split('\n');
+      const inline = (t) => esc(t).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+      if (lines.every(l => /^\s*([-*•]|\d+\.)\s+/.test(l))) {
+        const ordered = /^\s*\d+\./.test(lines[0]);
+        html += (ordered ? '<ol>' : '<ul>') + lines.map(l => '<li>' + inline(l.replace(/^\s*([-*•]|\d+\.)\s+/, '')) + '</li>').join('') + (ordered ? '</ol>' : '</ul>');
+      } else if (/^#{1,3}\s/.test(lines[0]) && lines.length === 1) {
+        html += '<h3>' + inline(lines[0].replace(/^#+\s/, '')) + '</h3>';
+      } else {
+        html += '<p>' + lines.map(inline).join('<br>') + '</p>';
+      }
+    }
+  });
+  return html;
+}
+
+function renderThread() {
+  const t = $('thread');
+  if (!history.length) {
+    t.innerHTML = `<div class="empty">
+      <svg width="44" height="44" viewBox="0 0 32 32"><path d="M16 29c0-9 0-14 6-19M16 20c-2-4-6-6-10-6 1 5 4 8 10 6zM22 10c2-3 5-4 8-4-1 4-4 6-8 4z" fill="none" stroke="#22c55e" stroke-width="2.5" stroke-linecap="round"/></svg>
+      <h1>What can I help with?</h1>
+      <div>Running <b>${esc(lastStatus?.model || 'a model')}</b> across ${lastStatus?.nodes?.length || 1} machine${(lastStatus?.nodes?.length || 1) === 1 ? '' : 's'} on your network.</div>
+      <div class="sugg">
+        <button>Explain pipeline parallelism simply</button>
+        <button>Write a haiku about distributed computing</button>
+        <button>Give me 3 ideas for a weekend project</button>
+      </div></div>`;
+    t.querySelectorAll('.sugg button').forEach(b => b.onclick = () => { $('input').value = b.textContent; send(); });
+    return;
+  }
+  t.innerHTML = '';
+  history.forEach((m, i) => t.appendChild(msgEl(m, i)));
+  scrollDown(true);
+}
+
+function msgEl(m, i) {
+  const el = document.createElement('div');
+  el.className = 'msg ' + (m.role === 'user' ? 'user' : 'ai');
+  const b = document.createElement('div');
+  b.className = 'bubble';
+  if (m.role === 'user') b.textContent = m.content; else b.innerHTML = m.error ? `<div class="error">${esc(m.error)}</div>` : md(m.content || '');
+  el.appendChild(b);
+  if (m.role !== 'user' && (m.stats || m.content)) {
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    if (m.stats) meta.innerHTML = `<span>${m.stats.tokens} tokens · ${m.stats.tps.toFixed(1)} tok/s · first token ${fmtMs(m.stats.ttft)}</span>`;
+    const copy = document.createElement('button'); copy.textContent = 'Copy';
+    copy.onclick = () => { navigator.clipboard?.writeText(m.content); copy.textContent = 'Copied'; setTimeout(() => copy.textContent = 'Copy', 1200); };
+    meta.appendChild(copy);
+    if (i === history.length - 1) {
+      const re = document.createElement('button'); re.textContent = 'Regenerate';
+      re.onclick = () => { if (busy) return; history.pop(); save(); renderThread(); generate(); };
+      meta.appendChild(re);
+    }
+    el.appendChild(meta);
+  }
+  return el;
+}
+
+function scrollDown(force) {
+  const box = $('messages');
+  if (force || box.scrollHeight - box.scrollTop - box.clientHeight < 160) box.scrollTop = box.scrollHeight;
+}
+function save() { store.set('history', history.slice(-100)); }
+
+function setBusy(v) {
+  busy = v;
+  const s = $('send');
+  s.classList.toggle('stop', v);
+  s.innerHTML = v ? '<svg width="12" height="12" viewBox="0 0 12 12"><rect width="12" height="12" rx="2" fill="currentColor"/></svg>'
+                  : '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+  updateSend();
+}
+function updateSend() { $('send').disabled = !busy && (!$('input').value.trim() || !ready); }
+
+async function send() {
+  if (busy) { controller?.abort(); return; }
+  const text = $('input').value.trim();
+  if (!text || !ready) return;
+  $('input').value = ''; autosize();
+  history.push({ role: 'user', content: text });
+  save(); renderThread();
+  await generate();
+}
+
+async function generate() {
+  const msgs = [];
+  if (settings.system.trim()) msgs.push({ role: 'system', content: settings.system });
+  history.forEach(m => { if (!m.error) msgs.push({ role: m.role, content: m.content }); });
+  const reply = { role: 'assistant', content: '' };
+  history.push(reply);
+  const el = msgEl(reply, history.length - 1);
+  $('thread').appendChild(el);
+  const bubble = el.querySelector('.bubble');
+  bubble.classList.add('caret');
+  scrollDown(true);
+  setBusy(true);
+  controller = new AbortController();
+  const t0 = performance.now(); let first = null, pending = false;
+  try {
+    const r = await fetch('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+      body: JSON.stringify({ model: 'tendril', messages: msgs, stream: true, temperature: settings.temperature, max_tokens: settings.maxTokens, stream_options: { include_usage: true } }) });
+    if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j?.error?.message || ('HTTP ' + r.status)); }
+    const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = '';
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
+        for (const line of chunk.split('\n')) {
+          if (!line.startsWith('data: ')) continue;
+          const data = line.slice(6);
+          if (data === '[DONE]') continue;
+          const j = JSON.parse(data);
+          if (j.error) throw new Error(j.error.message);
+          const d = j.choices?.[0]?.delta?.content;
+          if (d) {
+            if (first === null) first = performance.now() - t0;
+            reply.content += d;
+            if (!pending) { pending = true; requestAnimationFrame(() => { bubble.innerHTML = md(reply.content); pending = false; scrollDown(); }); }
+          }
+          if (j.usage) reply.stats = { tokens: j.usage.completion_tokens, tps: j.tendril?.decode_tokens_per_sec || 0, ttft: j.tendril?.ttft_ms ?? first };
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') reply.error = e.message;
+  }
+  setBusy(false);
+  save();
+  const idx = history.indexOf(reply);
+  el.replaceWith(msgEl(reply, idx));
+  scrollDown();
+}
+
+// ---- cluster panel --------------------------------------------------------
+const pillLabel = { ready: 'Ready', loading: 'Loading', waiting: 'Waiting for machines', starting: 'Starting', failed: 'Failed' };
+function renderStatus(s) {
+  lastStatus = s;
+  const st = s.status || {};
+  const state = st.state || 'starting';
+  ready = state === 'ready';
+  $('pill').className = 'pill ' + state; $('pillText').textContent = pillLabel[state] || state;
+  $('model').textContent = `${s.model} · ${s.architecture} · ${fmtParams(s.params)} params · ${s.format === 'native' ? 'full precision' : s.format} · ${s.context.toLocaleString()} ctx`;
+  $('joinCmd').textContent = s.join;
+  $('hint').textContent = ready ? 'Enter to send · Shift+Enter for a new line' : (state === 'loading' ? 'The model is loading — this takes a moment the first time.' : state === 'waiting' ? 'Waiting for enough machines to run this model.' : 'Starting…');
+  updateSend();
+
+  let card = '';
+  if (state === 'ready') {
+    const m = s.metrics.recent.slice(-1)[0];
+    card = `<div class="big">${st.predicted_tps.toFixed(1)} <span class="sub">tok/s predicted</span></div>
+      <div class="sub">${esc(st.plan)}${m ? ` · last reply ${m.decode_tps.toFixed(1)} tok/s, first token ${fmtMs(m.ttft_ms)}` : ''}</div>`;
+  } else if (state === 'waiting') {
+    card = `<div style="font-weight:600">Not enough memory yet</div><div class="sub">${esc(st.reason)}</div>
+      ${st.advice?.length ? '<ul class="advice">' + st.advice.slice(0, 3).map(a => '<li>' + esc(a) + '</li>').join('') + '</ul>' : ''}`;
+  } else if (state === 'loading') {
+    card = `<div style="font-weight:600">Loading ${esc(st.plan)}</div>` + st.stages.map(g => {
+      const pct = g.total ? Math.round(g.done / g.total * 100) : (g.phase === 'ready' ? 100 : 0);
+      return `<div class="sub" style="margin-top:8px">${esc(g.node)} — ${esc(g.phase)}${g.total && g.phase === 'sending' ? ` ${fmtBytes(g.done)} / ${fmtBytes(g.total)}` : ''}</div><div class="bar"><div style="width:${pct}%"></div></div>`;
+    }).join('');
+  } else if (state === 'failed') {
+    card = `<div class="error">${esc(st.error)}</div>`;
+  } else card = '<div class="sub">Starting…</div>';
+  $('statusCard').innerHTML = card;
+
+  const m = s.metrics;
+  const last = m.recent.slice(-1)[0];
+  $('sTps').textContent = last ? last.decode_tps.toFixed(1) : '–';
+  $('sReq').textContent = m.requests;
+  $('sTok').textContent = m.completion_tokens > 9999 ? (m.completion_tokens / 1000).toFixed(1) + 'k' : m.completion_tokens;
+  const pts = m.recent.map(r => r.decode_tps).slice(-30);
+  if (pts.length > 1) {
+    const max = Math.max(...pts, 1);
+    const d = pts.map((v, i) => `${(i / (pts.length - 1) * 100).toFixed(1)},${(38 - v / max * 34).toFixed(1)}`).join(' ');
+    $('spark').innerHTML = `<polyline points="${d}" fill="none" stroke="var(--accent)" stroke-width="1.6" vector-effect="non-scaling-stroke"/>`;
+  }
+
+  // Pipeline: nodes in stage order, then idle nodes.
+  const stages = s.plan?.stages || [];
+  const byName = Object.fromEntries(s.nodes.map(n => [n.name, n]));
+  const ordered = stages.map(g => ({ g, n: byName[g.node] })).filter(x => x.n);
+  const idle = s.nodes.filter(n => !stages.some(g => g.node === n.name));
+  let html = '';
+  ordered.forEach(({ g, n }, i) => {
+    const pct = Math.min(100, Math.round(g.peak / g.usable * 100));
+    if (i > 0) {
+      const link = n.local ? byName[ordered[i - 1].n.name] : n;
+      html += `<div class="link">${link?.rtt_ms != null ? fmtMs(link.rtt_ms) + ' · ' + (link.bandwidth_gbps || 0).toFixed(1) + ' Gb/s' : 'activations'} ↓</div>`;
+    }
+    html += `<div class="node active"><div class="top"><span class="name">${esc(n.name)}${n.local ? ' <span class="tag">this server</span>' : ''}</span><span class="chip">${esc(shortChip(n.chip))} · ${n.backend}</span></div>
+      <div class="role">${esc(g.components)}</div>
+      <div class="bar ${pct > 90 ? 'warn' : ''}"><div style="width:${pct}%"></div></div>
+      <div class="chip">${fmtBytes(g.peak)} of ${fmtBytes(g.usable)} · ${fmtMs(g.decode_ms)}/token${n.on_battery ? ' · on battery' : ''}</div></div>`;
+  });
+  idle.forEach(n => {
+    html += `<div class="node" style="margin-top:10px"><div class="top"><span class="name">${esc(n.name)}</span><span class="chip">${esc(shortChip(n.chip))} · ${n.backend}</span></div>
+      <div class="role idle">idle · ${esc(n.usable)} available${n.rtt_ms != null ? ' · ' + fmtMs(n.rtt_ms) : ''}</div></div>`;
+  });
+  $('pipeline').innerHTML = html || '<div class="sub">No machines yet.</div>';
+}
+
+function addEvent(e, prepend) {
+  const box = $('events');
+  const div = document.createElement('div');
+  div.className = 'ev ' + e.level;
+  const icon = { ok: '✓', warn: '!', error: '✗', info: '·' }[e.level] || '·';
+  div.innerHTML = `<span class="t">${esc(e.at)}</span><span class="i">${icon}</span><span>${esc(e.text)}</span>`;
+  box.prepend(div);
+  while (box.children.length > 80) box.lastChild.remove();
+}
+
+let eventsLoaded = false;
+async function poll() {
+  try {
+    const r = await fetch('/api/status');
+    const s = await r.json();
+    const wasEmpty = !lastStatus;
+    renderStatus(s);
+    if (!eventsLoaded) { eventsLoaded = true; s.events.forEach(e => addEvent(e)); }
+    if (wasEmpty && !history.length) renderThread();
+  } catch {
+    $('pill').className = 'pill failed'; $('pillText').textContent = 'Server unreachable';
+    ready = false; updateSend();
+  }
+}
+function listen() {
+  const es = new EventSource('/api/events');
+  es.onmessage = (m) => { try { addEvent(JSON.parse(m.data)); poll(); } catch {} };
+  es.onerror = () => { es.close(); setTimeout(listen, 3000); };
+}
+
+// ---- wiring ---------------------------------------------------------------
+function autosize() { const t = $('input'); t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 220) + 'px'; }
+$('input').addEventListener('input', () => { autosize(); updateSend(); });
+$('input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
+$('send').onclick = send;
+$('newChat').onclick = () => { if (busy) controller?.abort(); history = []; save(); renderThread(); $('input').focus(); };
+$('copyJoin').onclick = () => { navigator.clipboard?.writeText($('joinCmd').textContent); $('copyJoin').textContent = 'Copied'; setTimeout(() => $('copyJoin').textContent = 'Copy', 1200); };
+document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('.tabs button').forEach(x => x.classList.toggle('on', x === b));
+  document.body.classList.toggle('show-cluster', b.dataset.tab === 'cluster');
+});
+const dlg = $('settings');
+$('settingsBtn').onclick = () => { $('sys').value = settings.system; $('temp').value = settings.temperature; $('tempV').textContent = settings.temperature; $('maxTok').value = settings.maxTokens; dlg.showModal(); };
+$('temp').oninput = () => $('tempV').textContent = $('temp').value;
+$('closeSettings').onclick = () => { settings = { system: $('sys').value, temperature: parseFloat($('temp').value), maxTokens: Math.max(1, parseInt($('maxTok').value) || 1024) }; store.set('settings', settings); dlg.close(); };
+
+renderThread();
+poll(); setInterval(poll, 2000); listen();
+</script>
+</body>
+</html>

@@ -90,6 +90,13 @@ pub struct PlanOptions {
     pub max_stages: usize,
     /// Cap on attention scratch; the engine chunks prefill to respect it.
     pub attn_scratch_cap: Bytes,
+    /// Use at least this many machines (e.g. to measure distribution cost).
+    #[serde(default = "one")]
+    pub min_stages: usize,
+}
+
+fn one() -> usize {
+    1
 }
 
 impl Default for PlanOptions {
@@ -99,6 +106,7 @@ impl Default for PlanOptions {
             safety_frac: 0.05,
             max_stages: 8,
             attn_scratch_cap: Bytes(256 * MIB),
+            min_stages: 1,
         }
     }
 }
@@ -326,7 +334,7 @@ impl<'a> Prep<'a> {
                 weights += m.head_bytes();
             }
         }
-        let kv = Bytes(self.kv_ctx[b] - self.kv_ctx[a]);
+        let kv = Bytes(self.kv_ctx[b] - self.kv_ctx[a]).times(kv_scale(node, self.w));
         let mut scratch = if b > a {
             self.scratch_layers
         } else {
@@ -368,7 +376,9 @@ impl<'a> Prep<'a> {
             read += (m.head_bytes() + m.bytes.final_norm).0 as f64;
             params += self.head_params as f64;
         }
-        read += (self.kv_read[b] - self.kv_read[a]) as f64 * batch as f64;
+        read += (self.kv_read[b] - self.kv_read[a]) as f64
+            * batch as f64
+            * kv_scale(node, self.w) as f64;
         let mem_ms = read / (node.effective_bandwidth_gbs() * 1e9) * 1e3;
         let flops = 2.0 * params * batch as f64;
         let compute_ms = flops / (node.effective_tflops() * 1e12) * 1e3;
@@ -395,6 +405,16 @@ impl<'a> Prep<'a> {
         let chunks = tokens.div_ceil(self.w.prefill_chunk.max(1)) as f64;
         let mem_ms = weight_bytes * chunks / (node.effective_bandwidth_gbs() * 1e9) * 1e3;
         compute_ms.max(mem_ms) + chunks * (b - a) as f64 * node.backend.per_layer_overhead_ms()
+    }
+}
+
+/// Tendril's CPU backend computes attention in f32, so its KV cache uses
+/// 4 bytes per element where GPUs use 2.
+fn kv_scale(node: &NodeProfile, w: &Workload) -> u64 {
+    if node.backend == Backend::Cpu && w.kv_elem_bytes == 2 {
+        2
+    } else {
+        1
     }
 }
 
@@ -685,7 +705,10 @@ pub fn plan(
     opts: &PlanOptions,
 ) -> PlanResult {
     let prep = Prep::new(model, workload, opts);
-    let orders = orderings(cluster, opts.max_stages);
+    let orders: Vec<Vec<usize>> = orderings(cluster, opts.max_stages)
+        .into_iter()
+        .filter(|o| o.len() >= opts.min_stages)
+        .collect();
     let l = model.num_layers;
     let mut feasible: Vec<Plan> = Vec::new();
     let mut rejected: Vec<Rejection> = Vec::new();
@@ -942,10 +965,13 @@ pub fn feasible(
     opts: &PlanOptions,
 ) -> bool {
     let prep = Prep::new(model, workload, opts);
-    orderings(cluster, opts.max_stages).iter().any(|order| {
-        let nodes: Vec<&NodeProfile> = order.iter().map(|&i| &cluster.nodes[i]).collect();
-        order.len() as u64 <= model.num_layers && dp(&prep, &nodes, DpMode::Pressure).is_some()
-    })
+    orderings(cluster, opts.max_stages)
+        .iter()
+        .filter(|o| o.len() >= opts.min_stages)
+        .any(|order| {
+            let nodes: Vec<&NodeProfile> = order.iter().map(|&i| &cluster.nodes[i]).collect();
+            order.len() as u64 <= model.num_layers && dp(&prep, &nodes, DpMode::Pressure).is_some()
+        })
 }
 
 #[cfg(test)]

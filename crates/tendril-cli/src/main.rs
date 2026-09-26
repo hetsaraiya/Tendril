@@ -1,13 +1,18 @@
 //! tendril — plan and run LLMs across the machines you already have.
 
 mod catalog;
+mod client;
 mod common;
 mod doctor;
 mod fit;
 mod inspect;
+mod models;
 mod node;
 mod plan;
+mod run;
+mod serve;
 mod ui;
+mod verify;
 
 use clap::{Parser, Subcommand};
 
@@ -19,10 +24,11 @@ use clap::{Parser, Subcommand};
     long_about = "Tendril inspects a model, looks at your machines and decides how to run it: \
                   on one machine, split across several, or not at all — and explains why.",
     after_help = "Examples:\n  \
+        tendril run qwen2.5-0.5b                       chat with a small model on this machine\n  \
+        tendril serve Qwen/Qwen2.5-7B-Instruct         serve it; other machines can join\n  \
+        tendril join 192.168.1.20 --token XXXX-...     (on another machine) contribute it\n  \
         tendril plan gemma-2-9b --node air=m4:16 --node mini=m5:16 --link thunderbolt\n  \
-        tendril plan Qwen/Qwen2.5-14B-Instruct --context 32k --explain\n  \
         tendril fit llama-3.1-70b --node studio=m2-ultra:192\n  \
-        tendril inspect ./models/my-model\n  \
         tendril doctor"
 )]
 struct Cli {
@@ -32,6 +38,27 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Chat with a model on this machine (downloads it if needed).
+    Run(run::RunArgs),
+    /// Serve a model across this machine and any that join; web chat + OpenAI API.
+    Serve(serve::ServeArgs),
+    /// Contribute this machine to a `tendril serve` cluster.
+    Join(serve::JoinArgs),
+    /// Chat with a running server from the terminal.
+    Chat(client::ChatArgs),
+    /// Show a running server's machines, plan and traffic.
+    Status(client::StatusArgs),
+    /// Download a model from HuggingFace.
+    Pull(PullArgs),
+    /// Check that a split pipeline computes exactly what one machine would.
+    Verify(verify::VerifyArgs),
+    /// Developer tools (hidden).
+    #[command(hide = true, name = "dev-tiny-model")]
+    DevTinyModel {
+        dir: std::path::PathBuf,
+        #[arg(long, default_value_t = 4)]
+        layers: usize,
+    },
     /// Decide how to run a model on your machines, and explain why.
     Plan(plan::PlanArgs),
     /// "Can I run it?" matrix across quantizations and context lengths.
@@ -48,6 +75,12 @@ enum Cmd {
     Hardware,
 }
 
+#[derive(clap::Args)]
+struct PullArgs {
+    /// HuggingFace id or catalog name.
+    model: String,
+}
+
 fn main() {
     // Behave like a normal Unix tool when piped into `head`.
     #[cfg(unix)]
@@ -55,7 +88,30 @@ fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
     let cli = Cli::parse();
+    if std::env::var("RUST_LOG").is_ok() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+    }
     let r = match cli.cmd {
+        Cmd::Run(a) => run::run(a),
+        Cmd::Serve(a) => serve::serve(a),
+        Cmd::Join(a) => serve::join(a),
+        Cmd::Chat(a) => client::chat(a),
+        Cmd::Status(a) => client::status(a),
+        Cmd::Pull(a) => models::ensure_local(&a.model, true)
+            .map(|(d, n)| println!("{} {n} is ready at {}", ui::ok_mark(), d.display())),
+        Cmd::Verify(a) => verify::run(a),
+        Cmd::DevTinyModel { dir, layers } => {
+            tendril_engine::testing::write_tiny_llama(&dir, layers, 64, 1, candle_core::DType::BF16)
+                .map(|_| {
+                    println!(
+                        "wrote a random {layers}-layer test model to {}",
+                        dir.display()
+                    )
+                })
+        }
         Cmd::Plan(a) => plan::run(a),
         Cmd::Fit(a) => fit::run(a),
         Cmd::Inspect(a) => inspect::run(a),

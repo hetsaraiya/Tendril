@@ -29,49 +29,105 @@ Why this plan
 
 ```bash
 git clone https://github.com/hetsaraiya/Tendril && cd Tendril
-cargo install --path crates/tendril-cli     # installs the `tendril` binary
-tendril doctor                               # check this machine
+
+# Apple Silicon (Metal GPU):
+cargo install --path crates/tendril-cli --features metal
+# NVIDIA (CUDA toolkit installed):
+cargo install --path crates/tendril-cli --features cuda
+# Anything else (fast CPU kernels, AVX2/NEON):
+cargo install --path crates/tendril-cli
+
+tendril doctor        # check this machine
 ```
 
-Requires Rust 1.80+. Works on macOS (Apple Silicon), Linux and Windows.
+Requires Rust 1.82+. Models come from HuggingFace (safetensors); gated models such as
+Llama and Gemma need `HF_TOKEN`.
 
-## Five-minute tour
+## Run a model on one machine
 
 ```bash
-# Can I run it? A matrix of quantization × context on this machine.
-tendril fit qwen2.5-14b
-
-# Plan for machines you have (or are thinking of buying).
-tendril plan llama-3.3-70b --node studio=m2-ultra:192
-tendril plan gemma-2-9b --node air=m4:16 --node mini=m5:16 --link thunderbolt --explain
-
-# Any HuggingFace repo: only config.json and tensor headers are fetched (a few KB),
-# never the weights.
-tendril inspect Qwen/Qwen2.5-7B-Instruct
-tendril plan mistralai/Mistral-Nemo-Instruct-2407 --context 32k
-
-# Local folders and GGUF files work too.
-tendril plan ~/models/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
-
-# Describe a whole lab in a file.
-tendril plan llama-3.3-70b --cluster examples/mixed-lab.toml --quantize q4_k
+tendril run qwen2.5-1.5b                     # downloads, loads, opens a chat in your terminal
+tendril run Qwen/Qwen2.5-7B-Instruct -q q8_0 # quantize on load to halve memory
+tendril run ~/models/my-model -p "Hello!"    # one-shot answer from a local folder
 ```
 
-## Commands
+## Run a model across machines
 
-| Command | What it does |
-|---|---|
-| `tendril plan <model>` | Chooses machines, layer split and order; predicts speed and memory; explains the choice. `--explain` shows every cut, the memory breakdown and rejected alternatives. `--json` for scripts. |
-| `tendril fit <model>` | "Can I run it?" matrix across representations (bf16/q8/q6/q4) and context lengths. |
-| `tendril inspect <model>` | Architecture, where the bytes are, KV cache per context, size per quantization. |
-| `tendril node [--probe]` | This machine as the planner sees it; `--probe` measures memory bandwidth. |
-| `tendril doctor` | Checks accelerator, memory, macOS GPU limit, power, disk and HuggingFace access, with fixes. |
-| `tendril models` | Models known offline (Llama, Qwen, Gemma, Mistral, Phi, DeepSeek-R1 distills, …). |
-| `tendril hardware` | Hardware presets for `--node` (M1–M5 families, RTX 30/40/50, A100/H100, CPUs). |
+On the machine with the model (the **coordinator**):
 
-Common flags: `--context 32k`, `--concurrency 4`, `--goal balanced|latency|throughput|memory`,
-`--quantize q8_0` (only ever applied when you ask), `--link thunderbolt|10gbe|gbe|wifi`,
-`--with-local` (add this machine to `--node` machines), `--offline`.
+```text
+$ tendril serve Qwen/Qwen2.5-14B-Instruct
+
+Tendril · serving Qwen/Qwen2.5-14B-Instruct
+  Web chat   http://192.168.1.20:8080
+  API        http://192.168.1.20:8080/v1  (OpenAI-compatible)
+  Add more   run this on another machine to add it:
+             tendril join 192.168.1.20:7420 --token 7Q2K-9XMP-4HVD-J3FA
+
+17:55:13 ! Qwen2.5-14B doesn't fit on the 1 machine here yet: needs 29.4 GiB, m4-air allows 10.7 GiB …
+```
+
+On every other machine, paste the join command:
+
+```text
+$ tendril join 192.168.1.20:7420 --token 7Q2K-9XMP-4HVD-J3FA
+17:55:20 ✓ joined as m5-air — serving Qwen/Qwen2.5-14B-Instruct
+17:55:21 ↓ receiving weights for layers 22–47 + head: 6.1 GiB/13.9 GiB (44%)
+17:56:02 ✓ running layers 22–47 + head (13.9 GiB, Metal) — ready in 41.3 s
+```
+
+![Tendril web chat with the live pipeline view](docs/images/web-ui.png)
+
+As machines join, Tendril measures each link, re-plans automatically and starts serving
+as soon as the model fits. Then:
+
+- open the **web chat** (conversation + live view of the pipeline, memory, links and throughput),
+- chat from a terminal with `tendril chat`,
+- point any OpenAI client at `http://<coordinator>:8080/v1`,
+- watch the cluster with `tendril status`.
+
+What happens under the hood:
+
+- **Only the needed weights move.** Each machine receives exactly the tensors of its
+  layers (never the whole checkpoint), streamed from the coordinator and cached on disk,
+  so a restart reloads instantly.
+- **Only activations cross the network.** Each token sends one hidden-state vector per
+  machine boundary and a single token id back — a few KB, not the model.
+- **Every link is authenticated and encrypted** (Noise protocol, pre-shared cluster
+  token). A machine without the token can't join, read activations or inject work.
+- **Failures are explicit.** If a machine leaves, in-flight requests end with a clear
+  error, the cluster re-plans with who's left, and resumes when it fits again.
+- **Splitting is exact.** Pipeline execution is bit-identical to running the model on one
+  machine (`tendril verify <model>` checks this for any model).
+
+Useful flags: `--context 32k`, `--concurrency 8`, `--quantize q8_0|q4_k`,
+`--goal latency|throughput|memory`, `--max-memory 8gb` (cap what Tendril may use on a
+machine, on `serve` or `join`), `--min-machines 2` (force a split, e.g. to measure its
+cost), `--no-local` (coordinate only).
+
+### OpenAI-compatible API
+
+```bash
+curl http://localhost:8080/v1/chat/completions -H 'Content-Type: application/json' -d '{
+  "messages": [{"role": "user", "content": "Write a haiku about tendrils"}],
+  "stream": true
+}'
+```
+
+`/v1/chat/completions` and `/v1/completions` support streaming, `temperature`, `top_p`,
+`top_k`, `min_p`, `seed`, `stop`, `max_tokens`, presence/frequency/repetition penalties
+and `stream_options.include_usage`. Responses include a `tendril` object with
+time-to-first-token and decode speed. `/api/status` exposes the cluster as JSON.
+
+### Supported models
+
+Architectures: **Llama** (1–3.3, incl. Llama 3 RoPE scaling), **Mistral**, **Qwen 2 / 2.5**,
+**Qwen 3**, **Gemma 1 / 2 / 3** (sliding-window attention, soft-capping), **Phi-3**.
+Every architecture is verified against HuggingFace `transformers` (max relative logit
+error ~1e-6 in f32; see `tools/make_test_models.py`). Weights: bf16/f16/f32 safetensors,
+optionally quantized on load to q8_0, q6_k or q4_k.
+
+## Planning without running
 
 ## How the planner works
 

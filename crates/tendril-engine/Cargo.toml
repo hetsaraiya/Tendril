@@ -1,0 +1,35 @@
+[package]
+name = "tendril-engine"
+description = "Tendril execution engine: partition-aware transformer stages on Metal, CUDA or CPU"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+metal = ["candle-core/metal", "candle-nn/metal"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+accelerate = ["candle-core/accelerate", "candle-nn/accelerate"]
+mkl = ["candle-core/mkl", "candle-nn/mkl"]
+
+[dependencies]
+tendril-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+candle-core = "0.11"
+candle-nn = "0.11"
+safetensors = "0.8"
+tokenizers = { version = "0.23", default-features = false, features = ["onig"] }
+minijinja = { version = "2", features = ["loop_controls", "json"] }
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+rand = "0.9"
+rayon = "1"
+half = "2"
+memmap2 = "0.9"
+tracing = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+tempfile = "3"
