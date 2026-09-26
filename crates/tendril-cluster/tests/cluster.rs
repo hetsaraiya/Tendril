@@ -38,6 +38,8 @@ fn serve_opts(dir: &std::path::Path, port: u16, local: bool, min_stages: usize) 
         max_memory: None,
         prefix_cache: true,
         kv_disk: tendril_core::Bytes::mib(64.0),
+        speculate: true,
+        draft_tokens: 6,
     }
 }
 
@@ -203,12 +205,22 @@ async fn three_remote_stages() {
     let prompt: Vec<u32> = (0..300).map(|i| 5 + (i * 13 % 250) as u32).collect(); // multi-chunk prefill
     let want = reference(dir.path(), &prompt, 20);
     assert_eq!(collect(&c, prompt, 20).await, want);
-    // Per-stage timings travel with every token.
+    // The repetitive prompt makes prompt-lookup drafts verify in bulk, and the
+    // output above still matched the reference exactly.
+    let m = c.metrics();
+    assert!(m.spec_steps > 0, "{m:?}");
+    eprintln!(
+        "speculation: {} passes, {}/{} drafted tokens accepted",
+        m.spec_steps, m.accepted_tokens, m.drafted_tokens
+    );
+    // Per-stage timings travel with every plain token.
     let (plan, tel) = c.telemetry().await.expect("running pipeline");
-    assert!(tel.samples >= 3, "{tel:?}");
-    assert_eq!(tel.compute_ms.len(), plan.stages.len());
-    assert!(tel.compute_ms.iter().all(|&m| m > 0.0));
-    assert!(tel.step_ms >= tel.compute_ms.iter().sum::<f64>() * 0.5);
+    assert!(tel.samples >= 1 || m.spec_steps > 0, "{tel:?}");
+    if tel.samples > 0 {
+        assert_eq!(tel.compute_ms.len(), plan.stages.len());
+        assert!(tel.compute_ms.iter().all(|&m| m > 0.0));
+        assert!(tel.step_ms >= tel.compute_ms.iter().sum::<f64>() * 0.5);
+    }
     c.shutdown().await;
 }
 
@@ -308,5 +320,35 @@ async fn prefix_cache_reuses_spills_and_restores() {
         text3, fresh3,
         "restoring from disk must not change the output"
     );
+    c.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn speculation_is_exact_and_accepts_repetitive_text() {
+    let dir = tempfile::tempdir().unwrap();
+    tendril_engine::testing::write_tiny_llama(dir.path(), 4, 64, 3, candle_core::DType::F32)
+        .unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let c = Coordinator::start(serve_opts(dir.path(), port, true, 2))
+        .await
+        .unwrap();
+    let _a = spawn_agent(port, "helper", cache.path());
+    wait_ready(&c).await;
+    // Greedy decoding of a small random model settles into a cycle: prompt
+    // lookup should draft it and the pipeline should accept those drafts.
+    let prompt: Vec<u32> = (0..24).map(|i| 5 + (i * 11 % 90) as u32).collect();
+    let (text, _) = collect_with_timing(&c, prompt.clone(), 160).await;
+    let want = reference_ignore_eos(dir.path(), &prompt, 160);
+    assert_eq!(
+        text, want,
+        "speculative output must equal plain greedy output"
+    );
+    let m = c.metrics();
+    eprintln!(
+        "speculation: {} passes, {}/{} drafted tokens accepted",
+        m.spec_steps, m.accepted_tokens, m.drafted_tokens
+    );
+    assert!(m.accepted_tokens > 0, "{m:?}");
     c.shutdown().await;
 }

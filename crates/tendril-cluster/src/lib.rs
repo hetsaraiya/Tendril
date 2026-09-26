@@ -14,6 +14,7 @@ pub mod http;
 pub mod prefix;
 pub mod proto;
 pub mod shard;
+pub mod speculate;
 pub mod token;
 pub mod wire;
 pub mod worker;

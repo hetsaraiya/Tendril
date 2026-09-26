@@ -62,6 +62,13 @@ pub enum KvOpKind {
     Drop,
 }
 
+/// Draft tokens and the (sparse) distributions they were drawn from.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct Draft {
+    pub tokens: Vec<u32>,
+    pub q: Vec<Vec<(u32, f32)>>,
+}
+
 /// Where a stage sends its output.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub enum NextHop {
@@ -168,6 +175,16 @@ pub enum Msg {
         want_logits: bool,
         sample: Option<SampleSetup>,
         /// Per-stage timings appended as the message travels the pipeline.
+        trace: Vec<StageTime>,
+        /// Speculative draft to verify: the payload is [last token, drafts...].
+        draft: Option<Draft>,
+    },
+    /// Tokens accepted by speculative verification, plus one sampled token.
+    Tokens {
+        epoch: u64,
+        seq: u64,
+        pos: u32,
+        tokens: Vec<u32>,
         trace: Vec<StageTime>,
     },
     /// Sampled token from the last stage.

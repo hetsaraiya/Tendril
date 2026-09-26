@@ -37,7 +37,7 @@ fn run_pipeline(stages: &mut [Stage], ids: &[u32]) -> Result<Vec<Vec<f32>>> {
                     out.push(l);
                     break;
                 }
-                StageOutput::Nothing => bail!("no logits"),
+                StageOutput::Nothing | StageOutput::AllLogits(_) => bail!("no logits"),
             }
         }
     }

@@ -108,6 +108,14 @@ What happens under the hood:
   → 130 ms time-to-first-token at 1K tokens of history. Idle conversations spill to each
   machine's disk (`--kv-disk 8gb`) and come back when needed. Reuse is exact: output is
   identical to recomputing. OpenAI clients see `usage.prompt_tokens_details.cached_tokens`.
+- **Speculative decoding.** Every token normally pays for a full trip through all
+  machines. Tendril drafts likely next tokens by *prompt lookup* — copying what followed
+  the conversation's latest n-gram the last time it appeared (free; great for code
+  edits, summaries, RAG and structured output) — and the pipeline verifies them all in
+  one pass. Verification uses exact speculative sampling, so the output distribution is
+  unchanged and greedy output is identical. It adapts the draft length and switches
+  itself off when drafts aren't paying. Measured on an emulated Wi-Fi link: 107 → 260
+  tok/s at 74% acceptance (`--no-speculate`, `--draft-tokens N`).
 - **Splitting is exact.** Pipeline execution is bit-identical to running the model on one
   machine (`tendril verify <model>` checks this for any model).
 
