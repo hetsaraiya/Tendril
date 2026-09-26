@@ -1,0 +1,24 @@
+[package]
+name = "tendril-cli"
+description = "The tendril command-line tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "tendril"
+path = "src/main.rs"
+
+[dependencies]
+tendril-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+owo-colors.workspace = true
+sysinfo.workspace = true
+reqwest.workspace = true
+dirs.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -1,0 +1,22 @@
+# A mixed home lab: a Mac Studio, a gaming PC and an old laptop on 1 GbE.
+#   tendril plan llama-3.3-70b --cluster examples/mixed-lab.toml --quantize q4_k --explain
+link = "gbe"
+
+[[node]]
+name = "studio"
+hardware = "m2-max:64gb"
+
+[[node]]
+name = "gamer"
+hardware = "rtx4090"
+
+[[node]]
+name = "old-laptop"
+hardware = "cpu:16gb"
+# Override spec-sheet numbers with measurements (tendril node --probe):
+bandwidth_gbs = 25
+
+# The studio and the gaming PC share a 10 GbE switch.
+[[links]]
+between = ["studio", "gamer"]
+type = "10gbe"

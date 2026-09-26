@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/hetsaraiya/Tendril"
+rust-version = "1.80"
+
+[workspace.dependencies]
+tendril-core = { path = "crates/tendril-core" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+sysinfo = "0.33"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots", "rustls-tls-webpki-roots", "http2"] }
+owo-colors = { version = "4", features = ["supports-colors"] }
+dirs = "6"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+
+[profile.dev.package."*"]
+opt-level = 2
