@@ -3539,6 +3539,7 @@ dependencies = [
  "anyhow",
  "axum",
  "candle-core",
+ "chrono",
  "clap",
  "dirs",
  "futures",

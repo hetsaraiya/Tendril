@@ -248,7 +248,7 @@ pub fn run(a: BenchArgs) -> Result<()> {
         };
         let r = bench(&a, &url).await;
         if let Some(c) = local {
-            c.shutdown().await;
+            c.shutdown(true).await;
         }
         r
     })

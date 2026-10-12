@@ -3,24 +3,26 @@
 use crate::ui::{self, *};
 use anyhow::Result;
 use clap::Args;
-use tendril_core::hardware::{detect_local, probe_memory_bandwidth, Backend};
+use tendril_core::hardware::Backend;
 
 #[derive(Args, Debug)]
 pub struct NodeArgs {
-    /// Measure memory bandwidth (takes about a second).
+    /// Benchmark this machine again (decode and prefill speed, ~10 s).
+    /// It is otherwise measured once per hardware setup and reused.
     #[arg(long)]
     pub probe: bool,
+    /// auto, cpu, metal or cuda.
+    #[arg(long, default_value = "auto")]
+    pub device: String,
     #[arg(long)]
     pub json: bool,
 }
 
 pub fn run(a: NodeArgs) -> Result<()> {
-    let mut n = detect_local(true);
     if a.probe {
-        let bw = probe_memory_bandwidth();
-        n.measured_bandwidth_gbs = Some(bw);
-        tendril_core::hardware::save_probe(bw);
+        crate::speed::ensure(&a.device, true)?;
     }
+    let n = tendril_cluster::coordinator::this_machine(None, &a.device, None)?;
     if a.json {
         println!("{}", serde_json::to_string_pretty(&n)?);
         return Ok(());
@@ -69,17 +71,26 @@ pub fn run(a: NodeArgs) -> Result<()> {
             ),
         ),
         (
-            "Bandwidth",
+            "Decode speed",
             match n.measured_bandwidth_gbs {
                 Some(m) => format!(
-                    "{m:.0} GB/s measured (copy) · spec {:.0} GB/s",
+                    "{} of weights/s measured · spec sheet {:.0} GB/s",
+                    bold(format!("{m:.1} GB")),
                     n.bandwidth_gbs
                 ),
                 None => format!(
-                    "{:.0} GB/s spec · {:.0} GB/s used for estimates",
+                    "{:.0} GB/s spec · {:.0} GB/s assumed {}",
                     n.bandwidth_gbs,
-                    n.effective_bandwidth_gbs()
+                    n.effective_bandwidth_gbs(),
+                    dim("(not benchmarked yet)")
                 ),
+            },
+        ),
+        (
+            "Prefill speed",
+            match n.measured_tflops {
+                Some(t) => format!("{} TFLOP/s measured", bold(format!("{t:.2}"))),
+                None => format!("~{:.2} TFLOP/s assumed", n.effective_tflops()),
             },
         ),
         ("OS", format!("{} / {}", n.os, n.arch)),
@@ -106,11 +117,11 @@ pub fn run(a: NodeArgs) -> Result<()> {
             ))
         );
     }
-    if !a.probe {
+    if n.measured_bandwidth_gbs.is_none() {
         println!();
         println!(
             "{}",
-            dim("Run with --probe to measure memory bandwidth instead of using the spec sheet.")
+            dim("Not benchmarked yet: `tendril node --probe` measures it (serve and join do it automatically).")
         );
     }
     Ok(())

@@ -7,6 +7,7 @@ pub mod config;
 pub mod cpu_kernels;
 pub mod device;
 pub mod generate;
+pub mod hwbench;
 pub mod linear;
 pub mod model;
 pub mod pool;

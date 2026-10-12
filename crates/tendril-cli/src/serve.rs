@@ -9,7 +9,7 @@ use std::time::Duration;
 use tendril_cluster::agent::{AgentEvent, AgentOptions};
 use tendril_cluster::coordinator::{Coordinator, RemoteModel, ServeOptions, Status};
 use tendril_cluster::http::{router, AppState};
-use tendril_cluster::pool::{Pool, Resolver};
+use tendril_cluster::pool::{LoadRequest, Pool, Resolver};
 use tendril_core::units::{parse_tokens, Bytes};
 use tendril_core::{Goal, Link};
 use tendril_engine::linear::WeightFormat;
@@ -175,7 +175,14 @@ pub fn serve(a: ServeArgs) -> Result<()> {
     // Models not on this machine are fetched as config + tokenizer + tensor
     // table only; each machine then downloads just its own layers.
     let offline = a.offline;
-    let resolve: Resolver = Arc::new(move |name: &str| {
+    let resolve: Resolver = Arc::new(move |req: &LoadRequest| {
+        let name = req.model.trim();
+        let format = match &req.quantize {
+            Some(q) => WeightFormat::parse(q).ok_or_else(|| {
+                anyhow::anyhow!("unknown weight format '{q}' (native, q8_0, q6_k, q4_k)")
+            })?,
+            None => base.format,
+        };
         let (model_dir, model_name, remote) = if offline {
             let (d, n) = ensure_local(name, false)?;
             (d, n, None)
@@ -185,6 +192,8 @@ pub fn serve(a: ServeArgs) -> Result<()> {
         Ok(ServeOptions {
             model_dir,
             model_name,
+            format,
+            context: req.context.unwrap_or(base.context).clamp(256, 1 << 20),
             remote: remote.map(|(base_url, tensors)| RemoteModel {
                 base_url,
                 tensors,
@@ -193,11 +202,27 @@ pub fn serve(a: ServeArgs) -> Result<()> {
             ..base.clone()
         })
     });
+    // Measure this machine once per hardware setup; the planner uses it.
+    let local = if a.no_local {
+        None
+    } else {
+        if let Err(e) = crate::speed::ensure(&a.device, false) {
+            println!(
+                "{} benchmark failed ({e:#}); using spec-sheet numbers",
+                warn_mark()
+            );
+        }
+        Some(tendril_cluster::coordinator::this_machine(
+            a.name.as_deref(),
+            &a.device,
+            max_memory,
+        )?)
+    };
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        let pool = Pool::open(a.cluster_port, token.clone(), Some(resolve)).await?;
+        let pool = Pool::open(a.cluster_port, token.clone(), Some(resolve), local).await?;
         for m in &a.models {
             pool.load(m).await?;
         }
@@ -237,18 +262,19 @@ pub fn serve(a: ServeArgs) -> Result<()> {
         println!();
         if names.is_empty() {
             println!("{}", bold("Tendril · pool open, no model yet"));
-            println!("  {}  add machines below, then pick a model: {}", dim("Next     "), cyan("tendril load <model>"));
+            println!("  {}  add machines below, then pick a model in the dashboard or with {}", dim("Next     "), cyan("tendril load <model>"));
         } else {
             println!("{} {}", bold("Tendril · serving"), bold(cyan(names.join(" + "))));
         }
         if names.len() > 1 {
             println!("  {}  {}", dim("Models   "), dim(format!("one pool of machines; the API picks by the `model` field (default {})", names[0])));
         }
-        println!("  {}  {}", dim("Web chat "), bold(format!("http://{shown_host}:{}", a.port)));
+        println!("  {}  {}  {}", dim("Dashboard"), bold(format!("http://{shown_host}:{}", a.port)), dim("(chat + machines; controls unlock with the token below)"));
         println!("  {}  http://{shown_host}:{}/v1  {}", dim("API      "), a.port, dim("(OpenAI-compatible)"));
         println!("  {}  run this on another machine on your network to add it:", dim("Add more "));
         println!("             {}", cyan(&join));
         println!("             {}", dim(format!("(if your network blocks discovery: {join_direct})")));
+        println!("  {}  {}", dim("Token    "), bold(&token));
         println!();
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
@@ -314,9 +340,12 @@ pub fn serve(a: ServeArgs) -> Result<()> {
                 }
             }
         });
-        tokio::signal::ctrl_c().await.ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = pool.stopped() => println!("\n{}", dim("Stop requested from the dashboard.")),
+        }
         println!();
-        println!("{}", dim("Stopping… (telling joined machines to unload)"));
+        println!("{}", dim("Stopping… (joined machines unload and exit)"));
         pool.shutdown().await;
         printer.abort();
         Ok::<_, anyhow::Error>(())
@@ -344,7 +373,7 @@ pub fn join(a: JoinArgs) -> Result<()> {
         ),
         None => None,
     };
-    let me = tendril_core::hardware::detect_local(true);
+    let me = tendril_cluster::coordinator::this_machine(a.name.as_deref(), &a.device, None)?;
     println!();
     println!("{} {}", bold("Tendril · joining"), bold(cyan(&address)));
     println!(
@@ -364,6 +393,13 @@ pub fn join(a: JoinArgs) -> Result<()> {
         dim("Leave this running. Ctrl-C to leave the cluster.")
     );
     println!();
+    // Measure this machine once per hardware setup; the host plans with it.
+    if let Err(e) = crate::speed::ensure(&a.device, false) {
+        println!(
+            "{} benchmark failed ({e:#}); the host will use spec-sheet numbers",
+            warn_mark()
+        );
+    }
     let opts = AgentOptions {
         coordinator: address,
         token: a.token.clone(),
@@ -383,12 +419,14 @@ pub fn join(a: JoinArgs) -> Result<()> {
         let t = tendril_cluster::coordinator::clock();
         let line = match e {
             AgentEvent::Connecting { addr } => format!("{} connecting to {addr}…", dim("·")),
-            AgentEvent::Connected { name, cluster } => format!(
-                "{} joined as {} — serving {}",
+            AgentEvent::Connected { name, cluster } if cluster.is_empty() => format!(
+                "{} joined as {} — waiting for the host to pick a model",
                 ok_mark(),
-                bold(name),
-                bold(cluster)
+                bold(name)
             ),
+            AgentEvent::Connected { cluster, .. } => {
+                format!("{} serving {}", ok_mark(), bold(cluster))
+            }
             AgentEvent::Rejected { reason } => format!("{} {reason}", bad_mark()),
             AgentEvent::Disconnected { reason, retry_in } => {
                 format!(
@@ -428,8 +466,14 @@ pub fn join(a: JoinArgs) -> Result<()> {
                 device,
                 load_ms as f64 / 1000.0
             ),
-            AgentEvent::Unloaded => format!("{} unloaded{of}", dim("·")),
+            AgentEvent::Unloaded => format!("{} unloaded its part{of}", dim("·")),
             AgentEvent::Failed { error } => format!("{} {error}", bad_mark()),
+            AgentEvent::Left { reason } => {
+                format!("{} {reason} — this machine left the cluster", warn_mark())
+            }
+            AgentEvent::ModelStopped { reason } => {
+                format!("{} {reason}; still in the pool", dim("·"))
+            }
         };
         println!("{} {line}", dim(t));
     });

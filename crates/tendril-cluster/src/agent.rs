@@ -68,6 +68,14 @@ pub enum AgentEvent {
     Failed {
         error: String,
     },
+    /// The host stopped the cluster or removed this machine; the agent exits.
+    Left {
+        reason: String,
+    },
+    /// The host unloaded this model; this machine stays in the pool.
+    ModelStopped {
+        reason: String,
+    },
 }
 
 /// Called with the model a session serves ("" before the coordinator said) and the event.
@@ -75,21 +83,45 @@ pub type EventFn = Arc<dyn Fn(&str, AgentEvent) + Send + Sync>;
 
 type Active = Arc<Mutex<Option<StageWorker>>>;
 
-/// Models this process already has a session loop for.
-type Sessions = Arc<Mutex<HashSet<String>>>;
+/// State shared by this process's sessions (one per model).
+struct Shared {
+    /// Models this process already has a session loop for.
+    models: Mutex<HashSet<String>>,
+    /// Set when the host tells the machine to leave; every session stops.
+    leave: tokio::sync::watch::Sender<Option<String>>,
+}
+
+type Sessions = Arc<Shared>;
+
+/// How a control session ended.
+enum End {
+    Rejected(String),
+    /// The coordinator said goodbye; `leave` = exit the process.
+    Bye {
+        reason: String,
+        leave: bool,
+    },
+}
 
 pub async fn run(opts: AgentOptions, ev: EventFn) -> Result<()> {
     // Sessions for different models from this process share one machine id,
     // so the coordinator splits this machine's memory between them.
     let machine = rand::random::<u64>() | 1;
-    run_model(
-        opts,
-        None,
-        machine,
-        ev,
-        Arc::new(Mutex::new(HashSet::new())),
-    )
-    .await
+    let (leave, mut left) = tokio::sync::watch::channel(None);
+    let shared = Arc::new(Shared {
+        models: Mutex::new(HashSet::new()),
+        leave,
+    });
+    let r = tokio::select! {
+        r = run_model(opts, None, machine, ev.clone(), shared.clone()) => r,
+        _ = left.wait_for(|r| r.is_some()) => Ok(()),
+    };
+    // Whichever session heard it, say why this machine is leaving.
+    let reason = shared.leave.borrow().clone();
+    if let Some(reason) = reason {
+        ev("", AgentEvent::Left { reason });
+    }
+    r
 }
 
 fn spawn_sibling(opts: AgentOptions, model: String, machine: u64, ev: EventFn, sessions: Sessions) {
@@ -150,7 +182,7 @@ async fn run_model(
         .await;
         drop(active.lock().unwrap().take());
         match r {
-            Ok(Some(reason)) => {
+            Ok(End::Rejected(reason)) => {
                 ev(
                     &label,
                     AgentEvent::Rejected {
@@ -160,9 +192,28 @@ async fn run_model(
                 if opts.once {
                     bail!(reason);
                 }
+                if model.is_some() {
+                    // The pool no longer serves this model.
+                    sessions.models.lock().unwrap().remove(&label);
+                    return Ok(());
+                }
             }
-            Ok(None) if opts.once => return Ok(()),
-            Ok(None) => {}
+            Ok(End::Bye {
+                reason,
+                leave: true,
+            }) => {
+                // Wakes `run`, which ends every session.
+                sessions.leave.send_replace(Some(reason));
+                return Ok(());
+            }
+            Ok(End::Bye { reason, .. }) if model.is_some() => {
+                // This model was unloaded; a later load opens a new session.
+                sessions.models.lock().unwrap().remove(&label);
+                ev(&label, AgentEvent::ModelStopped { reason });
+                return Ok(());
+            }
+            Ok(End::Bye { .. }) if opts.once => return Ok(()),
+            Ok(End::Bye { .. }) => {}
             Err(e) => {
                 if started.elapsed() > Duration::from_secs(30) {
                     backoff = Duration::from_secs(1);
@@ -194,7 +245,7 @@ async fn run_model(
     }
 }
 
-/// One control session. Ok(Some(reason)) = rejected, Ok(None) = coordinator said bye.
+/// One control session, until the coordinator rejects us or says goodbye.
 async fn session(
     opts: &AgentOptions,
     psk: &[u8; 32],
@@ -204,20 +255,12 @@ async fn session(
     model: Option<&str>,
     machine: u64,
     sessions: &Sessions,
-) -> Result<Option<String>> {
+) -> Result<End> {
     let conn = wire::connect(&opts.coordinator, psk).await?;
     let (mut reader, mut writer) = (conn.reader, conn.writer);
-    let mut profile = tendril_core::hardware::detect_local(true);
-    if let Some(n) = &opts.name {
-        profile.name = n.clone();
-    }
-    // Report the backend this build can really use.
-    let dev = device_from_name(&opts.device)?;
-    if matches!(dev, candle_core::Device::Cpu) && profile.backend != tendril_core::Backend::Cpu {
-        profile.backend = tendril_core::Backend::Cpu;
-        profile.recompute_usable();
-    }
-    crate::coordinator::apply_memory_cap(&mut profile, opts.max_memory);
+    // Report the backend this build can really use, and its measured speed.
+    let profile =
+        crate::coordinator::this_machine(opts.name.as_deref(), &opts.device, opts.max_memory)?;
     writer
         .send(&Msg::Hello {
             protocol: PROTOCOL,
@@ -248,12 +291,12 @@ async fn session(
             );
             // Serve every model of the pool: one session (and stage) each.
             if !cluster.is_empty() {
-                sessions.lock().unwrap().insert(cluster.clone());
+                sessions.models.lock().unwrap().insert(cluster.clone());
             }
             open_sessions(opts, &models, machine, ev, sessions);
             cluster
         }
-        Msg::Reject { reason } => return Ok(Some(reason)),
+        Msg::Reject { reason } => return Ok(End::Rejected(reason)),
         other => bail!("unexpected reply {other:?}"),
     };
     // Sessions opened later report under their own model's name.
@@ -341,7 +384,7 @@ async fn session(
                 }
             }
             Msg::Models { models } => open_sessions(opts, &models, machine, &root_ev, sessions),
-            Msg::Bye { .. } => break Ok(None),
+            Msg::Bye { reason, leave } => break Ok(End::Bye { reason, leave }),
             _ => {}
         }
     };
@@ -358,7 +401,7 @@ fn open_sessions(
     ev: &EventFn,
     sessions: &Sessions,
 ) {
-    let mut known = sessions.lock().unwrap();
+    let mut known = sessions.models.lock().unwrap();
     for (i, m) in models.iter().enumerate() {
         if known.insert(m.clone()) {
             let mut o = opts.clone();

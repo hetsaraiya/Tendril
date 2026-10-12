@@ -294,7 +294,10 @@ async fn machines_join_first_then_each_downloads_only_its_layers() {
 
     // 1. An empty pool; a machine joins before any model is chosen.
     let port = free_port();
-    let pool = Pool::open(port, "POOL-TEST".into(), None).await.unwrap();
+    let me = tendril_cluster::coordinator::this_machine(Some("coord"), "cpu", None).unwrap();
+    let pool = Pool::open(port, "POOL-TEST".into(), None, Some(me))
+        .await
+        .unwrap();
     let agent_cache = tempfile::tempdir().unwrap();
     let agent = tokio::spawn(agent::run(
         AgentOptions {
@@ -395,4 +398,141 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
         }
     }
     out
+}
+
+fn join(
+    port: u16,
+    name: &str,
+    cache: &std::path::Path,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    tokio::spawn(agent::run(
+        AgentOptions {
+            coordinator: format!("127.0.0.1:{port}"),
+            token: "pool-test".into(),
+            name: Some(name.into()),
+            device: "cpu".into(),
+            data_port: 0,
+            cache: cache.to_path_buf(),
+            once: false,
+            max_memory: None,
+        },
+        Arc::new(|m: &str, e| eprintln!("agent[{m}]: {e:?}")),
+    ))
+}
+
+async fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+    for _ in 0..200 {
+        if f() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_previewed_plan_is_what_loads_and_the_host_controls_machines() {
+    use tendril_cluster::pool::{LoadRequest, Resolver};
+    let dir = tempfile::tempdir().unwrap();
+    tendril_engine::testing::write_tiny_llama(dir.path(), 6, 64, 11, candle_core::DType::F32)
+        .unwrap();
+    let port = free_port();
+    let model_dir = dir.path().to_path_buf();
+    let resolve: Resolver = Arc::new(move |req: &LoadRequest| {
+        let mut o = opts(&model_dir, &req.model, port);
+        if let Some(c) = req.context {
+            o.context = c;
+        }
+        Ok(o)
+    });
+    let me = tendril_cluster::coordinator::this_machine(Some("coord"), "cpu", None).unwrap();
+    let pool = Pool::open(port, "POOL-TEST".into(), Some(resolve), Some(me))
+        .await
+        .unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let friend = join(port, "friend", cache.path());
+    wait_for("the machine to join", || pool.machines().len() == 1).await;
+
+    // Plan first: what each machine would get, nothing loaded yet.
+    let req = LoadRequest {
+        model: "org/tiny".into(),
+        ..Default::default()
+    };
+    let preview = pool.plan(&req).await.unwrap();
+    assert!(preview.fits, "{:?}", preview.reason);
+    assert_eq!(preview.shares.len(), 2, "split across both machines");
+    let pct: f64 = preview.shares.iter().map(|s| s.weight_pct).sum();
+    assert!((pct - 100.0).abs() < 0.01, "shares cover the model: {pct}");
+    let total: u64 = preview.shares.iter().map(|s| s.weight_bytes).sum();
+    assert_eq!(
+        total,
+        preview
+            .plan
+            .as_ref()
+            .unwrap()
+            .stages
+            .iter()
+            .map(|s| s.mem.weights.0)
+            .sum::<u64>()
+    );
+    assert!(pool.models().is_empty(), "planning doesn't load");
+
+    // Loading runs exactly the previewed split.
+    pool.load_with(&req).await.unwrap();
+    let c = pool.models()[0].clone();
+    wait_ready(&c).await;
+    let ran = c.last_plan().unwrap().selected.unwrap();
+    let got: Vec<(String, u64, u64)> = ran
+        .stages
+        .iter()
+        .map(|s| (s.node_name.clone(), s.layer_start, s.layer_end))
+        .collect();
+    let want: Vec<(String, u64, u64)> = preview
+        .shares
+        .iter()
+        .map(|s| (s.machine.clone(), s.layers.0, s.layers.1))
+        .collect();
+    assert_eq!(got, want, "the loaded split is the previewed one");
+
+    // The dashboard sees both machines with what they run.
+    let views = pool.machine_views();
+    assert_eq!(views.len(), 2);
+    assert!(
+        views.iter().all(|v| v.roles[0].role != "not used"),
+        "{views:?}"
+    );
+
+    // Unloading frees the model; the machine stays in the pool.
+    pool.unload("org/tiny").await.unwrap();
+    assert!(pool.models().is_empty());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!friend.is_finished(), "unloading a model keeps machines");
+    assert_eq!(pool.machines().len(), 1);
+
+    // Removing a machine makes its `tendril join` exit.
+    let id = views.iter().find(|v| !v.local).unwrap().id.clone();
+    pool.remove_machine(&id).unwrap();
+    let r = tokio::time::timeout(Duration::from_secs(10), friend).await;
+    assert!(matches!(r, Ok(Ok(Ok(())))), "removed machine exits: {r:?}");
+    assert!(
+        pool.remove_machine("0").is_err(),
+        "the server can't remove itself"
+    );
+
+    // Stopping the server (Ctrl+C or the dashboard) makes joined machines exit.
+    let other = join(port, "other", cache.path());
+    wait_for("the second machine", || {
+        pool.machines()
+            .iter()
+            .map(|m| m.name.as_str())
+            .collect::<Vec<_>>()
+            == ["other"]
+    })
+    .await;
+    pool.shutdown().await;
+    let r = tokio::time::timeout(Duration::from_secs(10), other).await;
+    assert!(
+        matches!(r, Ok(Ok(Ok(())))),
+        "joined machine exits with the host: {r:?}"
+    );
 }

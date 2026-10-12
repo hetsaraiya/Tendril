@@ -92,6 +92,32 @@ impl Linear {
         })
     }
 
+    /// A random bf16 `[n, k]` weight on `device`, laid out exactly as a
+    /// loaded checkpoint would be (used to benchmark the machine).
+    pub fn random_bf16(n: usize, k: usize, device: &Device) -> Result<Linear> {
+        let kind = if device.is_cpu() {
+            // Small values with varied bits; the content doesn't matter.
+            let mut x: u32 = 0x9e37_79b9;
+            let w: Vec<u16> = (0..n * k)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    0x3c00 | (x as u16 & 0x00ff)
+                })
+                .collect();
+            Kind::Cpu(CpuWeights::Bf16(w))
+        } else {
+            Kind::Dense(Tensor::randn(0f32, 0.02, (n, k), device)?.to_dtype(DType::BF16)?)
+        };
+        Ok(Linear {
+            kind,
+            bias: None,
+            out_features: n,
+            in_features: k,
+        })
+    }
+
     /// Build from an f32 CPU tensor (used when splitting fused projections).
     pub fn from_f32(
         w: &Tensor,

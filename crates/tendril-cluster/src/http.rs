@@ -1,7 +1,7 @@
 //! OpenAI-compatible HTTP API, status endpoints and the built-in web UI.
 
 use crate::coordinator::{Coordinator, GenOut, GenRequest, ServeError, Status};
-use crate::pool::Pool;
+use crate::pool::{LoadRequest, Pool};
 use axum::extract::{Query, State};
 use axum::http::{header, StatusCode};
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
@@ -61,7 +61,12 @@ pub fn router(state: AppState) -> Router {
         .route("/api/status", get(status))
         .route("/api/events", get(events))
         .route("/v1/models", get(models))
+        .route("/api/auth", get(check_auth))
+        .route("/api/plan", post(plan_model))
         .route("/api/models", post(load_model))
+        .route("/api/models/unload", post(unload_model))
+        .route("/api/machines/remove", post(remove_machine))
+        .route("/api/stop", post(stop_server))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(completions))
         .route("/tokenize", post(tokenize))
@@ -94,24 +99,107 @@ fn serve_err(e: ServeError) -> Response {
     }
 }
 
-/// `{"model": "org/name"}` with `Authorization: Bearer <cluster token>`:
-/// start serving another model on the pool's machines.
-async fn load_model(
-    State(s): State<AppState>,
-    headers: axum::http::HeaderMap,
-    Json(body): Json<Value>,
-) -> Response {
+/// Control requests carry the cluster token: `Authorization: Bearer <token>`.
+fn authorized(s: &AppState, headers: &axum::http::HeaderMap) -> Result<(), Response> {
     let given = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
-    if crate::token::normalize(given) != crate::token::normalize(&s.pool.token) {
-        return err(
+    if !given.is_empty() && crate::token::normalize(given) == crate::token::normalize(&s.pool.token)
+    {
+        Ok(())
+    } else {
+        Err(err(
             StatusCode::UNAUTHORIZED,
             "unauthorized",
-            "loading a model needs the cluster token (Authorization: Bearer <token>)",
-        );
+            "this needs the cluster token (Authorization: Bearer <token>) — `tendril serve` prints it",
+        ))
+    }
+}
+
+fn bad(e: anyhow::Error) -> Response {
+    err(
+        StatusCode::BAD_REQUEST,
+        "invalid_request_error",
+        format!("{e:#}"),
+    )
+}
+
+fn load_request(body: Value) -> Result<LoadRequest, Response> {
+    let r: LoadRequest = serde_json::from_value(body).map_err(|e| {
+        err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            e.to_string(),
+        )
+    })?;
+    if r.model.trim().is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "`model` is required",
+        ));
+    }
+    Ok(r)
+}
+
+/// `GET /api/auth`: 204 when the bearer token is the cluster token.
+async fn check_auth(State(s): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+    match authorized(&s, &headers) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(r) => r,
+    }
+}
+
+/// `POST /api/plan {"model", "quantize"?, "context"?}`: how the model would
+/// be split across the pool, before anything is downloaded.
+async fn plan_model(
+    State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(r) = authorized(&s, &headers) {
+        return r;
+    }
+    let req = match load_request(body) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    match s.pool.plan(&req).await {
+        Ok(p) => Json(p).into_response(),
+        Err(e) => bad(e),
+    }
+}
+
+/// `POST /api/models {"model", "quantize"?, "context"?}`: start serving a
+/// model on the pool's machines.
+async fn load_model(
+    State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(r) = authorized(&s, &headers) {
+        return r;
+    }
+    let req = match load_request(body) {
+        Ok(r) => r,
+        Err(r) => return r,
+    };
+    match s.pool.load_with(&req).await {
+        Ok(name) => Json(json!({"loaded": name})).into_response(),
+        Err(e) => bad(e),
+    }
+}
+
+/// `POST /api/models/unload {"model"}`.
+async fn unload_model(
+    State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(r) = authorized(&s, &headers) {
+        return r;
     }
     let Some(model) = model_field(&body) else {
         return err(
@@ -120,14 +208,35 @@ async fn load_model(
             "`model` is required",
         );
     };
-    match s.pool.load(model).await {
-        Ok(name) => Json(json!({"loaded": name})).into_response(),
-        Err(e) => err(
-            StatusCode::BAD_REQUEST,
-            "invalid_request_error",
-            format!("{e:#}"),
-        ),
+    match s.pool.unload(model).await {
+        Ok(name) => Json(json!({"unloaded": name})).into_response(),
+        Err(e) => bad(e),
     }
+}
+
+/// `POST /api/machines/remove {"id"}`: the machine unloads and exits.
+async fn remove_machine(
+    State(s): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    if let Err(r) = authorized(&s, &headers) {
+        return r;
+    }
+    let id = body.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    match s.pool.remove_machine(id) {
+        Ok(name) => Json(json!({"removed": name})).into_response(),
+        Err(e) => bad(e),
+    }
+}
+
+/// `POST /api/stop`: stop the server, like Ctrl+C on it.
+async fn stop_server(State(s): State<AppState>, headers: axum::http::HeaderMap) -> Response {
+    if let Err(r) = authorized(&s, &headers) {
+        return r;
+    }
+    s.pool.request_stop();
+    Json(json!({"stopping": true})).into_response()
 }
 
 async fn status(State(s): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
@@ -146,8 +255,8 @@ async fn status(State(s): State<AppState>, Query(q): Query<HashMap<String, Strin
             .collect();
         return Json(json!({
             "model": null, "models": [], "architecture": "", "params": 0, "format": "native", "context": 0,
-            "status": {"state": "waiting", "reason": "No model chosen yet. On the server run: tendril load <model>", "advice": []},
-            "plan": null, "nodes": nodes, "metrics": crate::coordinator::Metrics::default(),
+            "status": {"state": "empty", "reason": "No model yet. Pick one in the dashboard, or on the server run: tendril load <model>", "advice": []},
+            "plan": null, "nodes": nodes, "machines": s.pool.machine_views(), "metrics": crate::coordinator::Metrics::default(),
             "events": s.pool.history(), "join": s.join_command, "version": env!("CARGO_PKG_VERSION"),
         }))
         .into_response();
@@ -229,6 +338,7 @@ async fn status(State(s): State<AppState>, Query(q): Query<HashMap<String, Strin
         "nodes": c.nodes(),
         "metrics": m,
         "events": events,
+        "machines": s.pool.machine_views(),
         "join": s.join_command,
         "uptime_s": c.uptime().as_secs(),
         "version": env!("CARGO_PKG_VERSION"),

@@ -148,6 +148,8 @@ pub struct NodeInfo {
     pub local: bool,
     pub role: String,
     pub on_battery: Option<bool>,
+    /// The machine's pool id (shared by its sessions for other models).
+    pub machine: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -343,12 +345,16 @@ pub const LOCAL_MACHINE: u64 = 0;
 /// models (see `pool.rs`).
 pub struct PoolLink {
     /// Position among the pool's models; the first reports membership events.
-    pub index: usize,
+    pub index: AtomicUsize,
     /// Every model in the pool (sent to joining machines).
-    pub models: Vec<String>,
+    pub models: StdMutex<Vec<String>>,
     /// Memory this model may use on each machine. None until the pool has
     /// allocated; a machine missing from the map is not used for this model.
     pub budgets: StdMutex<Option<HashMap<u64, Bytes>>>,
+    /// The split the pool chose for this model (the one its plan preview
+    /// showed), with the machine id of each stage. The coordinator runs
+    /// exactly this instead of planning on its own.
+    pub plan: StdMutex<Option<(Plan, Vec<u64>)>>,
     /// Why the pool could not give this model room (shown while waiting).
     pub note: StdMutex<Option<String>>,
     /// Wakes the pool when this model's machines change.
@@ -388,6 +394,8 @@ pub struct Inner {
     replan: Notify,
     last_plan: StdMutex<Option<PlanResult>>,
     started: Instant,
+    /// Background loops, stopped when this model is unloaded.
+    tasks: StdMutex<Vec<tokio::task::JoinHandle<()>>>,
     calibration: StdMutex<Calibration>,
 }
 
@@ -421,38 +429,15 @@ impl Coordinator {
         let cfg = Arc::new(ModelConfig::from_file(&dir.join("config.json"))?);
         let config_json = std::fs::read_to_string(dir.join("config.json"))?;
         let tok = Arc::new(Tok::from_dir(&dir, &cfg.eos_token_ids, cfg.bos_token_id)?);
-        let (ws, mut spec) = match &opts.remote {
-            None => (
-                ModelWeights::Local(Arc::new(WeightStore::open_dir(&dir)?)),
-                tendril_core::model::source::inspect_local_dir(&dir)?,
-            ),
+        let ws = match &opts.remote {
+            None => ModelWeights::Local(Arc::new(WeightStore::open_dir(&dir)?)),
             Some(r) => {
-                let raw: serde_json::Value = serde_json::from_str(&config_json)?;
-                let mut spec = tendril_core::model::config::spec_from_config(
-                    &opts.model_name,
-                    "huggingface (headers only)",
-                    &raw,
-                )?;
-                let infos: Vec<_> = r.tensors.iter().map(RemoteTensor::info).collect();
-                tendril_core::model::source::apply_measured(&mut spec, &infos);
-                (
-                    ModelWeights::Remote(RemoteWeights::new(
-                        r.base_url.clone(),
-                        r.tensors.clone(),
-                    )?),
-                    spec,
-                )
+                ModelWeights::Remote(RemoteWeights::new(r.base_url.clone(), r.tensors.clone())?)
             }
         };
         let ws = Arc::new(ws);
         let key = model_key(&config_json, &ws)?;
-        spec.id = opts.model_name.clone();
-        let spec = match opts.format {
-            WeightFormat::Native => spec,
-            WeightFormat::Q8_0 => spec.with_repr(Quant::Q8_0),
-            WeightFormat::Q4K => spec.with_repr(Quant::Q4K),
-            WeightFormat::Q6K => spec.with_repr(Quant::Q6K),
-        };
+        let spec = model_spec(&opts)?;
         let (events, _) = broadcast::channel(256);
         let inner = Arc::new(Inner {
             psk: token::psk(&opts.token),
@@ -479,22 +464,15 @@ impl Coordinator {
             replan: Notify::new(),
             last_plan: StdMutex::new(None),
             started: Instant::now(),
+            tasks: StdMutex::new(Vec::new()),
             calibration: StdMutex::new(Calibration::load()),
         });
         let c = Coordinator { inner };
 
         // This machine.
         if c.inner.opts.use_local {
-            let mut p = tendril_core::hardware::detect_local(true);
-            if let Some(n) = &c.inner.opts.name {
-                p.name = n.clone();
-            }
-            let dev = device_from_name(&c.inner.opts.device)?;
-            if matches!(dev, candle_core::Device::Cpu) && p.backend != tendril_core::Backend::Cpu {
-                p.backend = tendril_core::Backend::Cpu;
-                p.recompute_usable();
-            }
-            apply_memory_cap(&mut p, c.inner.opts.max_memory);
+            let o = &c.inner.opts;
+            let p = this_machine(o.name.as_deref(), &o.device, o.max_memory)?;
             c.add_node(p, None, LOCAL_MACHINE);
         }
 
@@ -507,15 +485,19 @@ impl Coordinator {
                         c.inner.opts.control_port
                     )
                 })?;
-            tokio::spawn(c.clone().control_loop(control));
+            let t = tokio::spawn(c.clone().control_loop(control));
+            c.inner.tasks.lock().unwrap().push(t);
         }
         let data = TcpListener::bind(("0.0.0.0", c.inner.opts.data_port)).await?;
         c.inner
             .data_port
             .store(data.local_addr()?.port() as usize, Ordering::Relaxed);
-        tokio::spawn(c.clone().data_loop(data));
-        tokio::spawn(c.clone().planner_loop());
-        tokio::spawn(c.clone().heartbeat_loop());
+        let tasks = [
+            tokio::spawn(c.clone().data_loop(data)),
+            tokio::spawn(c.clone().planner_loop()),
+            tokio::spawn(c.clone().heartbeat_loop()),
+        ];
+        c.inner.tasks.lock().unwrap().extend(tasks);
         c.inner.replan.notify_one();
         Ok(c)
     }
@@ -554,7 +536,12 @@ impl Coordinator {
     /// Machines joining and leaving: in a pool every model sees the same
     /// machine, so only the first model reports it.
     fn member_event(&self, level: &'static str, text: impl Into<String>) {
-        if self.inner.pool.as_ref().is_none_or(|p| p.index == 0) {
+        if self
+            .inner
+            .pool
+            .as_ref()
+            .is_none_or(|p| p.index.load(Ordering::Relaxed) == 0)
+        {
             self.emit(level, text.into(), None);
         }
     }
@@ -605,21 +592,7 @@ impl Coordinator {
                 .map(|p| {
                     p.slots
                         .iter()
-                        .map(|s| {
-                            let mut parts = vec![];
-                            if s.spec.embed {
-                                parts.push("embeddings".to_string());
-                            }
-                            parts.push(format!(
-                                "layers {}–{}",
-                                s.spec.layer_start,
-                                s.spec.layer_end.saturating_sub(1)
-                            ));
-                            if s.spec.head {
-                                parts.push("head".to_string());
-                            }
-                            (s.node_id, parts.join(" + "))
-                        })
+                        .map(|s| (s.node_id, spec_label(&s.spec)))
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -648,6 +621,7 @@ impl Coordinator {
                 local: n.remote.is_none(),
                 role: roles.get(&n.id).cloned().unwrap_or_else(|| "idle".into()),
                 on_battery: n.profile.on_battery,
+                machine: crate::pool::machine_key(n.machine),
             })
             .collect()
     }
@@ -742,7 +716,7 @@ impl Coordinator {
                 name: name.clone(),
                 cluster: self.inner.opts.model_name.clone(),
                 models: match &self.inner.pool {
-                    Some(p) => p.models.clone(),
+                    Some(p) => p.models.lock().unwrap().clone(),
                     None => vec![self.inner.opts.model_name.clone()],
                 },
             })
@@ -786,15 +760,18 @@ impl Coordinator {
             })
         };
 
-        self.member_event(
-            "ok",
-            format!(
-                "{name} joined — {} · {} backend · {} for models",
-                profile.chip,
-                profile.backend.label(),
-                profile.usable_memory
-            ),
-        );
+        // In a pool the pool reports machines joining (once per machine).
+        if self.inner.pool.is_none() {
+            self.event(
+                "ok",
+                format!(
+                    "{name} joined — {} · {} backend · {} for models",
+                    profile.chip,
+                    profile.backend.label(),
+                    profile.usable_memory
+                ),
+            );
+        }
         let mut rtts: Vec<f64> = Vec::new();
         let result: Result<()> = loop {
             let msg = match tokio::time::timeout(Duration::from_secs(15), reader.recv()).await {
@@ -904,7 +881,9 @@ impl Coordinator {
             );
             self.teardown(&format!("{name} disconnected")).await;
         } else {
-            self.member_event("warn", format!("{name} left the cluster"));
+            if self.inner.pool.is_none() {
+                self.event("warn", format!("{name} left the cluster"));
+            }
         }
         self.inner.replan.notify_one();
     }
@@ -1059,6 +1038,17 @@ impl Coordinator {
         (c, ids, machines)
     }
 
+    fn machine_of(&self, id: u32) -> u64 {
+        self.inner
+            .nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|n| n.id == id)
+            .map(|n| n.machine)
+            .unwrap_or(LOCAL_MACHINE)
+    }
+
     /// Some(reason) if the running pipeline uses more of a machine than this
     /// model's current share of the pool.
     async fn pipeline_over_budget(&self, cluster: &Cluster, ids: &[u32]) -> Option<String> {
@@ -1084,21 +1074,11 @@ impl Coordinator {
     }
 
     pub fn plan_options(&self) -> PlanOptions {
-        PlanOptions {
-            goal: self.inner.opts.goal,
-            safety_frac: self.inner.opts.safety,
-            min_stages: self.inner.opts.min_stages.max(1),
-            ..Default::default()
-        }
+        plan_options_for(&self.inner.opts)
     }
 
     pub fn workload(&self) -> Workload {
-        let mut w = Workload::new(
-            self.inner.opts.context as u64,
-            self.inner.opts.concurrency as u64,
-        );
-        w.prompt_tokens = w.prompt_tokens.min(512);
-        w
+        workload_for(&self.inner.opts)
     }
 
     async fn planner_loop(self) {
@@ -1159,7 +1139,37 @@ impl Coordinator {
         }
         let opts = self.plan_options();
         let w = self.workload();
-        let result = planner::plan(&self.inner.spec, &cluster, &w, &opts);
+        let mut result = planner::plan(&self.inner.spec, &cluster, &w, &opts);
+        // In a pool, run the split the pool planned (and previewed).
+        if let Some((plan, machines)) = self
+            .inner
+            .pool
+            .as_ref()
+            .and_then(|p| p.plan.lock().unwrap().clone())
+        {
+            let here: Vec<u64> = ids.iter().map(|id| self.machine_of(*id)).collect();
+            let mut p = plan;
+            let mut missing = Vec::new();
+            for (st, m) in p.stages.iter_mut().zip(&machines) {
+                match here.iter().position(|x| x == m) {
+                    Some(i) => st.node = i,
+                    None => missing.push(st.node_name.clone()),
+                }
+            }
+            if !missing.is_empty() {
+                if self.inner.pipeline.read().await.is_none() {
+                    self.set_status(Status::Waiting {
+                        reason: format!(
+                            "waiting for {} to connect for this model",
+                            missing.join(", ")
+                        ),
+                        advice: vec![],
+                    });
+                }
+                return Ok(());
+            }
+            result.selected = Some(p);
+        }
         *self.inner.last_plan.lock().unwrap() = Some(result.clone());
         let Some(best) = result.selected.clone() else {
             if let Some(note) = self
@@ -2408,7 +2418,28 @@ impl Coordinator {
             .map(|p| p.ready_at.elapsed())
     }
 
-    pub async fn shutdown(&self) {
+    /// Tell a machine's session for this model to leave (it was removed).
+    pub fn kick(&self, machine: u64, reason: &str) {
+        let remotes: Vec<Arc<RemoteNode>> = self
+            .inner
+            .nodes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| n.machine == machine)
+            .filter_map(|n| n.remote.clone())
+            .collect();
+        for r in remotes {
+            let _ = r.tx.try_send(Msg::Bye {
+                reason: reason.to_string(),
+                leave: true,
+            });
+        }
+    }
+
+    /// Stop serving: unload every stage and end the agents' sessions.
+    /// `leave`: tell the machines to exit (the whole server is stopping).
+    pub async fn shutdown(&self, leave: bool) {
         let remotes: Vec<Arc<RemoteNode>> = self
             .inner
             .nodes
@@ -2420,11 +2451,63 @@ impl Coordinator {
         self.teardown("server stopped").await;
         for r in remotes {
             let _ = r.tx.try_send(Msg::Bye {
-                reason: "coordinator shutting down".into(),
+                reason: if leave {
+                    "the host stopped the cluster".into()
+                } else {
+                    format!("{} was unloaded", self.inner.opts.model_name)
+                },
+                leave,
             });
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+        for t in self.inner.tasks.lock().unwrap().drain(..) {
+            t.abort();
+        }
     }
+}
+
+pub fn plan_options_for(opts: &ServeOptions) -> PlanOptions {
+    PlanOptions {
+        goal: opts.goal,
+        safety_frac: opts.safety,
+        min_stages: opts.min_stages.max(1),
+        ..Default::default()
+    }
+}
+
+/// The workload a model is planned for: its context and concurrency.
+pub fn workload_for(opts: &ServeOptions) -> Workload {
+    let mut w = Workload::new(opts.context as u64, opts.concurrency as u64);
+    w.prompt_tokens = w.prompt_tokens.min(512);
+    w
+}
+
+/// What the planner needs to know about the model `opts` describes, in the
+/// weight format it will run in. Reads only config and tensor headers.
+pub fn model_spec(opts: &ServeOptions) -> Result<ModelSpec> {
+    let dir = &opts.model_dir;
+    let mut spec = match &opts.remote {
+        None => tendril_core::model::source::inspect_local_dir(dir)?,
+        Some(r) => {
+            let raw: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
+            let mut spec = tendril_core::model::config::spec_from_config(
+                &opts.model_name,
+                "huggingface (headers only)",
+                &raw,
+            )?;
+            let infos: Vec<_> = r.tensors.iter().map(RemoteTensor::info).collect();
+            tendril_core::model::source::apply_measured(&mut spec, &infos);
+            spec
+        }
+    };
+    spec.id = opts.model_name.clone();
+    Ok(match opts.format {
+        WeightFormat::Native => spec,
+        WeightFormat::Q8_0 => spec.with_repr(Quant::Q8_0),
+        WeightFormat::Q4K => spec.with_repr(Quant::Q4K),
+        WeightFormat::Q6K => spec.with_repr(Quant::Q6K),
+    })
 }
 
 /// Read and check an agent's Hello. Also returns the model it asked for.
@@ -2467,6 +2550,28 @@ pub(crate) async fn read_hello(
     }
 }
 
+/// This machine as the planner sees it: detected hardware, the backend the
+/// chosen device really uses (with that backend's benchmark), the name and
+/// memory cap the user gave.
+pub fn this_machine(
+    name: Option<&str>,
+    device: &str,
+    max_memory: Option<Bytes>,
+) -> Result<NodeProfile> {
+    let mut p = tendril_core::hardware::detect_local(true);
+    if let Some(n) = name {
+        p.name = n.to_string();
+    }
+    let backend = match device_from_name(device)? {
+        candle_core::Device::Cpu => tendril_core::Backend::Cpu,
+        candle_core::Device::Metal(_) => tendril_core::Backend::Metal,
+        candle_core::Device::Cuda(_) => tendril_core::Backend::Cuda,
+    };
+    p.use_backend(backend);
+    apply_memory_cap(&mut p, max_memory);
+    Ok(p)
+}
+
 /// Respect a user's `--max-memory` cap.
 pub fn apply_memory_cap(p: &mut NodeProfile, cap: Option<Bytes>) {
     if let Some(cap) = cap {
@@ -2482,8 +2587,10 @@ pub fn spec_label(s: &StageSpec) -> String {
     if s.embed {
         parts.push("embeddings".to_string());
     }
-    if s.layer_end > s.layer_start {
-        parts.push(format!("layers {}–{}", s.layer_start, s.layer_end - 1));
+    match s.layer_end.saturating_sub(s.layer_start) {
+        0 => {}
+        1 => parts.push(format!("layer {}", s.layer_start)),
+        _ => parts.push(format!("layers {}–{}", s.layer_start, s.layer_end - 1)),
     }
     if s.head {
         parts.push("head".to_string());

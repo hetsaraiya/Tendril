@@ -92,6 +92,9 @@ impl Calibration {
                 if let Some(m) = p.measured_bandwidth_gbs.as_mut() {
                     *m /= e.factor;
                 }
+                if let Some(t) = p.measured_tflops.as_mut() {
+                    *t /= e.factor;
+                }
             }
         }
     }

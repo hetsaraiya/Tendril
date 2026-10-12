@@ -509,6 +509,7 @@ impl NodeProfile {
             tflops: chip.tflops,
             source: ProfileSource::Preset(chip.key.to_string()),
             measured_bandwidth_gbs: None,
+            measured_tflops: None,
             on_battery: None,
             address: None,
         };

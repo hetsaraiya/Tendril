@@ -126,6 +126,88 @@ dialog input, dialog textarea { width: 100%; border: 1px solid var(--line); bord
 dialog textarea { min-height: 70px; }
 dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 
+/* view switch */
+.seg { display: inline-flex; background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 2px; }
+.seg button { border: none; background: none; padding: 4px 12px; border-radius: 8px; font-size: 13.5px; font-weight: 560; color: var(--muted); }
+.seg button.on { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
+.lockbtn.on { border-color: var(--accent); color: var(--accent); }
+
+/* dashboard */
+.dash { display: none; grid-column: 1 / -1; overflow-y: auto; min-height: 0; }
+body.view-dash .dash { display: block; }
+body.view-dash main.chat, body.view-dash aside, body.view-dash .tabs { display: none !important; }
+body.view-dash .app { grid-template-rows: 56px minmax(0, 1fr); }
+.dwrap { max-width: 1240px; margin: 0 auto; padding: 22px 22px 60px; }
+.dhead { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
+.dhead h1 { font-size: 22px; letter-spacing: -.02em; margin: 0; font-weight: 680; }
+.dhead .facts { display: flex; gap: 8px; flex-wrap: wrap; }
+.fact { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; font-size: 13px; color: var(--muted); }
+.fact b { color: var(--text); font-variant-numeric: tabular-nums; }
+.dsec { margin-top: 26px; }
+.dsec > .h { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+.dsec > .h h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0; font-weight: 650; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+.mcard { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.mcard .t { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.mcard .nm { font-weight: 650; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mcard .hw { color: var(--muted); font-size: 12.5px; }
+.kvs { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; font-size: 13px; }
+.kvs .k { color: var(--muted); }
+.kvs .v { font-variant-numeric: tabular-nums; min-width: 0; }
+.est { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 0 4px; margin-left: 4px; }
+.meas { font-size: 11px; color: var(--accent); background: var(--accent-soft); border-radius: 5px; padding: 0 5px; margin-left: 4px; }
+.mem { height: 10px; background: var(--line); border-radius: 99px; overflow: hidden; display: flex; }
+.mem > span { height: 100%; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; color: var(--muted); }
+.legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: 0; }
+.roles { font-size: 12.5px; display: flex; flex-direction: column; gap: 2px; }
+.roles .r { display: flex; gap: 6px; } .roles .r b { font-weight: 600; white-space: nowrap; } .roles .r span { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.btn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 5px 11px; font-size: 13px; font-weight: 550; }
+.btn:hover:not(:disabled) { background: var(--panel2); }
+.btn:disabled { opacity: .45; cursor: default; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover:not(:disabled) { filter: brightness(1.05); background: var(--accent); }
+.btn.danger { color: var(--err); }
+.btn.danger:hover:not(:disabled) { background: var(--err-soft); }
+.acts { display: flex; gap: 6px; margin-top: auto; padding-top: 4px; flex-wrap: wrap; }
+.addcard { border-style: dashed; box-shadow: none; background: transparent; align-items: center; justify-content: center; text-align: center; color: var(--muted); min-height: 150px; cursor: pointer; }
+.addcard:hover { border-color: var(--accent); color: var(--text); }
+.addcard .plus { font-size: 26px; line-height: 1; color: var(--accent); }
+.lockedhint { font-size: 12.5px; color: var(--muted); }
+.progress { font-size: 12.5px; color: var(--muted); }
+.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 9px 16px; border-radius: 10px; font-size: 14px; box-shadow: var(--shadow); z-index: 50; max-width: 92vw; }
+.toast.err { background: var(--err); color: #fff; }
+
+/* plan dialog */
+dialog.wide { width: min(880px, 96vw); max-height: 92vh; overflow-y: auto; padding: 22px; }
+.formrow { display: grid; grid-template-columns: 1fr 150px 130px; gap: 10px; align-items: end; }
+dialog select { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; background: var(--bg); color: var(--text); font: inherit; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+.chip2 { border: 1px solid var(--line); background: var(--panel); border-radius: 99px; padding: 3px 10px; font-size: 12.5px; color: var(--text); }
+.chip2:hover { border-color: var(--accent); }
+.chip2.ok { border-color: var(--accent); color: var(--accent); }
+.chip2.no { color: var(--muted); }
+.wbar { display: flex; height: 46px; border-radius: 12px; overflow: hidden; border: 1px solid var(--line); margin: 6px 0 4px; }
+.wbar > div { display: flex; flex-direction: column; justify-content: center; padding: 0 10px; color: #fff; font-size: 12px; line-height: 1.25; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.wbar > div b { font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
+.pgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; margin-top: 12px; }
+.pbox { border: 2px solid var(--line); border-radius: 12px; padding: 10px 12px; font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
+.pbox .nm { font-weight: 650; }
+.verdict { border-radius: 12px; padding: 10px 14px; margin-top: 14px; font-size: 14px; }
+.verdict.ok { background: var(--accent-soft); color: var(--accent); }
+.verdict.no { background: var(--err-soft); color: var(--err); }
+.plansum { font-size: 13.5px; color: var(--muted); margin-top: 6px; }
+.spin { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: rot .8s linear infinite; vertical-align: -2px; margin-right: 6px; }
+@keyframes rot { to { transform: rotate(360deg); } }
+
+@media (max-width: 900px) {
+  .formrow { grid-template-columns: 1fr 1fr; }
+  .formrow > :first-child { grid-column: 1 / -1; }
+  .dwrap { padding: 16px 14px 60px; }
+  .seg button { padding: 4px 9px; }
+  #newChat, #settingsBtn { display: none; }
+  body.view-chat #newChat { display: inline-block; }
+}
 @media (max-width: 900px) {
   .app { grid-template-columns: 1fr; grid-template-rows: 56px 44px minmax(0, 1fr); }
   .tabs { display: flex; grid-column: 1; border-bottom: 1px solid var(--line); background: var(--panel); }
@@ -153,7 +235,9 @@ dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16
     <div class="picker" id="picker"><select id="modelSel" title="Model"></select></div>
     <div class="model" id="model">connecting…</div>
     <div class="spacer"></div>
+    <div class="seg" role="tablist"><button id="vChat" data-view="chat">Chat</button><button id="vDash" data-view="dash">Dashboard</button></div>
     <span class="pill starting" id="pill"><span class="dot"></span><span id="pillText">Starting</span></span>
+    <button class="iconbtn lockbtn" id="lockBtn" title="Controls need the cluster token">🔒 Unlock</button>
     <button class="iconbtn" id="newChat" title="New chat">New chat</button>
     <button class="iconbtn" id="settingsBtn" title="Settings">Settings</button>
   </header>
@@ -171,6 +255,20 @@ dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16
       <div class="hint" id="hint">Enter to send · Shift+Enter for a new line</div>
     </div></div>
   </main>
+
+  <section class="dash" id="dash"><div class="dwrap">
+    <div class="dhead">
+      <div><h1 id="dTitle">Your cluster</h1><div class="sub" id="dSub">Connecting…</div></div>
+      <div class="spacer"></div>
+      <div class="facts" id="dFacts"></div>
+    </div>
+    <div class="dsec"><div class="h"><h2>Models</h2><div class="spacer"></div><button class="btn primary" id="addModelBtn">+ Add a model</button></div>
+      <div class="grid" id="dModels"></div></div>
+    <div class="dsec"><div class="h"><h2>Machines</h2><div class="spacer"></div><span class="lockedhint" id="machHint"></span></div>
+      <div class="grid" id="dMachines"></div></div>
+    <div class="dsec"><div class="h"><h2>Activity</h2><div class="spacer"></div><button class="btn danger" id="stopBtn" title="Stop the server; joined machines unload and exit">Stop cluster</button></div>
+      <div class="card"><div class="events" id="dEvents" style="max-height:340px"></div></div></div>
+  </div></section>
 
   <aside id="cluster">
     <div class="section" id="modelsSection" style="display:none"><h3>Models on these machines</h3><div id="modelList"></div></div>
@@ -202,6 +300,28 @@ dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16
   <label for="maxTok">Max tokens per reply</label>
   <input id="maxTok" type="number" min="1" max="32768">
   <div class="row"><button class="iconbtn" id="closeSettings">Done</button></div>
+</dialog>
+
+<dialog id="unlockDlg">
+  <div style="font-weight:650;font-size:16px">Unlock controls</div>
+  <div class="sub" style="margin-top:6px">Loading models, removing machines and stopping the cluster need the cluster token — the one <code>tendril serve</code> printed (also in <code>tendril join --token …</code>).</div>
+  <label for="tokIn">Cluster token</label>
+  <input id="tokIn" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX">
+  <div class="error" id="tokErr" style="display:none;margin-top:10px"></div>
+  <div class="row"><button class="btn" id="tokCancel">Cancel</button><button class="btn primary" id="tokOk">Unlock</button></div>
+</dialog>
+
+<dialog id="planDlg" class="wide">
+  <div style="display:flex;align-items:center;gap:10px"><div style="font-weight:680;font-size:18px">Add a model</div><div class="spacer"></div><button class="btn" id="planClose">Close</button></div>
+  <div class="sub" style="margin-top:4px">Tendril plans it across your machines first: which machine gets which layers and how much of the weights. Each machine then downloads only its own share.</div>
+  <div class="formrow" style="margin-top:12px">
+    <div><label for="pmModel">Model — HuggingFace id or a catalog name</label><input id="pmModel" autocomplete="off" spellcheck="false" placeholder="Qwen/Qwen2.5-7B-Instruct"></div>
+    <div><label for="pmFmt">Weights</label><select id="pmFmt"><option value="">server default</option><option value="native">native (bf16)</option><option value="q8_0">q8_0 · ~half</option><option value="q6_k">q6_k</option><option value="q4_k">q4_k · ~quarter</option></select></div>
+    <div><label for="pmCtx">Context</label><select id="pmCtx"><option value="">server default</option><option value="4096">4k</option><option value="8192">8k</option><option value="16384">16k</option><option value="32768">32k</option><option value="131072">128k</option></select></div>
+  </div>
+  <div class="chips" id="pmSugg"></div>
+  <div class="row" style="justify-content:flex-start"><button class="btn primary" id="pmPlan">Plan it</button></div>
+  <div id="pmOut"></div>
 </dialog>
 
 <script>
@@ -251,6 +371,7 @@ function md(src) {
 
 function emptyLine() {
   const s = lastStatus, n = s?.nodes?.length || 1, machines = `${n} machine${n === 1 ? '' : 's'}`;
+  if (s && !s.model) return `No model loaded yet. <a href="#" onclick="setView('dash');return false">Open the dashboard</a> to pick one — Tendril plans it across your machines first.`;
   if (!multi()) return `Running <b>${esc(s?.model || 'a model')}</b> across ${machines} on your network.`;
   const others = s.models.filter(m => m.id !== s.model).map(m => esc(short(m.id)));
   const st = s.status?.state;
@@ -381,16 +502,16 @@ async function generate() {
 }
 
 // ---- cluster panel --------------------------------------------------------
-const pillLabel = { ready: 'Ready', loading: 'Loading', waiting: 'Waiting for machines', starting: 'Starting', failed: 'Failed' };
+const pillLabel = { ready: 'Ready', loading: 'Loading', waiting: 'Waiting for machines', starting: 'Starting', failed: 'Failed', empty: 'No model' };
 function renderStatus(s) {
   lastStatus = s;
   const st = s.status || {};
   const state = st.state || 'starting';
   ready = state === 'ready';
-  $('pill').className = 'pill ' + state; $('pillText').textContent = pillLabel[state] || state;
+  $('pill').className = 'pill ' + (state === 'empty' ? 'nomodel' : state); $('pillText').textContent = pillLabel[state] || state;
   renderModels(s);
   $('input').placeholder = multi() ? `Message ${short(s.model)}…` : 'Message the model…';
-  $('model').textContent = !s.model ? 'No model yet — run `tendril load <model>` on the server'
+  $('model').textContent = !s.model ? 'No model yet — add one in the dashboard'
     : `${multi() ? '' : s.model + ' · '}${s.architecture} · ${fmtParams(s.params)} params · ${s.format === 'native' ? 'full precision' : s.format} · ${s.context.toLocaleString()} ctx`;
   $('joinCmd').textContent = s.join;
   $('hint').textContent = ready ? 'Enter to send · Shift+Enter for a new line' : (state === 'loading' ? 'The model is loading — this takes a moment the first time.' : state === 'waiting' ? 'Waiting for enough machines to run this model.' : 'Starting…');
@@ -463,6 +584,7 @@ function renderStatus(s) {
     html += `<div class="sub" style="margin-top:10px">Per token: ${fmtMs(tel.step_ms)} measured (${fmtMs(tel.predicted_step_ms)} predicted), of which ${fmtMs(tel.transfer_ms)} network &amp; scheduling.</div>`;
   }
   $('pipeline').innerHTML = html || '<div class="sub">No machines yet.</div>';
+  renderDash(s);
 }
 
 // Several models share the machines: header picker + a list in the panel.
@@ -499,14 +621,245 @@ function pick(id) {
 $('modelSel').onchange = (e) => pick(e.target.value);
 
 function addEvent(e, prepend) {
-  const box = $('events');
-  const div = document.createElement('div');
-  div.className = 'ev ' + e.level;
   const icon = { ok: '✓', warn: '!', error: '✗', info: '·' }[e.level] || '·';
-  div.innerHTML = `<span class="t">${esc(e.at)}</span><span class="i">${icon}</span><span>${e.model ? `<span class="mt">${esc(short(e.model))}</span>` : ''}${esc(e.text)}</span>`;
-  box.prepend(div);
-  while (box.children.length > 80) box.lastChild.remove();
+  for (const id of ['events', 'dEvents']) {
+    const box = $(id);
+    const div = document.createElement('div');
+    div.className = 'ev ' + e.level;
+    div.innerHTML = `<span class="t">${esc(e.at)}</span><span class="i">${icon}</span><span>${e.model ? `<span class="mt">${esc(short(e.model))}</span>` : ''}${esc(e.text)}</span>`;
+    box.prepend(div);
+    while (box.children.length > 120) box.lastChild.remove();
+  }
 }
+
+// ---- dashboard --------------------------------------------------------------
+const MODEL_COLORS = ['#16a34a', '#2563eb', '#d97706', '#9333ea', '#db2777', '#0891b2', '#65a30d'];
+const MACHINE_COLORS = ['#2563eb', '#16a34a', '#d97706', '#9333ea', '#db2777', '#0891b2', '#dc2626', '#65a30d', '#7c3aed', '#0d9488'];
+let token = store.get('token', null);
+let view = store.get('view', null);
+const unlocked = () => !!token;
+const gb = (b) => fmtBytes(b);
+
+function setView(v) {
+  view = v; store.set('view', v);
+  document.body.classList.toggle('view-dash', v === 'dash');
+  document.body.classList.toggle('view-chat', v !== 'dash');
+  $('vChat').classList.toggle('on', v !== 'dash'); $('vDash').classList.toggle('on', v === 'dash');
+  if (v !== 'dash') { if (!history.length) renderThread(); $('input').focus(); }
+}
+$('vChat').onclick = () => setView('chat');
+$('vDash').onclick = () => setView('dash');
+
+function toast(msg, isErr) {
+  const t = document.createElement('div');
+  t.className = 'toast' + (isErr ? ' err' : ''); t.textContent = msg;
+  document.body.appendChild(t); setTimeout(() => t.remove(), isErr ? 6000 : 3500);
+}
+
+function renderLock() {
+  const b = $('lockBtn');
+  b.classList.toggle('on', unlocked());
+  b.textContent = unlocked() ? '🔓 Controls on' : '🔒 Unlock';
+  b.title = unlocked() ? 'Click to lock (forget the token in this browser)' : 'Controls need the cluster token';
+  $('addModelBtn').style.display = unlocked() ? '' : 'none';
+  $('stopBtn').style.display = unlocked() ? '' : 'none';
+  $('machHint').textContent = unlocked() ? '' : 'Unlock to add models, remove machines or stop the cluster';
+}
+
+// Ask for the token, then run `then` (if given).
+let afterUnlock = null;
+function unlock(then) {
+  afterUnlock = then || null;
+  $('tokIn').value = ''; $('tokErr').style.display = 'none';
+  $('unlockDlg').showModal(); $('tokIn').focus();
+}
+$('lockBtn').onclick = () => {
+  if (unlocked()) { token = null; store.set('token', null); renderLock(); if (lastStatus) renderDash(lastStatus); toast('Controls locked in this browser'); }
+  else unlock();
+};
+$('tokCancel').onclick = () => $('unlockDlg').close();
+async function tryToken() {
+  const t = $('tokIn').value.trim();
+  if (!t) return;
+  const r = await fetch('/api/auth', { headers: { Authorization: 'Bearer ' + t } }).catch(() => null);
+  if (r && r.status === 204) {
+    token = t; store.set('token', t); $('unlockDlg').close(); renderLock();
+    if (lastStatus) renderDash(lastStatus);
+    const f = afterUnlock; afterUnlock = null; if (f) f();
+  } else {
+    $('tokErr').textContent = r ? 'That is not this cluster\'s token.' : 'Server unreachable.'; $('tokErr').style.display = '';
+  }
+}
+$('tokOk').onclick = tryToken;
+$('tokIn').addEventListener('keydown', (e) => { if (e.key === 'Enter') tryToken(); });
+
+// POST a control request with the token.
+async function api(path, body) {
+  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (token || '') }, body: JSON.stringify(body || {}) });
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401) { token = null; store.set('token', null); renderLock(); throw new Error('The token was not accepted — unlock again.'); }
+  if (!r.ok) throw new Error(j?.error?.message || ('HTTP ' + r.status));
+  return j;
+}
+
+function modelColor(s, id) { const i = (s.models || []).findIndex(m => m.id === id); return MODEL_COLORS[(i < 0 ? 0 : i) % MODEL_COLORS.length]; }
+
+function renderDash(s) {
+  const ms = s.machines || [];
+  const models = s.models || [];
+  const usable = ms.reduce((a, m) => a + (m.usable_memory || 0), 0);
+  const gbs = ms.reduce((a, m) => a + (m.weight_gbs ?? m.spec_bandwidth_gbs * 0.7), 0);
+  const tf = ms.reduce((a, m) => a + (m.tflops ?? m.spec_tflops * 0.5), 0);
+  $('dTitle').textContent = models.length ? 'Your cluster' : 'Your cluster is ready for a model';
+  $('dSub').textContent = models.length
+    ? `${models.length} model${models.length === 1 ? '' : 's'} on ${ms.length} machine${ms.length === 1 ? '' : 's'} · Tendril ${s.version || ''}`
+    : `${ms.length} machine${ms.length === 1 ? '' : 's'} in the pool. Add a model — Tendril shows how it would be split before downloading anything.`;
+  $('dFacts').innerHTML = `<span class="fact"><b>${ms.length}</b> machine${ms.length === 1 ? '' : 's'}</span>
+    <span class="fact"><b>${gb(usable)}</b> for models</span>
+    <span class="fact"><b>${gbs.toFixed(0)} GB/s</b> decode</span>
+    <span class="fact"><b>${tf.toFixed(1)}</b> TFLOP/s prefill</span>`;
+
+  // Models
+  let mh = models.map(m => {
+    const col = modelColor(s, m.id);
+    const st = m.id === s.model ? (s.status || {}) : {};
+    let line;
+    if (m.state === 'ready') line = `${fmtParams(m.params)} params${m.id === s.model && st.predicted_tps ? ` · ~${st.predicted_tps.toFixed(1)} tok/s` : ''}${m.active ? ` · ${m.active} generating` : ''}`;
+    else if (m.state === 'loading' && st.stages) line = st.stages.map(g => `${esc(g.node)}: ${esc(g.phase)}${g.total ? ' ' + Math.round(g.done / g.total * 100) + '%' : ''}`).join(' · ');
+    else line = esc(m.reason || pillLabel[m.state] || m.state);
+    const where = (m.machines || []).map(x => `${esc(x.name)} ${gb(x.budget)}`).join(' + ');
+    return `<div class="mcard">
+      <div class="t"><span class="nm"><i style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${col};margin-right:7px"></i>${esc(m.id)}</span><span class="pill ${m.state}"><span class="dot"></span>${esc(pillLabel[m.state] || m.state)}</span></div>
+      <div class="progress">${line}</div>
+      ${where ? `<div class="hw">Memory share: ${where}</div>` : ''}
+      <div class="acts"><button class="btn" data-chat="${esc(m.id)}" ${m.state === 'ready' ? '' : 'disabled'}>Chat</button>
+        ${unlocked() ? `<button class="btn danger" data-unload="${esc(m.id)}">Unload</button>` : ''}</div>
+    </div>`;
+  }).join('');
+  if (!models.length) {
+    mh = unlocked()
+      ? `<div class="mcard addcard" id="addFirst"><div class="plus">+</div><div style="font-weight:600;color:var(--text)">Add your first model</div><div class="sub">Any HuggingFace model or catalog name. You'll see the plan before anything downloads.</div></div>`
+      : `<div class="mcard addcard" id="addFirst"><div class="plus">🔒</div><div style="font-weight:600;color:var(--text)">Unlock to add a model</div><div class="sub">Enter the cluster token that <code>tendril serve</code> printed.</div></div>`;
+  }
+  $('dModels').innerHTML = mh;
+  $('dModels').querySelectorAll('[data-chat]').forEach(b => b.onclick = () => { pick(b.dataset.chat); setView('chat'); });
+  $('dModels').querySelectorAll('[data-unload]').forEach(b => b.onclick = async () => {
+    if (!confirm(`Unload ${b.dataset.unload}? Its memory is freed for other models; machines stay in the pool.`)) return;
+    b.disabled = true;
+    try { await api('/api/models/unload', { model: b.dataset.unload }); toast('Unloaded ' + b.dataset.unload); poll(); }
+    catch (e) { toast(e.message, true); b.disabled = false; }
+  });
+  const af = $('addFirst'); if (af) af.onclick = openPlan;
+
+  // Machines
+  let html = ms.map(m => {
+    const segs = (m.roles || []).filter(r => r.budget > 0);
+    const used = segs.reduce((a, r) => a + r.budget, 0);
+    const bar = segs.map(r => `<span style="width:${Math.min(100, r.budget / Math.max(1, m.usable_memory) * 100)}%;background:${modelColor(s, r.model)}"></span>`).join('');
+    const legend = segs.map(r => `<span><i style="background:${modelColor(s, r.model)}"></i>${esc(short(r.model))} ${gb(r.budget)}</span>`).join('');
+    const roles = (m.roles || []).filter(r => r.role && r.role !== 'not used' && r.role !== 'idle');
+    const dec = m.weight_gbs != null ? `${m.weight_gbs.toFixed(1)} GB/s<span class="meas">measured</span>` : `~${(m.spec_bandwidth_gbs * 0.7).toFixed(0)} GB/s<span class="est">spec</span>`;
+    const pre = m.tflops != null ? `${m.tflops.toFixed(2)} TFLOP/s<span class="meas">measured</span>` : `~${(m.spec_tflops * 0.5).toFixed(1)} TFLOP/s<span class="est">spec</span>`;
+    const link = m.local ? 'this server' : (m.rtt_ms != null ? `${fmtMs(m.rtt_ms)} · ${(m.bandwidth_gbps || 0).toFixed(1)} Gb/s` : 'measuring…');
+    return `<div class="mcard">
+      <div class="t"><span class="nm">${esc(m.name)}${m.local ? ' <span class="tag">this server</span>' : ''}</span><span class="hw">${esc(m.backend)}</span></div>
+      <div class="hw">${esc(shortChip(m.chip))}${m.gpu_cores ? ` · ${m.gpu_cores} GPU cores` : ''} · ${m.cpu_cores} CPU cores · ${esc(m.os)}</div>
+      <div class="mem" title="Memory reserved per model">${bar}</div>
+      <div class="legend">${legend || '<span>No model uses it yet</span>'}<span style="margin-left:auto">${gb(used)} of ${gb(m.usable_memory)} usable · ${gb(m.total_memory)} total</span></div>
+      <div class="kvs"><span class="k">Decode</span><span class="v">${dec}</span><span class="k">Prefill</span><span class="v">${pre}</span><span class="k">Link</span><span class="v">${link}</span>${m.on_battery ? '<span class="k">Power</span><span class="v" style="color:var(--warn)">on battery</span>' : ''}</div>
+      ${roles.length ? `<div class="roles">${roles.map(r => `<div class="r"><b style="color:${modelColor(s, r.model)}">${esc(short(r.model))}</b><span>${esc(r.role)}</span></div>`).join('')}</div>` : ''}
+      ${unlocked() && !m.local ? `<div class="acts"><button class="btn danger" data-remove="${esc(m.id)}" data-name="${esc(m.name)}">Remove</button></div>` : ''}
+    </div>`;
+  }).join('');
+  html += `<div class="mcard addcard" style="cursor:default"><div class="plus">+</div><div style="font-weight:600;color:var(--text)">Add a machine</div>
+    <div class="sub">Run on any computer on your network:</div><div class="join" style="text-align:left;width:100%"><span>${esc(s.join || '')}</span><button data-copy>Copy</button></div></div>`;
+  $('dMachines').innerHTML = html;
+  $('dMachines').querySelectorAll('[data-copy]').forEach(b => b.onclick = () => { navigator.clipboard?.writeText(s.join || ''); b.textContent = 'Copied'; setTimeout(() => b.textContent = 'Copy', 1200); });
+  $('dMachines').querySelectorAll('[data-remove]').forEach(b => b.onclick = async () => {
+    if (!confirm(`Remove ${b.dataset.name}? It unloads everything and its \`tendril join\` exits.`)) return;
+    b.disabled = true;
+    try { await api('/api/machines/remove', { id: b.dataset.remove }); toast('Removed ' + b.dataset.name); setTimeout(poll, 800); }
+    catch (e) { toast(e.message, true); b.disabled = false; }
+  });
+  renderLock();
+}
+
+// ---- plan → load ------------------------------------------------------------
+const SUGGEST = ['qwen2.5-0.5b', 'qwen2.5-1.5b', 'llama-3.2-3b', 'Qwen/Qwen2.5-7B-Instruct', 'meta-llama/Llama-3.1-8B-Instruct', 'Qwen/Qwen2.5-Coder-7B-Instruct'];
+function openPlan() {
+  if (!unlocked()) { unlock(openPlan); return; }
+  $('pmOut').innerHTML = '';
+  $('pmSugg').innerHTML = SUGGEST.map(m => `<button class="chip2" data-m="${esc(m)}">${esc(m)}</button>`).join('');
+  $('pmSugg').querySelectorAll('[data-m]').forEach(b => b.onclick = () => { $('pmModel').value = b.dataset.m; planNow(); });
+  $('planDlg').showModal(); $('pmModel').focus();
+}
+$('addModelBtn').onclick = openPlan;
+$('planClose').onclick = () => $('planDlg').close();
+$('pmPlan').onclick = () => planNow();
+$('pmModel').addEventListener('keydown', (e) => { if (e.key === 'Enter') planNow(); });
+
+function planBody() {
+  const b = { model: $('pmModel').value.trim() };
+  if ($('pmFmt').value) b.quantize = $('pmFmt').value;
+  if ($('pmCtx').value) b.context = parseInt($('pmCtx').value);
+  return b;
+}
+async function planNow() {
+  const body = planBody();
+  if (!body.model) { $('pmModel').focus(); return; }
+  $('pmOut').innerHTML = `<div class="plansum" style="margin-top:16px"><span class="spin"></span>Reading ${esc(body.model)}'s config and tensor table (no weights) and planning it across ${(lastStatus?.machines || []).length} machine(s)…</div>`;
+  $('pmPlan').disabled = true;
+  try { renderPlan(await api('/api/plan', body), body); }
+  catch (e) { $('pmOut').innerHTML = `<div class="verdict no">${esc(e.message)}</div>`; }
+  $('pmPlan').disabled = false;
+}
+
+function renderPlan(p, body) {
+  const colorOf = (name) => MACHINE_COLORS[Math.max(0, (p.machine_names || []).indexOf(name)) % MACHINE_COLORS.length];
+  let h = `<div style="margin-top:18px;font-size:15px"><b>${esc(p.model)}</b> <span class="sub">· ${esc(p.architecture)} · ${fmtParams(p.params)} params · ${p.layers} layers · ${p.context.toLocaleString()} ctx</span></div>`;
+  h += `<div class="plansum">Model weights: <b style="color:var(--text)">${gb(p.weight_bytes)}</b> in ${esc(p.format)} · across ${p.machines} machine${p.machines === 1 ? '' : 's'}</div>`;
+  if (p.shares?.length) {
+    h += `<div class="wbar">${p.shares.map(sh => `<div style="width:${Math.max(sh.weight_pct, 6)}%;background:${colorOf(sh.machine)}" title="${esc(sh.machine)}: ${esc(sh.components)}"><b>${esc(sh.machine)}</b>${sh.weight_pct.toFixed(0)}% · ${gb(sh.weight_bytes)}</div>`).join('')}</div>`;
+    h += `<div class="pgrid">${p.shares.map((sh, i) => {
+      const pct = Math.min(100, sh.memory_needed / Math.max(1, sh.memory_budget) * 100);
+      return `<div class="pbox" style="border-color:${colorOf(sh.machine)}">
+        <div class="nm">${i + 1}. ${esc(sh.machine)} <span class="sub">${esc(sh.backend)}</span></div>
+        <div>${esc(sh.components)}</div>
+        <div><b>${gb(sh.weight_bytes)}</b> of weights <span class="sub">(${sh.weight_pct.toFixed(1)}%)</span></div>
+        <div class="bar ${pct > 92 ? 'warn' : ''}" style="margin:4px 0 0"><div style="width:${pct}%"></div></div>
+        <div class="sub">needs ${gb(sh.memory_needed)} of ${gb(sh.memory_budget)} · KV ${gb(sh.kv_bytes)}</div>
+        <div class="sub">downloads ${gb(sh.weight_bytes)} · ${fmtMs(sh.decode_ms)}/token</div>
+      </div>`; }).join('')}</div>`;
+    h += `<div class="verdict ok">✓ Fits · ~${(p.tokens_per_sec || 0).toFixed(1)} tok/s · first token ~${fmtMs(p.ttft_ms)} — each machine downloads only its share, in parallel.</div>`;
+  } else {
+    h += `<div class="verdict no">✗ Doesn't fit: ${esc(p.reason || 'not enough memory')}</div>`;
+  }
+  if (p.displaces?.length) h += `<div class="verdict no" style="background:var(--warn-soft);color:var(--warn)">! Loading it leaves no room for ${p.displaces.map(esc).join(', ')}.</div>`;
+  if (p.alternatives?.length) {
+    h += `<div class="plansum" style="margin-top:14px">Other weight formats — click to plan with one:</div><div class="chips">${p.alternatives.map(a =>
+      `<button class="chip2 ${a.fits ? 'ok' : 'no'}" data-fmt="${esc(a.format)}">${esc(a.format)} · ${gb(a.weight_bytes)} · ${a.fits ? '~' + (a.tokens_per_sec || 0).toFixed(1) + ' tok/s' : "doesn't fit"}</button>`).join('')}</div>`;
+  }
+  if (p.advice?.length) h += `<ul class="advice">${p.advice.slice(0, 4).map(a => '<li>' + esc(a) + '</li>').join('')}</ul>`;
+  h += `<div class="row" style="justify-content:flex-start;margin-top:16px"><button class="btn primary" id="pmLoad" ${p.shares?.length ? '' : 'disabled'}>Load ${esc(short(p.model))}</button><span class="sub" style="align-self:center">${p.shares?.length ? 'Starts the downloads and loads it on these machines.' : ''}</span></div>`;
+  $('pmOut').innerHTML = h;
+  $('pmOut').querySelectorAll('[data-fmt]').forEach(b => b.onclick = () => { $('pmFmt').value = b.dataset.fmt; planNow(); });
+  const lb = $('pmLoad');
+  if (lb) lb.onclick = async () => {
+    lb.disabled = true; lb.textContent = 'Loading…';
+    try {
+      const r = await api('/api/models', body);
+      $('planDlg').close();
+      selected = r.loaded; store.set('model', r.loaded);
+      toast(`Loading ${short(r.loaded)} — machines are downloading their shares`);
+      poll();
+    } catch (e) { toast(e.message, true); lb.disabled = false; lb.textContent = 'Load ' + short(p.model); }
+  };
+}
+
+$('stopBtn').onclick = async () => {
+  if (!confirm('Stop the cluster? Every model unloads and joined machines exit.')) return;
+  try { await api('/api/stop'); toast('Stopping the cluster…'); } catch (e) { toast(e.message, true); }
+};
 
 let eventsLoaded = false;
 async function poll() {
@@ -515,6 +868,7 @@ async function poll() {
     if (r.status === 404) { selected = null; store.set('model', null); r = await fetch('/api/status'); }
     const s = await r.json();
     const wasEmpty = !lastStatus;
+    if (wasEmpty && !view) setView(s.model ? 'chat' : 'dash');
     renderStatus(s);
     if (!eventsLoaded) { eventsLoaded = true; s.events.forEach(e => addEvent(e)); }
     if (wasEmpty && !history.length) renderThread();
@@ -545,8 +899,12 @@ $('settingsBtn').onclick = () => { $('sys').value = settings.system; $('temp').v
 $('temp').oninput = () => $('tempV').textContent = $('temp').value;
 $('closeSettings').onclick = () => { settings = { system: $('sys').value, temperature: parseFloat($('temp').value), maxTokens: Math.max(1, parseInt($('maxTok').value) || 1024) }; store.set('settings', settings); dlg.close(); };
 
+if (view) setView(view);
+renderLock();
 renderThread();
 poll(); setInterval(poll, 2000); listen();
+// A token saved earlier may be stale (server restarted with another one).
+if (token) fetch('/api/auth', { headers: { Authorization: 'Bearer ' + token } }).then(r => { if (r.status === 401) { token = null; store.set('token', null); renderLock(); } }).catch(() => {});
 </script>
 </body>
 </html>

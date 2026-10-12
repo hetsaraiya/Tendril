@@ -190,7 +190,7 @@ async fn local_plus_remote_pipeline_matches_single_machine() {
         c.history().iter().any(|e| e.text.contains("already has")),
         "second load should hit the shard cache"
     );
-    c.shutdown().await;
+    c.shutdown(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -226,7 +226,7 @@ async fn three_remote_stages() {
         assert!(tel.compute_ms.iter().all(|&m| m > 0.0));
         assert!(tel.step_ms >= tel.compute_ms.iter().sum::<f64>() * 0.5);
     }
-    c.shutdown().await;
+    c.shutdown(true).await;
 }
 
 async fn collect_with_timing(
@@ -325,7 +325,7 @@ async fn prefix_cache_reuses_spills_and_restores() {
         text3, fresh3,
         "restoring from disk must not change the output"
     );
-    c.shutdown().await;
+    c.shutdown(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -355,7 +355,7 @@ async fn speculation_is_exact_and_accepts_repetitive_text() {
         m.spec_steps, m.accepted_tokens, m.drafted_tokens
     );
     assert!(m.accepted_tokens > 0, "{m:?}");
-    c.shutdown().await;
+    c.shutdown(true).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -420,5 +420,5 @@ async fn request_survives_a_machine_leaving_mid_generation() {
     assert_eq!(done.completion_tokens, 300);
     assert_eq!(c.metrics().recoveries, 1, "{:#?}", c.history());
     assert_eq!(text, want, "no lost or duplicated text across the recovery");
-    c.shutdown().await;
+    c.shutdown(true).await;
 }

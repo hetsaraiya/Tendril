@@ -100,8 +100,13 @@ pub struct NodeProfile {
     /// Approximate fp16 TFLOP/s.
     pub tflops: f64,
     pub source: ProfileSource,
+    /// Weight-streaming bandwidth measured through Tendril's own decode
+    /// kernels on this machine (GB/s); replaces the spec-sheet estimate.
     #[serde(default)]
     pub measured_bandwidth_gbs: Option<f64>,
+    /// Matrix-multiply throughput measured the same way (TFLOP/s).
+    #[serde(default)]
+    pub measured_tflops: Option<f64>,
     #[serde(default)]
     pub on_battery: Option<bool>,
     /// Network address when this node belongs to a live cluster.
@@ -113,14 +118,27 @@ impl NodeProfile {
     /// Effective bandwidth used by the cost model (GB/s).
     pub fn effective_bandwidth_gbs(&self) -> f64 {
         match self.measured_bandwidth_gbs {
-            // A measured CPU memcpy already reflects achievable bandwidth.
-            Some(m) if self.backend == Backend::Cpu => m * 0.9,
+            // Measured through the real kernels: already what decode achieves.
+            Some(m) if m > 0.0 => m,
             _ => self.bandwidth_gbs * self.backend.bandwidth_efficiency(),
         }
     }
 
     pub fn effective_tflops(&self) -> f64 {
-        self.tflops * self.backend.compute_efficiency()
+        match self.measured_tflops {
+            Some(t) if t > 0.0 => t,
+            _ => self.tflops * self.backend.compute_efficiency(),
+        }
+    }
+
+    /// Run on `backend` (e.g. a Mac forced onto its CPU): redo the memory
+    /// budget and pick up that backend's benchmark.
+    pub fn use_backend(&mut self, backend: Backend) {
+        if self.backend != backend {
+            self.backend = backend;
+            self.recompute_usable();
+            apply_benchmark(self);
+        }
     }
 
     /// Recompute the memory budget from the hardware facts.
@@ -226,6 +244,7 @@ pub fn detect_local(consider_free_memory: bool) -> NodeProfile {
         tflops: 0.8,
         source: ProfileSource::Detected,
         measured_bandwidth_gbs: None,
+        measured_tflops: None,
         on_battery: detect_battery(),
         address: None,
     };
@@ -270,52 +289,95 @@ pub fn detect_local(consider_free_memory: bool) -> NodeProfile {
         node.bandwidth_gbs = if total.0 >= 128 * GIB { 120.0 } else { 40.0 };
     }
     node.recompute_usable();
-    apply_saved_measurements(&mut node);
+    apply_benchmark(&mut node);
     node
 }
 
-/// Measurements from `tendril node --probe`, reused for two weeks.
-#[derive(Serialize, Deserialize)]
-struct SavedProbe {
-    bandwidth_gbs: f64,
-    measured_unix: u64,
+/// Bump when the benchmark changes so every machine measures again.
+pub const BENCH_VERSION: u32 = 1;
+
+/// A machine's measured speed, kept until its hardware changes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Benchmark {
+    /// What was measured (see [`fingerprint`]).
+    pub fingerprint: String,
+    /// Weights streamed per second by the decode kernels, GB/s.
+    pub weight_gbs: f64,
+    /// Matrix-multiply throughput (prefill), TFLOP/s.
+    pub tflops: f64,
+    /// Plain memory copy, GB/s (for reference).
+    pub copy_gbs: f64,
+    /// "CPU", "Metal" or "CUDA".
+    pub device: String,
+    /// Local date and time of the measurement.
+    pub measured_at: String,
+    pub seconds: f64,
 }
 
-fn probe_path() -> Option<std::path::PathBuf> {
-    Some(dirs::config_dir()?.join("tendril").join("probe.json"))
+/// Identifies the hardware a benchmark is valid for: the same chip, cores,
+/// memory and backend measure the same. A new GPU, more RAM or another OS
+/// gives a new fingerprint and a fresh benchmark.
+pub fn fingerprint(p: &NodeProfile) -> String {
+    format!(
+        "v{BENCH_VERSION}|{}|{}|{}|{}|{}c|{}g|{}GiB|{}",
+        p.chip,
+        p.backend.label(),
+        p.os,
+        p.arch,
+        p.cpu_cores,
+        p.gpu_cores.unwrap_or(0),
+        (p.total_memory.0 as f64 / GIB as f64).round() as u64,
+        p.accel_memory
+            .map(|b| format!("{}GiB", (b.0 as f64 / GIB as f64).round() as u64))
+            .unwrap_or_default(),
+    )
 }
 
-fn now_unix() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+fn bench_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("TENDRIL_BENCH_FILE") {
+        return Some(p.into());
+    }
+    Some(dirs::config_dir()?.join("tendril").join("benchmarks.json"))
 }
 
-/// Remember a measured bandwidth for this machine.
-pub fn save_probe(bandwidth_gbs: f64) {
-    if let Some(p) = probe_path() {
-        if let Some(d) = p.parent() {
-            let _ = std::fs::create_dir_all(d);
-        }
-        let s = SavedProbe {
-            bandwidth_gbs,
-            measured_unix: now_unix(),
-        };
-        if let Ok(j) = serde_json::to_vec_pretty(&s) {
-            let _ = std::fs::write(p, j);
-        }
+fn load_benchmarks() -> Vec<Benchmark> {
+    bench_path()
+        .and_then(|p| std::fs::read(p).ok())
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// This hardware's saved benchmark, if it was measured before.
+pub fn saved_benchmark(p: &NodeProfile) -> Option<Benchmark> {
+    let fp = fingerprint(p);
+    load_benchmarks().into_iter().find(|b| b.fingerprint == fp)
+}
+
+/// Remember a benchmark (replacing any earlier one for the same hardware).
+pub fn save_benchmark(b: &Benchmark) {
+    let Some(path) = bench_path() else { return };
+    let mut all = load_benchmarks();
+    all.retain(|x| x.fingerprint != b.fingerprint);
+    all.push(b.clone());
+    if let Some(d) = path.parent() {
+        let _ = std::fs::create_dir_all(d);
+    }
+    if let Ok(j) = serde_json::to_vec_pretty(&all) {
+        let _ = std::fs::write(path, j);
     }
 }
 
-fn apply_saved_measurements(node: &mut NodeProfile) {
-    let Some(p) = probe_path() else { return };
-    let Ok(b) = std::fs::read(p) else { return };
-    let Ok(s) = serde_json::from_slice::<SavedProbe>(&b) else {
-        return;
-    };
-    if now_unix().saturating_sub(s.measured_unix) < 14 * 86400 && s.bandwidth_gbs > 0.0 {
-        node.measured_bandwidth_gbs = Some(s.bandwidth_gbs);
+/// Use this hardware's measured speed in place of spec-sheet numbers.
+pub fn apply_benchmark(node: &mut NodeProfile) {
+    match saved_benchmark(node) {
+        Some(b) => {
+            node.measured_bandwidth_gbs = Some(b.weight_gbs);
+            node.measured_tflops = Some(b.tflops);
+        }
+        None => {
+            node.measured_bandwidth_gbs = None;
+            node.measured_tflops = None;
+        }
     }
 }
 
@@ -459,6 +521,43 @@ mod tests {
         let t = "Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:  10.\nPages active: 99.\nPages inactive:  20.\nPages speculative:  2.\n";
         assert_eq!(vm_stat_available(t), Some(16384 * 32));
         assert_eq!(vm_stat_available("garbage"), None);
+    }
+
+    #[test]
+    fn benchmark_is_reused_until_the_hardware_changes() {
+        let dir = std::env::temp_dir().join(format!("tendril-bench-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("TENDRIL_BENCH_FILE", dir.join("b.json"));
+        let mut p = crate::presets::node_from_spec("box", "m4:16").unwrap();
+        let spec_bw = p.effective_bandwidth_gbs();
+        save_benchmark(&Benchmark {
+            fingerprint: fingerprint(&p),
+            weight_gbs: 42.0,
+            tflops: 1.5,
+            copy_gbs: 60.0,
+            device: "Metal".into(),
+            measured_at: "now".into(),
+            seconds: 1.0,
+        });
+        apply_benchmark(&mut p);
+        assert_eq!(
+            p.effective_bandwidth_gbs(),
+            42.0,
+            "measured replaces the spec sheet"
+        );
+        assert_eq!(p.effective_tflops(), 1.5);
+        // More memory (or another backend) is different hardware: measure again.
+        let mut bigger = crate::presets::node_from_spec("box", "m4:32").unwrap();
+        apply_benchmark(&mut bigger);
+        assert!(bigger.measured_bandwidth_gbs.is_none());
+        p.use_backend(Backend::Cpu);
+        assert!(
+            p.measured_bandwidth_gbs.is_none(),
+            "the CPU wasn't benchmarked"
+        );
+        assert_ne!(p.effective_bandwidth_gbs(), spec_bw);
+        std::env::remove_var("TENDRIL_BENCH_FILE");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
