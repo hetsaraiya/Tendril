@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tendril_core::cluster::{Cluster, Link};
@@ -38,7 +38,24 @@ pub struct LoadRequest {
     /// Tokens per conversation.
     #[serde(default)]
     pub context: Option<usize>,
+    /// Load only if the pool is still as it was when this plan was shown
+    /// (`PlanPreview::pool_version`); otherwise the request is refused so the
+    /// user can look at the new plan first.
+    #[serde(default)]
+    pub expect_version: Option<u64>,
 }
+
+/// The pool changed between showing a plan and confirming it.
+#[derive(Debug)]
+pub struct PoolChanged;
+
+impl std::fmt::Display for PoolChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the machines or models changed since this plan was made — plan again to see the new split")
+    }
+}
+
+impl std::error::Error for PoolChanged {}
 
 /// Turns a load request into serve options (fetching the model's config
 /// and tensor table, not its weights).
@@ -93,6 +110,8 @@ pub struct MachineRole {
 /// What loading a model would do, before anything is downloaded.
 #[derive(Clone, Debug, Serialize)]
 pub struct PlanPreview {
+    /// Pass back as `expect_version` to load exactly this plan.
+    pub pool_version: u64,
     pub model: String,
     pub architecture: String,
     pub params: u64,
@@ -156,6 +175,9 @@ pub struct Share {
     pub reason: Option<String>,
     /// (machine name, memory this model may use there).
     pub machines: Vec<(String, u64)>,
+    /// The same by machine id (names can repeat).
+    #[serde(skip)]
+    pub by_machine: Vec<(u64, u64)>,
 }
 
 pub struct Pool {
@@ -175,6 +197,8 @@ pub struct Pool {
     resolved: StdMutex<HashMap<String, (Instant, ServeOptions)>>,
     /// Set by the dashboard's "Stop cluster".
     stop: Notify,
+    /// See [`Pool::version`].
+    version: AtomicU64,
     control_port: u16,
     /// The cluster token (also guards the model-loading API).
     pub token: String,
@@ -231,6 +255,7 @@ impl Pool {
             local,
             resolved: StdMutex::new(HashMap::new()),
             stop: Notify::new(),
+            version: AtomicU64::new(0),
         });
         tokio::spawn(pool.clone().control_loop(control, token::psk(&token)));
         tokio::spawn(pool.clone().allocator_loop(changed));
@@ -240,7 +265,7 @@ impl Pool {
     /// Resolve a request (config and tensor table, no weights), reusing a
     /// resolution from a recent plan preview.
     async fn resolve(&self, req: &LoadRequest) -> Result<ServeOptions> {
-        let key = serde_json::to_string(req)?;
+        let key = serde_json::to_string(&(&req.model, &req.quantize, req.context))?;
         {
             let mut cache = self.resolved.lock().unwrap();
             cache.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(600));
@@ -273,6 +298,9 @@ impl Pool {
     /// Resolve a request and serve it on the pool's machines.
     pub async fn load_with(&self, req: &LoadRequest) -> Result<String> {
         let opts = self.resolve(req).await?;
+        if req.expect_version.is_some_and(|v| v != self.version()) {
+            return Err(PoolChanged.into());
+        }
         let model = opts.model_name.clone();
         self.add(opts).await?;
         Ok(model)
@@ -302,10 +330,12 @@ impl Pool {
             placed: false,
             reason: None,
             machines: vec![],
+            by_machine: vec![],
         });
         self.models.lock().unwrap().push(c);
         self.links.lock().unwrap().push(link);
         self.announce_models();
+        self.bump();
         self.changed.notify_one();
         Ok(())
     }
@@ -328,7 +358,14 @@ impl Pool {
     /// Stop serving a model; machines keep its memory free for others.
     pub async fn unload(&self, name: &str) -> Result<String> {
         let _one_at_a_time = self.adding.lock().await;
-        let c = self.get(Some(name)).map_err(|e| anyhow::anyhow!(e))?;
+        // Exactly a loaded model: a typo must not unload the only one.
+        let c = self
+            .models()
+            .into_iter()
+            .find(|c| c.inner.opts.model_name == name.trim())
+            .with_context(|| {
+                format!("{name} is not loaded; loaded: {}", self.names().join(", "))
+            })?;
         let model = c.inner.opts.model_name.clone();
         {
             let mut models = self.models.lock().unwrap();
@@ -342,6 +379,7 @@ impl Pool {
         }
         c.shutdown(false).await;
         self.announce_models();
+        self.bump();
         self.event("info", format!("Unloaded {model}"));
         self.changed.notify_one();
         Ok(model)
@@ -432,7 +470,7 @@ impl Pool {
                     budget: shares
                         .iter()
                         .find(|s| &s.model == model)
-                        .and_then(|s| s.machines.iter().find(|(n, _)| n == &p.name))
+                        .and_then(|s| s.by_machine.iter().find(|(m, _)| machine_key(*m) == id))
                         .map(|(_, b)| *b)
                         .unwrap_or(0),
                 })
@@ -556,6 +594,7 @@ impl Pool {
     /// Plan a model across the pool's machines (next to the models already
     /// loaded) without loading or downloading anything.
     pub async fn plan(&self, req: &LoadRequest) -> Result<PlanPreview> {
+        let version = self.version();
         let opts = self.resolve(req).await?;
         if self.names().contains(&opts.model_name) {
             bail!("{} is already loaded", opts.model_name);
@@ -607,10 +646,11 @@ impl Pool {
                 formats.push((f, model_spec(&o)?));
             }
         }
-        let preview = tokio::task::spawn_blocking(move || {
+        let mut preview = tokio::task::spawn_blocking(move || {
             preview(&spec, &opts, w, po, &loaded, &names, &cluster, &formats)
         })
         .await?;
+        preview.pool_version = version;
         let _ = ids;
         Ok(preview)
     }
@@ -842,6 +882,7 @@ impl Pool {
         // 4 MiB transfer.
         let _ = tx.send(Msg::Ping { t: 1 });
         let mut sent = Instant::now();
+        self.bump();
         let speed = match hello.profile.measured_bandwidth_gbs {
             Some(g) => format!(" · decode {g:.0} GB/s measured"),
             None => String::new(),
@@ -898,6 +939,8 @@ impl Pool {
                     let rtt = e.rtt_ms.unwrap_or(0.0) / 1000.0;
                     let secs = (sent.elapsed().as_secs_f64() - rtt / 2.0).max(1e-4);
                     e.gbps = Some(len as f64 * 8.0 / secs / 1e9);
+                    // Links feed plans: a plan made before this is stale.
+                    self.bump();
                 }
                 _ => {}
             }
@@ -911,34 +954,32 @@ impl Pool {
             lobby.remove(&hello.machine);
         }
         drop(lobby);
+        self.bump();
         self.event("warn", format!("{name} left the cluster"));
         Ok(())
     }
 
     async fn allocator_loop(self: Arc<Self>, changed: Arc<Notify>) {
-        let mut last: Vec<HashMap<u64, Bytes>> = vec![];
-        let mut first = true;
+        // What each model was last given, by model name (models come and go).
+        let mut last: HashMap<String, Decision> = HashMap::new();
         loop {
             changed.notified().await;
             // Let a machine's sessions for every model arrive.
             tokio::time::sleep(Duration::from_millis(600)).await;
-            let models = self.models();
-            let links = self.links.lock().unwrap().clone();
+            let (models, links) = self.models_and_links();
+            last.retain(|name, _| models.iter().any(|c| &c.inner.opts.model_name == name));
             if models.is_empty() {
                 continue;
             }
-            // A model added since the last round starts with no share.
-            let grew = last.len() < models.len();
-            last.resize(models.len(), HashMap::new());
             // One view of the machines for everything the pool decides: the
             // plan preview, every model's share and the split it runs.
             let (cluster, machines) = self.pool_cluster(models[0].inner.opts.link.clone());
             let specs: Vec<_> = models
                 .iter()
-                .zip(&last)
-                .map(|(c, prev)| {
+                .map(|c| {
+                    let prev = last.get(&c.inner.opts.model_name);
                     let current: Vec<usize> = (0..machines.len())
-                        .filter(|&j| prev.contains_key(&machines[j]))
+                        .filter(|&j| prev.is_some_and(|d| d.budgets.contains_key(&machines[j])))
                         .collect();
                     (
                         c.inner.spec.clone(),
@@ -966,31 +1007,46 @@ impl Pool {
                 Ok(a) => a,
                 Err(_) => continue,
             };
-            let names = self.names();
-            let mut next: Vec<HashMap<u64, Bytes>> = Vec::new();
+            let mut next: Vec<Decision> = Vec::new();
             let mut shares = Vec::new();
-            for (i, p) in alloc.placements.iter().enumerate() {
-                let mut map = HashMap::new();
+            for (c, p) in models.iter().zip(&alloc.placements) {
+                let mut budgets = HashMap::new();
                 let mut list = Vec::new();
+                let mut by_machine = Vec::new();
                 for (j, b) in p.budgets.iter().enumerate() {
                     if b.0 > 0 {
-                        map.insert(machines[j], *b);
+                        budgets.insert(machines[j], *b);
                         list.push((cluster.nodes[j].name.clone(), b.0));
+                        by_machine.push((machines[j], b.0));
                     }
                 }
-                next.push(map);
+                let split = p
+                    .plan
+                    .as_ref()
+                    .map(|pl| {
+                        pl.stages
+                            .iter()
+                            .map(|st| (machines[st.node], st.layer_start, st.layer_end))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                next.push(Decision { budgets, split });
                 shares.push(Share {
-                    model: names[i].clone(),
+                    model: c.inner.opts.model_name.clone(),
                     placed: p.plan.is_some(),
                     reason: p.reason.clone(),
                     machines: list,
+                    by_machine,
                 });
             }
             *self.shares.lock().unwrap() = shares.clone();
-            if next == last && !first && !grew {
+            // Tell only models whose share or split changed (or that are new).
+            let changed_models: Vec<usize> = (0..models.len())
+                .filter(|&i| last.get(&models[i].inner.opts.model_name) != Some(&next[i]))
+                .collect();
+            if changed_models.is_empty() {
                 continue;
             }
-            first = false;
             if !cluster.nodes.is_empty() {
                 let parts: Vec<String> = shares
                     .iter()
@@ -1029,12 +1085,14 @@ impl Pool {
             }
             // Shrink first so memory is free before another model loads into it.
             let shrinks = |i: usize| {
-                last[i]
-                    .iter()
-                    .any(|(m, b)| next[i].get(m).is_none_or(|nb| nb < b))
+                last.get(&models[i].inner.opts.model_name).is_some_and(|d| {
+                    d.budgets
+                        .iter()
+                        .any(|(m, b)| next[i].budgets.get(m).is_none_or(|nb| nb < b))
+                })
             };
             let (shrinking, rest): (Vec<usize>, Vec<usize>) =
-                (0..models.len()).partition(|&i| shrinks(i));
+                changed_models.into_iter().partition(|&i| shrinks(i));
             let apply = |i: usize| {
                 let placed = alloc.placements[i].plan.is_some();
                 *links[i].note.lock().unwrap() = if placed {
@@ -1047,7 +1105,7 @@ impl Pool {
                             .unwrap_or_else(|| "not enough memory in the pool".into()),
                     )
                 };
-                *links[i].budgets.lock().unwrap() = Some(next[i].clone());
+                *links[i].budgets.lock().unwrap() = Some(next[i].budgets.clone());
                 *links[i].plan.lock().unwrap() = alloc.placements[i].plan.clone().map(|p| {
                     let ms = p.stages.iter().map(|st| machines[st.node]).collect();
                     (p, ms)
@@ -1063,9 +1121,36 @@ impl Pool {
             for &i in &rest {
                 apply(i);
             }
-            last = next;
+            for (c, d) in models.iter().zip(next) {
+                last.insert(c.inner.opts.model_name.clone(), d);
+            }
         }
     }
+
+    /// The models and their pool links, taken together so they line up.
+    fn models_and_links(&self) -> (Vec<Coordinator>, Vec<Arc<PoolLink>>) {
+        let models = self.models.lock().unwrap();
+        let links = self.links.lock().unwrap();
+        (models.clone(), links.clone())
+    }
+
+    /// Bumped whenever the pool changes in a way that changes plans
+    /// (machines, links, models), so a confirmed plan can be checked.
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed)
+    }
+
+    fn bump(&self) {
+        self.version.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// What the allocator gave one model: its memory per machine and its split
+/// (machine, first layer, end layer per stage).
+#[derive(Clone, Debug, PartialEq)]
+struct Decision {
+    budgets: HashMap<u64, Bytes>,
+    split: Vec<(u64, u64, u64)>,
 }
 
 /// How the dashboard and control requests name a machine.
@@ -1105,6 +1190,7 @@ fn preview(
     };
     let machine_names: Vec<String> = cluster.nodes.iter().map(|n| n.name.clone()).collect();
     let mut out = PlanPreview {
+        pool_version: 0,
         model: opts.model_name.clone(),
         architecture: spec.arch.label().to_string(),
         params: spec.total_params(),

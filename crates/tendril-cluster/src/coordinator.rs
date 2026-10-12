@@ -396,6 +396,9 @@ pub struct Inner {
     started: Instant,
     /// Background loops, stopped when this model is unloaded.
     tasks: StdMutex<Vec<tokio::task::JoinHandle<()>>>,
+    /// Set once this model is being unloaded (or the server stops): requests
+    /// end with an error instead of waiting to resume.
+    stopping: std::sync::atomic::AtomicBool,
     calibration: StdMutex<Calibration>,
 }
 
@@ -465,6 +468,7 @@ impl Coordinator {
             last_plan: StdMutex::new(None),
             started: Instant::now(),
             tasks: StdMutex::new(Vec::new()),
+            stopping: std::sync::atomic::AtomicBool::new(false),
             calibration: StdMutex::new(Calibration::load()),
         });
         let c = Coordinator { inner };
@@ -912,7 +916,8 @@ impl Coordinator {
     async fn teardown(&self, why: &str) {
         let old = self.inner.pipeline.write().await.take();
         if let Some(p) = old {
-            // In-flight requests pause and resume on the next pipeline.
+            // In-flight requests pause and resume on the next pipeline —
+            // unless there won't be one (the model is being unloaded).
             let routes: Vec<_> = self
                 .inner
                 .router
@@ -921,8 +926,14 @@ impl Coordinator {
                 .values()
                 .map(|r| r.1.clone())
                 .collect();
+            let stopping = self.inner.stopping.load(Ordering::Relaxed);
             for tx in routes {
-                let _ = tx.send((p.epoch, SeqEvent::Lost(why.to_string())));
+                let ev = if stopping {
+                    SeqEvent::Error(format!("{why}; the request was stopped"))
+                } else {
+                    SeqEvent::Lost(why.to_string())
+                };
+                let _ = tx.send((p.epoch, ev));
             }
             for s in &p.slots {
                 if let Some(r) = self.remote(s.node_id) {
@@ -1140,6 +1151,7 @@ impl Coordinator {
         let opts = self.plan_options();
         let w = self.workload();
         let mut result = planner::plan(&self.inner.spec, &cluster, &w, &opts);
+        let mut assigned = false;
         // In a pool, run the split the pool planned (and previewed).
         if let Some((plan, machines)) = self
             .inner
@@ -1169,6 +1181,7 @@ impl Coordinator {
                 return Ok(());
             }
             result.selected = Some(p);
+            assigned = true;
         }
         *self.inner.last_plan.lock().unwrap() = Some(result.clone());
         let Some(best) = result.selected.clone() else {
@@ -1232,6 +1245,20 @@ impl Coordinator {
                 });
             if same {
                 return Ok(());
+            }
+            if assigned {
+                // The pool decided (machines changed, or it is clearly faster):
+                // move now; in-flight requests resume on the new split.
+                self.event(
+                    "info",
+                    format!(
+                        "The pool re-planned this model: {} (~{:.1} tok/s)",
+                        best.label(),
+                        best.tokens_per_sec
+                    ),
+                );
+                self.teardown("the pool re-planned this model").await;
+                return self.activate(best, &ids).await;
             }
             let gain = best.tokens_per_sec / cur.plan.tokens_per_sec.max(1e-9);
             let busy = !self.inner.router.lock().unwrap().is_empty();
@@ -1826,6 +1853,12 @@ impl Coordinator {
     /// Start generating. Text arrives on the returned channel.
     pub async fn generate(&self, req: GenRequest) -> Result<mpsc::Receiver<GenOut>, ServeError> {
         let queued_at = Instant::now();
+        if self.inner.stopping.load(Ordering::Relaxed) {
+            return Err(ServeError::NotReady(format!(
+                "{} is being unloaded",
+                self.inner.opts.model_name
+            )));
+        }
         let pipeline = self.inner.pipeline.read().await.clone();
         let Some(p) = pipeline else {
             let why = match self.status() {
@@ -2440,6 +2473,7 @@ impl Coordinator {
     /// Stop serving: unload every stage and end the agents' sessions.
     /// `leave`: tell the machines to exit (the whole server is stopping).
     pub async fn shutdown(&self, leave: bool) {
+        self.inner.stopping.store(true, Ordering::Relaxed);
         let remotes: Vec<Arc<RemoteNode>> = self
             .inner
             .nodes
@@ -2448,7 +2482,12 @@ impl Coordinator {
             .iter()
             .filter_map(|n| n.remote.clone())
             .collect();
-        self.teardown("server stopped").await;
+        self.teardown(if leave {
+            "the server stopped"
+        } else {
+            "the model was unloaded"
+        })
+        .await;
         for r in remotes {
             let _ = r.tx.try_send(Msg::Bye {
                 reason: if leave {

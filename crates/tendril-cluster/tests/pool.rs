@@ -478,7 +478,11 @@ async fn the_previewed_plan_is_what_loads_and_the_host_controls_machines() {
     assert!(pool.models().is_empty(), "planning doesn't load");
 
     // Loading runs exactly the previewed split.
-    pool.load_with(&req).await.unwrap();
+    let confirmed = LoadRequest {
+        expect_version: Some(preview.pool_version),
+        ..req.clone()
+    };
+    pool.load_with(&confirmed).await.unwrap();
     let c = pool.models()[0].clone();
     wait_ready(&c).await;
     let ran = c.last_plan().unwrap().selected.unwrap();
@@ -502,12 +506,72 @@ async fn the_previewed_plan_is_what_loads_and_the_host_controls_machines() {
         "{views:?}"
     );
 
-    // Unloading frees the model; the machine stays in the pool.
+    // Control requests name the model exactly: a typo unloads nothing.
+    assert!(pool.unload("org/tinyy").await.is_err());
+    assert_eq!(pool.models().len(), 1);
+
+    // Unloading mid-generation ends the request at once (no recovery wait).
+    let mut rx = c
+        .generate(tendril_cluster::coordinator::GenRequest {
+            prompt: c.inner.tok.encode_prompt("keep going").unwrap(),
+            params: SamplingParams::greedy(),
+            max_tokens: 400,
+            stop: vec![],
+            ignore_eos: true,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        rx.recv().await,
+        Some(tendril_cluster::coordinator::GenOut::Text(_))
+    ));
+    let t0 = std::time::Instant::now();
     pool.unload("org/tiny").await.unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match rx.recv().await {
+                Some(tendril_cluster::coordinator::GenOut::Error(e)) => break Some(e),
+                Some(tendril_cluster::coordinator::GenOut::Done { .. }) | None => break None,
+                Some(_) => {}
+            }
+        }
+    })
+    .await
+    .expect("the request ends promptly");
+    assert!(ended.is_some(), "the client is told why");
+    assert!(t0.elapsed() < Duration::from_secs(5));
     assert!(pool.models().is_empty());
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(!friend.is_finished(), "unloading a model keeps machines");
     assert_eq!(pool.machines().len(), 1);
+
+    // A plan confirmed after the pool changed is refused…
+    let stale = pool.load_with(&confirmed).await.unwrap_err();
+    assert!(
+        stale.is::<tendril_cluster::pool::PoolChanged>(),
+        "{stale:#}"
+    );
+    // …and a fresh plan of the same model loads again (on the same split).
+    let again = pool.plan(&req).await.unwrap();
+    pool.load_with(&LoadRequest {
+        expect_version: Some(again.pool_version),
+        ..req.clone()
+    })
+    .await
+    .unwrap();
+    let c2 = pool.models()[0].clone();
+    wait_ready(&c2).await;
+    let ran2: Vec<(String, u64, u64)> = c2
+        .last_plan()
+        .unwrap()
+        .selected
+        .unwrap()
+        .stages
+        .iter()
+        .map(|s| (s.node_name.clone(), s.layer_start, s.layer_end))
+        .collect();
+    assert_eq!(ran2, want, "reloaded on the same split");
+    pool.unload("org/tiny").await.unwrap();
 
     // Removing a machine makes its `tendril join` exit.
     let id = views.iter().find(|v| !v.local).unwrap().id.clone();

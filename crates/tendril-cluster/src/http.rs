@@ -188,6 +188,9 @@ async fn load_model(
     };
     match s.pool.load_with(&req).await {
         Ok(name) => Json(json!({"loaded": name})).into_response(),
+        Err(e) if e.is::<crate::pool::PoolChanged>() => {
+            err(StatusCode::CONFLICT, "pool_changed", e.to_string())
+        }
         Err(e) => bad(e),
     }
 }

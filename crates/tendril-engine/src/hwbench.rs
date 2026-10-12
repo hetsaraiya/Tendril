@@ -58,12 +58,12 @@ pub fn run(device: &Device, step: &mut dyn FnMut(&str)) -> Result<DeviceBench> {
         DType::BF16
     };
     // Decode: one token through a bf16 weight much larger than any cache
-    // (256 MiB on CPU, 1 GiB on a GPU).
+    // (256 MiB on CPU, 512 MiB on a GPU, so small GPUs can run it too).
     step("decode speed (streaming weights)");
     let (n, k) = if device.is_cpu() {
         (16384, 8192)
     } else {
-        (32768, 16384)
+        (16384, 16384)
     };
     let w = Linear::random_bf16(n, k, device)?;
     let x = Tensor::ones((1, k), act, device)?;

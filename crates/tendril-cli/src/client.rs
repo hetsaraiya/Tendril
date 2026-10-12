@@ -95,22 +95,36 @@ pub fn load(a: LoadArgs) -> Result<()> {
         req["context"] = json!(n);
     }
     eprintln!("{} Planning {} across the pool…", dim("·"), bold(&a.model));
-    let p = control(&a.url, &token, "/api/plan", &req)?;
-    print_plan(&p);
-    if p["fits"] != json!(true) {
-        bail!("not loading: it doesn't fit on the machines in the pool");
-    }
-    if !a.yes {
-        print!("\n  Load it? Each machine downloads only its share. [Y/n] ");
-        std::io::stdout().flush()?;
-        let mut line = String::new();
-        std::io::stdin().lock().read_line(&mut line)?;
-        if line.trim().eq_ignore_ascii_case("n") || line.trim().eq_ignore_ascii_case("no") {
-            println!("{}", dim("  Not loaded."));
-            return Ok(());
+    let v = loop {
+        let p = control(&a.url, &token, "/api/plan", &req)?;
+        print_plan(&p);
+        if p["fits"] != json!(true) {
+            bail!("not loading: it doesn't fit on the machines in the pool");
         }
-    }
-    let v = control(&a.url, &token, "/api/models", &req)?;
+        if !a.yes {
+            print!("\n  Load it? Each machine downloads only its share. [Y/n] ");
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line)?;
+            if line.trim().eq_ignore_ascii_case("n") || line.trim().eq_ignore_ascii_case("no") {
+                println!("{}", dim("  Not loaded."));
+                return Ok(());
+            }
+        }
+        // Load exactly this plan: refused if the pool changed meanwhile.
+        let mut confirmed = req.clone();
+        confirmed["expect_version"] = p["pool_version"].clone();
+        match control(&a.url, &token, "/api/models", &confirmed) {
+            Ok(v) => break v,
+            Err(e) if e.to_string().contains("plan again") && !a.yes => {
+                println!(
+                    "\n{} The machines changed while you were deciding — here is the new plan:",
+                    warn_mark()
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    };
     println!(
         "{} Loading {} — machines are downloading their shares; watch with `tendril status` or the dashboard",
         ok_mark(),

@@ -5,7 +5,7 @@ use crate::shard::{is_complete, shard_path, ShardWriter};
 use crate::worker::StageWorker;
 use crate::{token, wire};
 use anyhow::{bail, Context, Result};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -85,8 +85,10 @@ type Active = Arc<Mutex<Option<StageWorker>>>;
 
 /// State shared by this process's sessions (one per model).
 struct Shared {
-    /// Models this process already has a session loop for.
-    models: Mutex<HashSet<String>>,
+    /// Models this process already has a session loop for, each
+    /// with the data-port slot it holds (fixed `--data-port`: the
+    /// model's session listens on port + slot; slot 0 is the first session).
+    models: Mutex<HashMap<String, u16>>,
     /// Set when the host tells the machine to leave; every session stops.
     leave: tokio::sync::watch::Sender<Option<String>>,
 }
@@ -109,7 +111,7 @@ pub async fn run(opts: AgentOptions, ev: EventFn) -> Result<()> {
     let machine = rand::random::<u64>() | 1;
     let (leave, mut left) = tokio::sync::watch::channel(None);
     let shared = Arc::new(Shared {
-        models: Mutex::new(HashSet::new()),
+        models: Mutex::new(HashMap::new()),
         leave,
     });
     let r = tokio::select! {
@@ -291,7 +293,12 @@ async fn session(
             );
             // Serve every model of the pool: one session (and stage) each.
             if !cluster.is_empty() {
-                sessions.models.lock().unwrap().insert(cluster.clone());
+                sessions
+                    .models
+                    .lock()
+                    .unwrap()
+                    .entry(cluster.clone())
+                    .or_insert(0);
             }
             open_sessions(opts, &models, machine, ev, sessions);
             cluster
@@ -393,7 +400,8 @@ async fn session(
 }
 
 /// Open a session for each of the pool's models this machine doesn't serve yet.
-/// With a fixed `--data-port`, the model at position i listens on port + 1 + i.
+/// With a fixed `--data-port`, each session listens on port + its slot: the
+/// lowest slot no live session holds, so slots survive models coming and going.
 fn open_sessions(
     opts: &AgentOptions,
     models: &[String],
@@ -402,14 +410,17 @@ fn open_sessions(
     sessions: &Sessions,
 ) {
     let mut known = sessions.models.lock().unwrap();
-    for (i, m) in models.iter().enumerate() {
-        if known.insert(m.clone()) {
-            let mut o = opts.clone();
-            if o.data_port != 0 {
-                o.data_port = o.data_port.saturating_add(1 + i as u16);
-            }
-            spawn_sibling(o, m.clone(), machine, ev.clone(), sessions.clone());
+    for m in models {
+        if known.contains_key(m) {
+            continue;
         }
+        let slot = free_slot(&known);
+        known.insert(m.clone(), slot);
+        let mut o = opts.clone();
+        if o.data_port != 0 {
+            o.data_port = o.data_port.saturating_add(slot);
+        }
+        spawn_sibling(o, m.clone(), machine, ev.clone(), sessions.clone());
     }
 }
 
@@ -681,5 +692,30 @@ async fn data_loop(listener: TcpListener, psk: [u8; 32], active: Active) {
                 }
             }
         });
+    }
+}
+
+/// The lowest data-port slot (≥ 1) no live session holds.
+fn free_slot(known: &HashMap<String, u16>) -> u16 {
+    (1u16..)
+        .find(|s| !known.values().any(|v| v == s))
+        .expect("a free slot")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_port_slots_survive_models_coming_and_going() {
+        let mut k: HashMap<String, u16> = HashMap::new();
+        k.insert("pool".into(), 0);
+        k.insert("a".into(), free_slot(&k));
+        k.insert("b".into(), free_slot(&k));
+        assert_eq!((k["a"], k["b"]), (1, 2));
+        // A is unloaded; B keeps its port and C takes A's free one.
+        k.remove("a");
+        k.insert("c".into(), free_slot(&k));
+        assert_eq!((k["b"], k["c"]), (2, 1));
     }
 }

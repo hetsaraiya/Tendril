@@ -698,7 +698,7 @@ async function api(path, body) {
   const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (token || '') }, body: JSON.stringify(body || {}) });
   const j = await r.json().catch(() => ({}));
   if (r.status === 401) { token = null; store.set('token', null); renderLock(); throw new Error('The token was not accepted — unlock again.'); }
-  if (!r.ok) throw new Error(j?.error?.message || ('HTTP ' + r.status));
+  if (!r.ok) { const e = new Error(j?.error?.message || ('HTTP ' + r.status)); e.status = r.status; throw e; }
   return j;
 }
 
@@ -804,19 +804,19 @@ function planBody() {
   if ($('pmCtx').value) b.context = parseInt($('pmCtx').value);
   return b;
 }
-async function planNow() {
+async function planNow(notice) {
   const body = planBody();
   if (!body.model) { $('pmModel').focus(); return; }
   $('pmOut').innerHTML = `<div class="plansum" style="margin-top:16px"><span class="spin"></span>Reading ${esc(body.model)}'s config and tensor table (no weights) and planning it across ${(lastStatus?.machines || []).length} machine(s)…</div>`;
   $('pmPlan').disabled = true;
-  try { renderPlan(await api('/api/plan', body), body); }
+  try { renderPlan(await api('/api/plan', body), body, notice); }
   catch (e) { $('pmOut').innerHTML = `<div class="verdict no">${esc(e.message)}</div>`; }
   $('pmPlan').disabled = false;
 }
 
-function renderPlan(p, body) {
+function renderPlan(p, body, notice) {
   const colorOf = (name) => MACHINE_COLORS[Math.max(0, (p.machine_names || []).indexOf(name)) % MACHINE_COLORS.length];
-  let h = `<div style="margin-top:18px;font-size:15px"><b>${esc(p.model)}</b> <span class="sub">· ${esc(p.architecture)} · ${fmtParams(p.params)} params · ${p.layers} layers · ${p.context.toLocaleString()} ctx</span></div>`;
+  let h = (notice ? `<div class="verdict no" style="background:var(--warn-soft);color:var(--warn)">! ${esc(notice)}</div>` : '') + `<div style="margin-top:18px;font-size:15px"><b>${esc(p.model)}</b> <span class="sub">· ${esc(p.architecture)} · ${fmtParams(p.params)} params · ${p.layers} layers · ${p.context.toLocaleString()} ctx</span></div>`;
   h += `<div class="plansum">Model weights: <b style="color:var(--text)">${gb(p.weight_bytes)}</b> in ${esc(p.format)} · across ${p.machines} machine${p.machines === 1 ? '' : 's'}</div>`;
   if (p.shares?.length) {
     h += `<div class="wbar">${p.shares.map(sh => `<div style="width:${Math.max(sh.weight_pct, 6)}%;background:${colorOf(sh.machine)}" title="${esc(sh.machine)}: ${esc(sh.components)}"><b>${esc(sh.machine)}</b>${sh.weight_pct.toFixed(0)}% · ${gb(sh.weight_bytes)}</div>`).join('')}</div>`;
@@ -847,12 +847,16 @@ function renderPlan(p, body) {
   if (lb) lb.onclick = async () => {
     lb.disabled = true; lb.textContent = 'Loading…';
     try {
-      const r = await api('/api/models', body);
+      // Load exactly the plan on screen; refused if the pool changed since.
+      const r = await api('/api/models', Object.assign({}, body, { expect_version: p.pool_version }));
       $('planDlg').close();
       selected = r.loaded; store.set('model', r.loaded);
       toast(`Loading ${short(r.loaded)} — machines are downloading their shares`);
       poll();
-    } catch (e) { toast(e.message, true); lb.disabled = false; lb.textContent = 'Load ' + short(p.model); }
+    } catch (e) {
+      if (e.status === 409) { planNow('The machines changed while this was open — here is the new plan. Check it and load again.'); return; }
+      toast(e.message, true); lb.disabled = false; lb.textContent = 'Load ' + short(p.model);
+    }
   };
 }
 

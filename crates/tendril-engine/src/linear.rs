@@ -108,7 +108,9 @@ impl Linear {
                 .collect();
             Kind::Cpu(CpuWeights::Bf16(w))
         } else {
-            Kind::Dense(Tensor::randn(0f32, 0.02, (n, k), device)?.to_dtype(DType::BF16)?)
+            // Made in bf16 on the device directly: no f32 copy (GPU matmul
+            // speed doesn't depend on the values).
+            Kind::Dense(Tensor::ones((n, k), DType::BF16, device)?)
         };
         Ok(Linear {
             kind,
