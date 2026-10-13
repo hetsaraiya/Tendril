@@ -1,6 +1,6 @@
 //! Zero-config LAN discovery.
 //!
-//! A coordinator broadcasts a small beacon every second. It names the model,
+//! A server broadcasts a small beacon every second. It names the models,
 //! the control port and a *fingerprint* of the cluster token (a hash, never
 //! the token itself), so `tendril join --token T` can find the right cluster
 //! without an address, and strangers learn nothing that lets them join.

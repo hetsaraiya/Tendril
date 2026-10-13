@@ -8,907 +8,599 @@
 <style>
 :root {
   --bg: #f7f7f5; --panel: #ffffff; --panel2: #f1f1ee; --text: #1c1c1a; --muted: #6b6b66; --line: #e3e3de;
-  --accent: #16a34a; --accent-soft: #dcfce7; --warn: #d97706; --warn-soft: #fef3c7; --err: #dc2626; --err-soft: #fee2e2;
+  --accent: #16a34a; --accent-soft: #dcfce7; --warn: #b45309; --warn-soft: #fef3c7; --err: #dc2626; --err-soft: #fee2e2;
+  --info: #2563eb; --info-soft: #dbeafe;
   --user: #1c1c1a; --user-text: #fafaf9; --code: #f4f4f0; --shadow: 0 1px 2px rgba(0,0,0,.04), 0 4px 16px rgba(0,0,0,.04);
   --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 @media (prefers-color-scheme: dark) {
   :root { --bg: #111210; --panel: #181917; --panel2: #1f201e; --text: #ececea; --muted: #9a9a93; --line: #2c2d2a;
     --accent: #22c55e; --accent-soft: #14301f; --warn: #f59e0b; --warn-soft: #3a2a0c; --err: #f87171; --err-soft: #3b1515;
+    --info: #60a5fa; --info-soft: #172554;
     --user: #ececea; --user-text: #111210; --code: #1f201e; --shadow: none; }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html, body { height: 100%; margin: 0; }
 body { background: var(--bg); color: var(--text); font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif; }
 button { font: inherit; color: inherit; cursor: pointer; }
-.app { display: grid; grid-template-columns: minmax(0, 1fr) 400px; grid-template-rows: 56px minmax(0, 1fr); height: 100vh; }
-header { grid-column: 1 / -1; display: flex; align-items: center; gap: 14px; padding: 0 18px; border-bottom: 1px solid var(--line); background: var(--panel); }
-.brand { display: flex; align-items: center; gap: 8px; font-weight: 650; letter-spacing: -.01em; }
+input, select, textarea { font: inherit; color: var(--text); }
+code, .mono { font-family: var(--mono); font-size: 12.5px; }
+header { position: sticky; top: 0; z-index: 5; display: flex; align-items: center; gap: 14px; padding: 0 18px; height: 56px; border-bottom: 1px solid var(--line); background: var(--panel); }
+.brand { display: flex; align-items: center; gap: 8px; font-weight: 650; letter-spacing: -.01em; white-space: nowrap; }
 .brand svg { width: 22px; height: 22px; }
-.model { color: var(--muted); font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cluster { color: var(--muted); font-size: 14px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .spacer { flex: 1; }
-.picker { position: relative; display: none; }
-.picker.on { display: block; }
-.picker select { appearance: none; -webkit-appearance: none; font: inherit; font-size: 14px; font-weight: 580; color: var(--text); background: var(--panel2); border: 1px solid var(--line); border-radius: 9px; padding: 5px 30px 5px 11px; max-width: 34vw; text-overflow: ellipsis; cursor: pointer; }
-.picker select:hover, .picker select:focus { border-color: var(--accent); outline: none; }
-.picker::after { content: ""; position: absolute; right: 12px; top: 50%; width: 6px; height: 6px; border-right: 1.6px solid var(--muted); border-bottom: 1.6px solid var(--muted); transform: translateY(-70%) rotate(45deg); pointer-events: none; }
-.mrow { display: flex; align-items: center; gap: 10px; background: var(--panel2); border-radius: 12px; padding: 10px 12px; border: 1px solid transparent; cursor: pointer; width: 100%; text-align: left; margin-bottom: 8px; }
-.mrow:hover { border-color: var(--line); }
-.mrow.on { border-color: var(--accent); }
-.mrow .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
-.mrow .dot.ready { background: var(--accent); } .mrow .dot.loading, .mrow .dot.waiting, .mrow .dot.starting { background: var(--warn); } .mrow .dot.failed { background: var(--err); }
-.mrow .dot.loading { animation: pulse 1s infinite; }
-.mrow .mname { font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mrow .msub { color: var(--muted); font-size: 12.5px; }
-.ev .mt { color: var(--accent); font-weight: 550; margin-right: 4px; }
-.pill { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px; font-size: 13px; font-weight: 550; background: var(--panel2); color: var(--muted); white-space: nowrap; }
-.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
-.pill.ready { background: var(--accent-soft); color: var(--accent); }
-.pill.loading, .pill.waiting, .pill.starting { background: var(--warn-soft); color: var(--warn); }
-.pill.loading .dot { animation: pulse 1s infinite; }
-.pill.failed { background: var(--err-soft); color: var(--err); }
-@keyframes pulse { 50% { opacity: .3; } }
-.iconbtn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 6px 10px; font-size: 13px; }
-.iconbtn:hover { background: var(--panel2); }
-.tabs { display: none; }
-
-/* chat */
-.chat { display: flex; flex-direction: column; min-height: 0; }
-.messages { flex: 1; overflow-y: auto; padding: 28px 0 12px; scroll-behavior: smooth; }
-.inner { max-width: 760px; margin: 0 auto; padding: 0 20px; }
-.empty { text-align: center; color: var(--muted); padding-top: 12vh; }
-.empty h1 { color: var(--text); font-size: 26px; letter-spacing: -.02em; margin: 12px 0 6px; font-weight: 650; }
-.empty .sugg { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 22px; }
-.empty .sugg button { border: 1px solid var(--line); background: var(--panel); border-radius: 10px; padding: 8px 12px; font-size: 14px; color: var(--text); }
-.empty .sugg button:hover { border-color: var(--accent); }
-.msg { margin: 0 0 22px; display: flex; flex-direction: column; }
-.msg.user { align-items: flex-end; }
-.msg.user .bubble { background: var(--user); color: var(--user-text); border-radius: 16px 16px 4px 16px; padding: 9px 14px; max-width: 85%; white-space: pre-wrap; word-wrap: break-word; }
-.msg.ai .bubble { max-width: 100%; word-wrap: break-word; }
-.bubble p { margin: 0 0 10px; } .bubble p:last-child { margin-bottom: 0; }
-.bubble pre { background: var(--code); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; overflow-x: auto; font: 13px/1.5 var(--mono); position: relative; }
-.bubble code { font: 13px var(--mono); background: var(--code); padding: 1px 5px; border-radius: 5px; }
-.bubble pre code { background: none; padding: 0; }
-.bubble ul, .bubble ol { margin: 0 0 10px; padding-left: 22px; }
-.bubble h1, .bubble h2, .bubble h3 { font-size: 16px; margin: 14px 0 6px; }
-.caret::after { content: "▍"; animation: pulse .9s infinite; color: var(--accent); }
-.meta { font-size: 12px; color: var(--muted); margin-top: 6px; display: flex; gap: 12px; align-items: center; }
-.meta button { border: none; background: none; color: var(--muted); padding: 0; font-size: 12px; }
-.meta button:hover { color: var(--text); }
-.error { color: var(--err); background: var(--err-soft); border-radius: 10px; padding: 8px 12px; font-size: 14px; }
-.composer { padding: 10px 0 18px; }
-.box { display: flex; align-items: flex-end; gap: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 8px 8px 8px 14px; box-shadow: var(--shadow); }
-.box:focus-within { border-color: var(--accent); }
-textarea { flex: 1; border: none; outline: none; resize: none; background: transparent; color: var(--text); font: inherit; max-height: 220px; padding: 6px 0; }
-.send { border: none; background: var(--accent); color: white; border-radius: 10px; width: 36px; height: 36px; display: grid; place-items: center; flex: none; }
-.send:disabled { opacity: .35; cursor: default; }
-.send.stop { background: var(--text); color: var(--bg); }
-.hint { text-align: center; font-size: 12px; color: var(--muted); margin-top: 8px; }
-
-/* cluster panel */
-aside { border-left: 1px solid var(--line); background: var(--panel); overflow-y: auto; padding: 18px; min-height: 0; }
-.section { margin-bottom: 22px; }
-.section h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; font-weight: 600; }
-.card { background: var(--panel2); border-radius: 12px; padding: 12px 14px; }
-.big { font-size: 22px; font-weight: 650; letter-spacing: -.02em; }
-.sub { color: var(--muted); font-size: 13px; }
-.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
-.stat .v { font-size: 18px; font-weight: 650; font-variant-numeric: tabular-nums; }
-.stat .k { font-size: 12px; color: var(--muted); }
-.node { background: var(--panel2); border-radius: 12px; padding: 12px 14px; border: 1px solid transparent; }
-.node.active { border-color: var(--accent); }
-.node .top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
-.node .name { font-weight: 620; }
-.node .chip { color: var(--muted); font-size: 12.5px; }
-.node .role { font-size: 13px; margin-top: 4px; }
-.tag { font-size: 11px; font-weight: 550; color: var(--accent); background: var(--accent-soft); border-radius: 6px; padding: 1px 6px; margin-left: 4px; vertical-align: 1px; }
-.node .role.idle { color: var(--muted); }
-.bar { height: 6px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 8px 0 4px; }
-.bar > div { height: 100%; background: var(--accent); border-radius: 99px; transition: width .4s; }
-.bar.warn > div { background: var(--warn); }
-.link { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; padding: 5px 0 5px 18px; }
-.link::before { content: ""; width: 2px; height: 18px; background: var(--line); border-radius: 2px; }
-.join { font: 12.5px var(--mono); background: var(--panel2); border-radius: 10px; padding: 10px 12px; word-break: break-all; position: relative; padding-right: 60px; }
-.join button { position: absolute; right: 8px; top: 8px; border: 1px solid var(--line); background: var(--panel); border-radius: 7px; padding: 2px 8px; font: 12px inherit; font-family: inherit; }
-.events { font-size: 12.5px; max-height: 260px; overflow-y: auto; }
-.ev { display: grid; grid-template-columns: 58px 14px 1fr; gap: 4px; padding: 3px 0; border-bottom: 1px dashed var(--line); }
-.ev .t { color: var(--muted); font: 11.5px var(--mono); padding-top: 2px; }
-.ev.ok .i { color: var(--accent); } .ev.warn .i { color: var(--warn); } .ev.error .i { color: var(--err); } .ev.info .i { color: var(--muted); }
-.advice { font-size: 13px; margin: 8px 0 0; padding-left: 18px; color: var(--muted); }
-.advice li { margin-bottom: 4px; }
-svg.spark { width: 100%; height: 40px; display: block; margin-top: 8px; }
-
-/* settings */
-dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); color: var(--text); padding: 20px; width: min(440px, 92vw); }
-dialog::backdrop { background: rgba(0,0,0,.35); }
-dialog label { display: block; font-size: 13px; color: var(--muted); margin: 12px 0 4px; }
-dialog input, dialog textarea { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; background: var(--bg); color: var(--text); font: inherit; }
-dialog textarea { min-height: 70px; }
-dialog .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
-
-/* view switch */
 .seg { display: inline-flex; background: var(--panel2); border: 1px solid var(--line); border-radius: 10px; padding: 2px; }
 .seg button { border: none; background: none; padding: 4px 12px; border-radius: 8px; font-size: 13.5px; font-weight: 560; color: var(--muted); }
 .seg button.on { background: var(--panel); color: var(--text); box-shadow: 0 1px 2px rgba(0,0,0,.08); }
-.lockbtn.on { border-color: var(--accent); color: var(--accent); }
-
-/* dashboard */
-.dash { display: none; grid-column: 1 / -1; overflow-y: auto; min-height: 0; }
-body.view-dash .dash { display: block; }
-body.view-dash main.chat, body.view-dash aside, body.view-dash .tabs { display: none !important; }
-body.view-dash .app { grid-template-rows: 56px minmax(0, 1fr); }
-.dwrap { max-width: 1240px; margin: 0 auto; padding: 22px 22px 60px; }
-.dhead { display: flex; align-items: flex-end; gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
-.dhead h1 { font-size: 22px; letter-spacing: -.02em; margin: 0; font-weight: 680; }
-.dhead .facts { display: flex; gap: 8px; flex-wrap: wrap; }
-.fact { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; font-size: 13px; color: var(--muted); }
-.fact b { color: var(--text); font-variant-numeric: tabular-nums; }
-.dsec { margin-top: 26px; }
-.dsec > .h { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
-.dsec > .h h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0; font-weight: 650; }
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
-.mcard { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 8px; min-width: 0; }
-.mcard .t { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-.mcard .nm { font-weight: 650; font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.mcard .hw { color: var(--muted); font-size: 12.5px; }
-.kvs { display: grid; grid-template-columns: auto 1fr; gap: 3px 10px; font-size: 13px; }
-.kvs .k { color: var(--muted); }
-.kvs .v { font-variant-numeric: tabular-nums; min-width: 0; }
-.est { font-size: 11px; color: var(--muted); border: 1px solid var(--line); border-radius: 5px; padding: 0 4px; margin-left: 4px; }
-.meas { font-size: 11px; color: var(--accent); background: var(--accent-soft); border-radius: 5px; padding: 0 5px; margin-left: 4px; }
-.mem { height: 10px; background: var(--line); border-radius: 99px; overflow: hidden; display: flex; }
-.mem > span { height: 100%; }
-.legend { display: flex; flex-wrap: wrap; gap: 4px 10px; font-size: 12px; color: var(--muted); }
-.legend i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 4px; vertical-align: 0; }
-.roles { font-size: 12.5px; display: flex; flex-direction: column; gap: 2px; }
-.roles .r { display: flex; gap: 6px; } .roles .r b { font-weight: 600; white-space: nowrap; } .roles .r span { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.btn { border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 5px 11px; font-size: 13px; font-weight: 550; }
+.btn { border: 1px solid var(--line); background: var(--panel); border-radius: 9px; padding: 6px 12px; font-size: 13.5px; font-weight: 550; }
 .btn:hover:not(:disabled) { background: var(--panel2); }
 .btn:disabled { opacity: .45; cursor: default; }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 .btn.primary:hover:not(:disabled) { filter: brightness(1.05); background: var(--accent); }
 .btn.danger { color: var(--err); }
-.btn.danger:hover:not(:disabled) { background: var(--err-soft); }
-.acts { display: flex; gap: 6px; margin-top: auto; padding-top: 4px; flex-wrap: wrap; }
-.addcard { border-style: dashed; box-shadow: none; background: transparent; align-items: center; justify-content: center; text-align: center; color: var(--muted); min-height: 150px; cursor: pointer; }
-.addcard:hover { border-color: var(--accent); color: var(--text); }
-.addcard .plus { font-size: 26px; line-height: 1; color: var(--accent); }
-.lockedhint { font-size: 12.5px; color: var(--muted); }
-.progress { font-size: 12.5px; color: var(--muted); }
-.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 9px 16px; border-radius: 10px; font-size: 14px; box-shadow: var(--shadow); z-index: 50; max-width: 92vw; }
-.toast.err { background: var(--err); color: #fff; }
+.btn.small { padding: 2px 8px; font-size: 12.5px; border-radius: 7px; }
+.lock.on { border-color: var(--accent); color: var(--accent); }
+.wrap { max-width: 1240px; margin: 0 auto; padding: 22px 20px 70px; }
+h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 28px 0 10px; font-weight: 620; display: flex; align-items: center; gap: 10px; }
+h2:first-child { margin-top: 0; }
+h2 .grow { flex: 1; }
+.grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px 16px; box-shadow: var(--shadow); min-width: 0; }
+.card.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent) inset; }
+.row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.row.between { justify-content: space-between; }
+.name { font-weight: 640; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sub { color: var(--muted); font-size: 13px; }
+.tiny { color: var(--muted); font-size: 12px; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 9px; border-radius: 999px; font-size: 12.5px; font-weight: 560; background: var(--panel2); color: var(--muted); white-space: nowrap; }
+.pill .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.pill.ready, .pill.good { background: var(--accent-soft); color: var(--accent); }
+.pill.loading, .pill.warn { background: var(--warn-soft); color: var(--warn); }
+.pill.loading .dot { animation: pulse 1s infinite; }
+.pill.failed, .pill.bad { background: var(--err-soft); color: var(--err); }
+.pill.info { background: var(--info-soft); color: var(--info); }
+@keyframes pulse { 50% { opacity: .3; } }
+.bar { height: 6px; background: var(--line); border-radius: 99px; overflow: hidden; margin: 8px 0 4px; display: flex; }
+.bar > div { height: 100%; background: var(--accent); transition: width .4s; }
+.bar > div.b2 { background: var(--info); }
+.bar.warn > div { background: var(--warn); }
+.chips { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 8px; }
+.chip { font-size: 11.5px; font-weight: 560; border-radius: 6px; padding: 1px 7px; background: var(--panel2); color: var(--muted); }
+.chip.ok { background: var(--accent-soft); color: var(--accent); }
+.chip.no { text-decoration: line-through; opacity: .7; }
+.note { border-radius: 12px; padding: 11px 13px; font-size: 13.5px; margin-top: 10px; }
+.note.warn { background: var(--warn-soft); color: var(--text); border: 1px solid color-mix(in srgb, var(--warn) 35%, transparent); }
+.note.bad { background: var(--err-soft); border: 1px solid color-mix(in srgb, var(--err) 35%, transparent); }
+.note.good { background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent); }
+.note.info { background: var(--panel2); border: 1px solid var(--line); }
+.note b.t { display: block; margin-bottom: 3px; }
+.cmd { display: flex; align-items: center; gap: 8px; background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 5px 6px 5px 10px; margin-top: 5px; }
+.cmd code { flex: 1; overflow-x: auto; white-space: nowrap; }
+table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+th { text-align: left; font-weight: 600; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+td { padding: 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+tr:last-child td { border-bottom: none; }
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+label.f { display: block; font-size: 12.5px; color: var(--muted); margin: 10px 0 4px; font-weight: 550; }
+.in { width: 100%; border: 1px solid var(--line); border-radius: 9px; padding: 8px 10px; background: var(--bg); }
+.in:focus { outline: none; border-color: var(--accent); }
+.fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0 12px; }
+details > summary { cursor: pointer; color: var(--muted); font-size: 13px; margin-top: 10px; }
+.events { font-size: 12.5px; max-height: 280px; overflow-y: auto; }
+.ev { display: grid; grid-template-columns: 62px 14px 1fr; gap: 4px; padding: 3px 0; border-bottom: 1px dashed var(--line); }
+.ev .t { color: var(--muted); font: 11.5px var(--mono); padding-top: 2px; }
+.ev.ok .i { color: var(--accent); } .ev.warn .i { color: var(--warn); } .ev.error .i { color: var(--err); } .ev.info .i { color: var(--muted); }
+.log { font: 11.5px/1.45 var(--mono); background: var(--code); border-radius: 8px; padding: 8px 10px; white-space: pre-wrap; max-height: 180px; overflow: auto; margin-top: 6px; }
+.empty { color: var(--muted); font-size: 14px; padding: 18px; text-align: center; border: 1px dashed var(--line); border-radius: 14px; }
+.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--text); color: var(--bg); padding: 9px 16px; border-radius: 10px; font-size: 14px; z-index: 20; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: 90vw; }
+.toast.on { opacity: 1; }
+.consent { display: flex; gap: 9px; align-items: flex-start; margin-top: 10px; font-weight: 560; }
+.consent input { margin-top: 4px; width: 16px; height: 16px; accent-color: var(--warn); }
+.split { display: flex; gap: 4px; height: 26px; border-radius: 8px; overflow: hidden; margin: 10px 0 4px; }
+.split > div { display: grid; place-items: center; font-size: 11.5px; font-weight: 600; color: #fff; min-width: 26px; overflow: hidden; white-space: nowrap; }
 
-/* plan dialog */
-dialog.wide { width: min(880px, 96vw); max-height: 92vh; overflow-y: auto; padding: 22px; }
-.formrow { display: grid; grid-template-columns: 1fr 150px 130px; gap: 10px; align-items: end; }
-dialog select { width: 100%; border: 1px solid var(--line); border-radius: 8px; padding: 7px 9px; background: var(--bg); color: var(--text); font: inherit; }
-.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
-.chip2 { border: 1px solid var(--line); background: var(--panel); border-radius: 99px; padding: 3px 10px; font-size: 12.5px; color: var(--text); }
-.chip2:hover { border-color: var(--accent); }
-.chip2.ok { border-color: var(--accent); color: var(--accent); }
-.chip2.no { color: var(--muted); }
-.wbar { display: flex; height: 46px; border-radius: 12px; overflow: hidden; border: 1px solid var(--line); margin: 6px 0 4px; }
-.wbar > div { display: flex; flex-direction: column; justify-content: center; padding: 0 10px; color: #fff; font-size: 12px; line-height: 1.25; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
-.wbar > div b { font-size: 13px; overflow: hidden; text-overflow: ellipsis; }
-.pgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; margin-top: 12px; }
-.pbox { border: 2px solid var(--line); border-radius: 12px; padding: 10px 12px; font-size: 13px; display: flex; flex-direction: column; gap: 4px; }
-.pbox .nm { font-weight: 650; }
-.verdict { border-radius: 12px; padding: 10px 14px; margin-top: 14px; font-size: 14px; }
-.verdict.ok { background: var(--accent-soft); color: var(--accent); }
-.verdict.no { background: var(--err-soft); color: var(--err); }
-.plansum { font-size: 13.5px; color: var(--muted); margin-top: 6px; }
-.spin { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: rot .8s linear infinite; vertical-align: -2px; margin-right: 6px; }
-@keyframes rot { to { transform: rotate(360deg); } }
-
-@media (max-width: 900px) {
-  .formrow { grid-template-columns: 1fr 1fr; }
-  .formrow > :first-child { grid-column: 1 / -1; }
-  .dwrap { padding: 16px 14px 60px; }
-  .seg button { padding: 4px 9px; }
-  #newChat, #settingsBtn { display: none; }
-  body.view-chat #newChat { display: inline-block; }
-}
-@media (max-width: 900px) {
-  .app { grid-template-columns: 1fr; grid-template-rows: 56px 44px minmax(0, 1fr); }
-  .tabs { display: flex; grid-column: 1; border-bottom: 1px solid var(--line); background: var(--panel); }
-  .tabs button { flex: 1; border: none; background: none; padding: 10px; color: var(--muted); font-weight: 550; border-bottom: 2px solid transparent; }
-  .tabs button.on { color: var(--text); border-bottom-color: var(--accent); }
-  aside { border-left: none; display: none; }
-  body.show-cluster aside { display: block; } body.show-cluster .chat { display: none; }
-  .model { display: none; }
-  .picker select { max-width: 40vw; }
-  header { gap: 8px; padding: 0 12px; }
-  .iconbtn { white-space: nowrap; padding: 6px 8px; }
-  body.multi .brand { font-size: 0; gap: 0; }
-  body.multi #pillText { display: none; }
-  body.multi .pill { padding: 6px; }
+/* chat */
+.chatview { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; height: calc(100vh - 56px); }
+.chatbar { min-width: 0; display: flex; align-items: center; gap: 10px; padding: 10px 20px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.messages { overflow-y: auto; padding: 24px 0 12px; }
+.inner { max-width: 780px; margin: 0 auto; padding: 0 20px; }
+.msg { margin: 0 0 20px; display: flex; flex-direction: column; }
+.msg.user { align-items: flex-end; }
+.msg.user .bubble { background: var(--user); color: var(--user-text); border-radius: 16px 16px 4px 16px; padding: 9px 14px; max-width: 85%; white-space: pre-wrap; word-wrap: break-word; }
+.msg.ai .bubble { max-width: 100%; word-wrap: break-word; }
+.bubble p { margin: 0 0 10px; } .bubble p:last-child { margin-bottom: 0; }
+.bubble pre { background: var(--code); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; overflow-x: auto; font: 13px/1.5 var(--mono); }
+.bubble code { background: var(--code); padding: 1px 5px; border-radius: 5px; }
+.bubble pre code { background: none; padding: 0; }
+.bubble img { max-width: 100%; border-radius: 12px; display: block; margin-top: 6px; }
+.msg.user .bubble img { max-width: 220px; }
+.caret::after { content: "▍"; animation: pulse .9s infinite; color: var(--accent); }
+.composer { padding: 10px 0 18px; }
+.box { display: flex; align-items: flex-end; gap: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; padding: 8px 8px 8px 12px; box-shadow: var(--shadow); }
+.box:focus-within { border-color: var(--accent); }
+.box textarea { flex: 1; border: none; outline: none; resize: none; background: transparent; max-height: 220px; padding: 6px 0; }
+.round { border: none; background: var(--accent); color: #fff; border-radius: 10px; width: 36px; height: 36px; display: grid; place-items: center; flex: none; }
+.round.ghost { background: var(--panel2); color: var(--muted); }
+.round:disabled { opacity: .35; cursor: default; }
+.thumbs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
+.thumbs span { position: relative; }
+.thumbs img { width: 56px; height: 56px; object-fit: cover; border-radius: 8px; border: 1px solid var(--line); }
+.thumbs button { position: absolute; top: -6px; right: -6px; border: none; border-radius: 50%; width: 18px; height: 18px; font-size: 11px; line-height: 18px; padding: 0; background: var(--text); color: var(--bg); }
+.hint { text-align: center; font-size: 12px; color: var(--muted); margin-top: 8px; }
+.welcome { text-align: center; color: var(--muted); padding-top: 10vh; }
+.welcome h1 { color: var(--text); font-size: 24px; letter-spacing: -.02em; margin: 10px 0 6px; }
+dialog { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); color: var(--text); padding: 20px; width: min(440px, 92vw); }
+dialog::backdrop { background: rgba(0,0,0,.35); }
+@media (max-width: 640px) {
+  header { padding: 0 12px; gap: 8px; }
+  .cluster { display: none; }
+  .wrap { padding: 16px 12px 60px; }
+  .grid { grid-template-columns: minmax(0, 1fr); }
+  .hide-sm { display: none; }
+  .card { overflow-x: auto; }
+  td, th { padding: 6px 4px; }
 }
 </style>
 </head>
 <body>
-<div class="app">
-  <header>
-    <div class="brand">
-      <svg viewBox="0 0 32 32"><path d="M16 29c0-9 0-14 6-19M16 20c-2-4-6-6-10-6 1 5 4 8 10 6zM22 10c2-3 5-4 8-4-1 4-4 6-8 4z" fill="none" stroke="#22c55e" stroke-width="2.5" stroke-linecap="round"/></svg>
-      Tendril
-    </div>
-    <div class="picker" id="picker"><select id="modelSel" title="Model"></select></div>
-    <div class="model" id="model">connecting…</div>
-    <div class="spacer"></div>
-    <div class="seg" role="tablist"><button id="vChat" data-view="chat">Chat</button><button id="vDash" data-view="dash">Dashboard</button></div>
-    <span class="pill starting" id="pill"><span class="dot"></span><span id="pillText">Starting</span></span>
-    <button class="iconbtn lockbtn" id="lockBtn" title="Controls need the cluster token">🔒 Unlock</button>
-    <button class="iconbtn" id="newChat" title="New chat">New chat</button>
-    <button class="iconbtn" id="settingsBtn" title="Settings">Settings</button>
-  </header>
-  <nav class="tabs"><button class="on" data-tab="chat">Chat</button><button data-tab="cluster">Cluster</button></nav>
+<header>
+  <div class="brand"><svg viewBox="0 0 32 32"><path d="M16 29c0-9 0-14 6-19M16 20c-2-4-6-6-10-6 1 5 4 8 10 6zM22 10c2-3 5-4 8-4-1 4-4 6-8 4z" fill="none" stroke="#22c55e" stroke-width="2.5" stroke-linecap="round"/></svg>Tendril</div>
+  <span class="cluster" id="cluster"></span>
+  <div class="spacer"></div>
+  <div class="seg"><button id="tab-cluster" class="on">Cluster</button><button id="tab-chat">Chat</button></div>
+  <button class="btn lock" id="lock" title="Controls need the cluster token">🔒 <span class="hide-sm">Unlock</span></button>
+</header>
 
-  <main class="chat">
-    <div class="messages" id="messages"><div class="inner" id="thread"></div></div>
-    <div class="composer"><div class="inner">
-      <div class="box">
-        <textarea id="input" rows="1" placeholder="Message the model…" autofocus></textarea>
-        <button class="send" id="send" title="Send (Enter)" disabled>
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </button>
-      </div>
-      <div class="hint" id="hint">Enter to send · Shift+Enter for a new line</div>
-    </div></div>
-  </main>
+<div id="view-cluster" class="wrap">
+  <h2>Models <span class="grow"></span><button class="btn small" id="add-btn">+ Add model</button></h2>
+  <div id="models"></div>
 
-  <section class="dash" id="dash"><div class="dwrap">
-    <div class="dhead">
-      <div><h1 id="dTitle">Your cluster</h1><div class="sub" id="dSub">Connecting…</div></div>
-      <div class="spacer"></div>
-      <div class="facts" id="dFacts"></div>
-    </div>
-    <div class="dsec"><div class="h"><h2>Models</h2><div class="spacer"></div><button class="btn primary" id="addModelBtn">+ Add a model</button></div>
-      <div class="grid" id="dModels"></div></div>
-    <div class="dsec"><div class="h"><h2>Machines</h2><div class="spacer"></div><span class="lockedhint" id="machHint"></span></div>
-      <div class="grid" id="dMachines"></div></div>
-    <div class="dsec"><div class="h"><h2>Activity</h2><div class="spacer"></div><button class="btn danger" id="stopBtn" title="Stop the server; joined machines unload and exit">Stop cluster</button></div>
-      <div class="card"><div class="events" id="dEvents" style="max-height:340px"></div></div></div>
-  </div></section>
+  <div id="add" hidden>
+    <h2>Add a model · 1. Pick an engine</h2>
+    <div class="grid" id="engines"></div>
+    <div id="engine-panel"></div>
+  </div>
 
-  <aside id="cluster">
-    <div class="section" id="modelsSection" style="display:none"><h3>Models on these machines</h3><div id="modelList"></div></div>
-    <div class="section"><h3 id="statusTitle">Status</h3><div class="card" id="statusCard"><div class="sub">Connecting to the server…</div></div></div>
-    <div class="section"><h3>Throughput</h3>
-      <div class="stats">
-        <div class="stat card"><div class="v" id="sTps">–</div><div class="k">tok/s (last)</div></div>
-        <div class="stat card"><div class="v" id="sReq">0</div><div class="k">requests</div></div>
-        <div class="stat card"><div class="v" id="sTok">0</div><div class="k">tokens out</div></div>
-      </div>
-      <svg class="spark" id="spark" viewBox="0 0 100 40" preserveAspectRatio="none"></svg>
-      <div class="sub" id="cacheLine" style="margin-top:6px"></div>
-    </div>
-    <div class="section"><h3>Pipeline</h3><div id="pipeline"></div></div>
-    <div class="section"><h3>Add a machine</h3>
-      <div class="sub" style="margin-bottom:8px">Run this on any computer on your network:</div>
-      <div class="join"><span id="joinCmd">…</span><button id="copyJoin">Copy</button></div>
-    </div>
-    <div class="section"><h3>Activity</h3><div class="events" id="events"></div></div>
-  </aside>
+  <h2>Machines <span class="grow"></span><button class="btn small" id="detect-btn" title="Look for newly installed engines">Check engines again</button></h2>
+  <div class="grid" id="machines"></div>
+  <div class="note info" style="margin-top:12px">
+    <b class="t">Add a machine</b>
+    Run this on another machine on your network (it needs Tendril and at least one engine):
+    <div class="cmd"><code id="join"></code><button class="btn small" data-copy="#join">Copy</button></div>
+  </div>
+
+  <h2>Activity</h2>
+  <div class="card"><div class="events" id="events"></div></div>
+  <div class="row" style="margin-top:14px"><span class="spacer"></span><button class="btn danger small" id="stop-btn" hidden>Stop cluster</button></div>
 </div>
 
-<dialog id="settings">
-  <div style="font-weight:650;font-size:16px">Settings</div>
-  <label for="sys">System prompt</label>
-  <textarea id="sys" placeholder="You are a helpful assistant."></textarea>
-  <label for="temp">Temperature <span id="tempV"></span></label>
-  <input id="temp" type="range" min="0" max="1.5" step="0.05">
-  <label for="maxTok">Max tokens per reply</label>
-  <input id="maxTok" type="number" min="1" max="32768">
-  <div class="row"><button class="iconbtn" id="closeSettings">Done</button></div>
-</dialog>
-
-<dialog id="unlockDlg">
-  <div style="font-weight:650;font-size:16px">Unlock controls</div>
-  <div class="sub" style="margin-top:6px">Loading models, removing machines and stopping the cluster need the cluster token — the one <code>tendril serve</code> printed (also in <code>tendril join --token …</code>).</div>
-  <label for="tokIn">Cluster token</label>
-  <input id="tokIn" autocomplete="off" spellcheck="false" placeholder="XXXX-XXXX-XXXX-XXXX">
-  <div class="error" id="tokErr" style="display:none;margin-top:10px"></div>
-  <div class="row"><button class="btn" id="tokCancel">Cancel</button><button class="btn primary" id="tokOk">Unlock</button></div>
-</dialog>
-
-<dialog id="planDlg" class="wide">
-  <div style="display:flex;align-items:center;gap:10px"><div style="font-weight:680;font-size:18px">Add a model</div><div class="spacer"></div><button class="btn" id="planClose">Close</button></div>
-  <div class="sub" style="margin-top:4px">Tendril plans it across your machines first: which machine gets which layers and how much of the weights. Each machine then downloads only its own share.</div>
-  <div class="formrow" style="margin-top:12px">
-    <div><label for="pmModel">Model — HuggingFace id or a catalog name</label><input id="pmModel" autocomplete="off" spellcheck="false" placeholder="Qwen/Qwen2.5-7B-Instruct"></div>
-    <div><label for="pmFmt">Weights</label><select id="pmFmt"><option value="">server default</option><option value="native">native (bf16)</option><option value="q8_0">q8_0 · ~half</option><option value="q6_k">q6_k</option><option value="q4_k">q4_k · ~quarter</option></select></div>
-    <div><label for="pmCtx">Context</label><select id="pmCtx"><option value="">server default</option><option value="4096">4k</option><option value="8192">8k</option><option value="16384">16k</option><option value="32768">32k</option><option value="131072">128k</option></select></div>
+<div id="view-chat" class="chatview" hidden>
+  <div class="chatbar">
+    <select class="in" id="chat-model" style="width:auto;max-width:60vw"></select>
+    <span class="pill" id="chat-kind"></span>
+    <span class="spacer"></span>
+    <select class="in" id="img-size" style="width:auto" hidden><option>512x512</option><option>768x768</option><option selected>1024x1024</option><option>1024x768</option><option>768x1024</option></select>
+    <button class="btn small" id="clear-chat">New chat</button>
   </div>
-  <div class="chips" id="pmSugg"></div>
-  <div class="row" style="justify-content:flex-start"><button class="btn primary" id="pmPlan">Plan it</button></div>
-  <div id="pmOut"></div>
+  <div class="messages" id="messages"><div class="inner" id="thread"></div></div>
+  <div class="composer"><div class="inner">
+    <div class="thumbs" id="thumbs"></div>
+    <div class="box">
+      <button class="round ghost" id="attach" title="Attach an image" hidden>📎</button>
+      <input type="file" id="file" hidden>
+      <textarea id="input" rows="1" placeholder="Message…"></textarea>
+      <button class="round" id="send" title="Send">↑</button>
+    </div>
+    <div class="hint" id="hint"></div>
+  </div></div>
+</div>
+
+<dialog id="unlock">
+  <b>Unlock controls</b>
+  <p class="sub">Loading and unloading models, removing machines and stopping the cluster need the cluster token that <code>tendril serve</code> prints.</p>
+  <input class="in" id="token-in" placeholder="XXXX-XXXX-XXXX-XXXX" autocomplete="off">
+  <div class="row" style="justify-content:flex-end;margin-top:14px"><button class="btn" id="unlock-cancel">Cancel</button><button class="btn primary" id="unlock-ok">Unlock</button></div>
+  <div class="sub" id="unlock-err" style="color:var(--err)"></div>
 </dialog>
+<div class="toast" id="toast"></div>
 
 <script>
-const $ = (id) => document.getElementById(id);
-const store = { get(k, d) { try { const v = localStorage.getItem('tendril.' + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
-                set(k, v) { try { localStorage.setItem('tendril.' + k, JSON.stringify(v)); } catch {} } };
-let settings = Object.assign({ system: '', temperature: 0.7, maxTokens: 1024 }, store.get('settings', {}));
-let history = store.get('history', []);
-let selected = store.get('model', null);
-const short = (m) => (m || '').split('/').pop();
-const multi = () => (lastStatus?.models?.length || 0) > 1;
-let busy = false, controller = null, lastStatus = null, ready = false;
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const fmtB = b => { b = Number(b || 0); const u = ["B","KiB","MiB","GiB","TiB"]; let i = 0; while (b >= 1024 && i < 4) { b /= 1024; i++; } return (i ? b.toFixed(b < 10 ? 2 : 1) : b) + " " + u[i]; };
+const store = { get(k) { try { return localStorage.getItem(k); } catch { return null; } }, set(k, v) { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} } };
+const S = { st: null, token: store.get("tendril-token"), engine: null, plan: null, planReq: null, trusted: false, busy: false,
+  chat: { model: store.get("tendril-chat-model"), thread: [], images: [], abort: null } };
+const TASK = { chat: "Chat", image_generation: "Images", transcription: "Speech → text" };
+const COLORS = ["#16a34a", "#2563eb", "#9333ea", "#ea580c", "#0891b2", "#db2777", "#65a30d", "#ca8a04"];
 
-function esc(s) { return s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
-function fmtBytes(b) { if (!b) return '0'; const u = ['B','KiB','MiB','GiB','TiB']; let i = 0; while (b >= 1024 && i < 4) { b /= 1024; i++; } return (b >= 100 ? b.toFixed(0) : b >= 10 ? b.toFixed(1) : b.toFixed(2)) + ' ' + u[i]; }
-function fmtParams(n) { return n >= 1e9 ? (n / 1e9).toFixed(n >= 1e10 ? 0 : 1) + 'B' : n >= 1e6 ? Math.round(n / 1e6) + 'M' : Math.round(n / 1e3) + 'K'; }
-function shortChip(c) { return c.replace(/\((R|TM)\)/g, '').replace(/NVIDIA GeForce |NVIDIA |Apple /, '').replace(/ (CPU|Processor)\b.*$/, '').replace(/\s+/g, ' ').trim(); }
-function fmtMs(ms) { if (ms == null) return '–'; if (ms >= 1000) return (ms/1000).toFixed(2) + ' s'; if (ms >= 1) return ms.toFixed(ms < 10 ? 1 : 0) + ' ms'; return Math.round(ms*1000) + ' µs'; }
+function toast(t) { const e = $("#toast"); e.textContent = t; e.classList.add("on"); clearTimeout(e._t); e._t = setTimeout(() => e.classList.remove("on"), 3200); }
+async function api(path, body, method) {
+  const opt = { method: method || (body === undefined ? "GET" : "POST"), headers: {} };
+  if (body !== undefined) { opt.headers["content-type"] = "application/json"; opt.body = JSON.stringify(body); }
+  if (S.token) opt.headers.authorization = "Bearer " + S.token;
+  const r = await fetch(path, opt);
+  if (r.status === 204 || r.status === 202) return {};
+  const v = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error(v.error?.message || r.statusText); e.kind = v.error?.type; e.status = r.status; throw e; }
+  return v;
+}
+document.addEventListener("click", e => {
+  const c = e.target.closest("[data-copy]");
+  if (c) { const t = c.dataset.copy.startsWith("#") ? $(c.dataset.copy).textContent : c.dataset.copy; navigator.clipboard?.writeText(t).then(() => toast("Copied")); }
+});
 
-// Tiny, safe markdown: code fences, inline code, bold/italic, headings, lists, paragraphs.
-function md(src) {
-  const parts = src.split(/```/);
-  let html = '';
-  parts.forEach((p, i) => {
-    if (i % 2 === 1) {
-      const nl = p.indexOf('\n'); const body = nl >= 0 ? p.slice(nl + 1) : p;
-      html += '<pre><code>' + esc(body.replace(/\n$/, '')) + '</code></pre>';
-      return;
-    }
-    const blocks = p.split(/\n{2,}/);
-    for (const b of blocks) {
-      if (!b.trim()) continue;
-      const lines = b.split('\n');
-      const inline = (t) => esc(t).replace(/`([^`]+)`/g, '<code>$1</code>').replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>').replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
-      if (lines.every(l => /^\s*([-*•]|\d+\.)\s+/.test(l))) {
-        const ordered = /^\s*\d+\./.test(lines[0]);
-        html += (ordered ? '<ol>' : '<ul>') + lines.map(l => '<li>' + inline(l.replace(/^\s*([-*•]|\d+\.)\s+/, '')) + '</li>').join('') + (ordered ? '</ol>' : '</ul>');
-      } else if (/^#{1,3}\s/.test(lines[0]) && lines.length === 1) {
-        html += '<h3>' + inline(lines[0].replace(/^#+\s/, '')) + '</h3>';
-      } else {
-        html += '<p>' + lines.map(inline).join('<br>') + '</p>';
-      }
-    }
-  });
-  return html;
+// ---- views -------------------------------------------------------------
+function setView(v) {
+  $("#tab-cluster").classList.toggle("on", v === "cluster"); $("#tab-chat").classList.toggle("on", v === "chat");
+  $("#view-cluster").hidden = v !== "cluster"; $("#view-chat").hidden = v !== "chat";
+  store.set("tendril-view", v); if (v === "chat") renderChatBar();
+}
+$("#tab-cluster").onclick = () => setView("cluster");
+$("#tab-chat").onclick = () => setView("chat");
+
+// ---- token -------------------------------------------------------------
+function renderLock() {
+  const on = !!S.token; $("#lock").classList.toggle("on", on);
+  $("#lock").innerHTML = on ? "🔓 <span class='hide-sm'>Unlocked</span>" : "🔒 <span class='hide-sm'>Unlock</span>";
+  $("#stop-btn").hidden = !on;
+}
+$("#lock").onclick = () => {
+  if (S.token) { S.token = null; store.set("tendril-token", null); renderLock(); render(); toast("Locked"); return; }
+  $("#unlock-err").textContent = ""; $("#token-in").value = ""; $("#unlock").showModal(); $("#token-in").focus();
+};
+$("#unlock-cancel").onclick = () => $("#unlock").close();
+$("#unlock-ok").onclick = async () => {
+  const t = $("#token-in").value.trim();
+  const r = await fetch("/api/auth", { headers: { authorization: "Bearer " + t } });
+  if (r.status === 204) { S.token = t; store.set("tendril-token", t); $("#unlock").close(); renderLock(); render(); toast("Controls unlocked"); }
+  else $("#unlock-err").textContent = "That's not this cluster's token.";
+};
+$("#token-in").onkeydown = e => { if (e.key === "Enter") $("#unlock-ok").click(); };
+function needToken() { if (!S.token) { $("#lock").click(); return true; } return false; }
+
+// ---- status ------------------------------------------------------------
+async function refresh() {
+  try { S.st = await api("/api/status"); render(); } catch (e) { $("#cluster").textContent = "server unreachable"; }
+}
+function readyOn(engineId) {
+  const ms = S.st?.machines || [];
+  return { ready: ms.filter(m => (m.engines || []).some(d => d.engine === engineId && d.ready)), total: ms.length };
+}
+function render() {
+  const st = S.st; if (!st) return;
+  $("#cluster").textContent = `cluster ${st.cluster} · ${st.machines.length} machine${st.machines.length === 1 ? "" : "s"} · v${st.version}`;
+  $("#join").textContent = st.join || "";
+  renderModels(); renderMachines(); renderEvents();
+  if (!$("#add").hidden) renderEngines();
+  if (!$("#view-chat").hidden) renderChatBar();
 }
 
-function emptyLine() {
-  const s = lastStatus, n = s?.nodes?.length || 1, machines = `${n} machine${n === 1 ? '' : 's'}`;
-  if (s && !s.model) return `No model loaded yet. <a href="#" onclick="setView('dash');return false">Open the dashboard</a> to pick one — Tendril plans it across your machines first.`;
-  if (!multi()) return `Running <b>${esc(s?.model || 'a model')}</b> across ${machines} on your network.`;
-  const others = s.models.filter(m => m.id !== s.model).map(m => esc(short(m.id)));
-  const st = s.status?.state;
-  const head = st === 'ready' ? `Chatting with <b>${esc(short(s.model))}</b>` : `<b>${esc(short(s.model))}</b> is ${esc((pillLabel[st] || st || '').toLowerCase())}`;
-  return `${head} · sharing ${machines} with ${others.join(', ')}. Switch models any time from the menu above.`;
-}
+function statusPill(s) { return `<span class="pill ${s === "ready" ? "ready" : s === "failed" ? "failed" : "loading"}"><span class="dot"></span>${esc(s)}</span>`; }
 
-function renderThread() {
-  const t = $('thread');
-  if (!history.length) {
-    t.innerHTML = `<div class="empty">
-      <svg width="44" height="44" viewBox="0 0 32 32"><path d="M16 29c0-9 0-14 6-19M16 20c-2-4-6-6-10-6 1 5 4 8 10 6zM22 10c2-3 5-4 8-4-1 4-4 6-8 4z" fill="none" stroke="#22c55e" stroke-width="2.5" stroke-linecap="round"/></svg>
-      <h1>What can I help with?</h1>
-      <div>${emptyLine()}</div>
-      <div class="sugg">
-        <button>Explain pipeline parallelism simply</button>
-        <button>Write a haiku about distributed computing</button>
-        <button>Give me 3 ideas for a weekend project</button>
+function renderModels() {
+  const deps = S.st.deployments;
+  if (!deps.length) { $("#models").innerHTML = `<div class="empty">No model loaded yet. ${S.token ? "Press <b>+ Add model</b>." : "Unlock with the cluster token, then add one."}</div>`; return; }
+  $("#models").innerHTML = `<div class="grid">${deps.map(d => {
+    const roles = d.roles.map(r => {
+      const pct = r.total ? Math.round(100 * r.done / r.total) : null;
+      return `<div style="margin-top:8px"><div class="row between"><span class="sub"><b style="color:var(--text)">${esc(r.machine_name)}</b> · ${esc(r.id)}${r.serves_api ? " ★" : ""}</span><span class="tiny">${esc(r.state)}${pct !== null ? " " + pct + "%" : ""}</span></div>
+        ${pct !== null && r.state !== "ready" ? `<div class="bar"><div style="width:${pct}%"></div></div><div class="tiny">${esc(r.detail)} · ${fmtB(r.done)} of ${fmtB(r.total)}</div>` : r.detail ? `<div class="tiny">${esc(r.detail)}</div>` : ""}
+        ${r.log && r.log.length ? `<details><summary>engine output</summary><div class="log">${esc(r.log.join("\n"))}</div></details>` : ""}</div>`;
+    }).join("");
+    const p = d.plan;
+    return `<div class="card">
+      <div class="row between"><span class="name" title="${esc(d.name)}">${esc(d.name)}</span>${statusPill(d.status)}</div>
+      <div class="sub">${esc(d.engine_name)} · ${TASK[d.task] || d.task}${d.vision ? " · sees images" : ""} · ${p.stages.length} machine${p.stages.length === 1 ? "" : "s"}${p.tokens_per_sec ? ` · ~${p.tokens_per_sec.toFixed(1)} tok/s` : ""}</div>
+      ${d.reason ? `<div class="note bad">${esc(d.reason)}</div>` : ""}
+      ${roles}
+      <div class="row" style="margin-top:12px">
+        ${d.status === "ready" ? `<button class="btn small" data-chat="${esc(d.name)}">${d.task === "chat" ? "Chat" : d.task === "image_generation" ? "Generate" : "Transcribe"}</button>` : ""}
+        <span class="spacer"></span>
+        ${S.token ? `<button class="btn small danger" data-unload="${esc(d.name)}">${d.status === "failed" ? "Remove" : "Unload"}</button>` : ""}
       </div></div>`;
-    t.querySelectorAll('.sugg button').forEach(b => b.onclick = () => { $('input').value = b.textContent; send(); });
+  }).join("")}</div>`;
+  document.querySelectorAll("[data-unload]").forEach(b => b.onclick = async () => {
+    try { await api("/api/models/unload", { model: b.dataset.unload }); toast("Unloaded " + b.dataset.unload); refresh(); } catch (e) { toast(e.message); }
+  });
+  document.querySelectorAll("[data-chat]").forEach(b => b.onclick = () => { S.chat.model = b.dataset.chat; store.set("tendril-chat-model", S.chat.model); S.chat.thread = []; renderThread(); setView("chat"); });
+}
+
+function renderMachines() {
+  const ms = S.st.machines;
+  if (!ms.length) { $("#machines").innerHTML = `<div class="empty">No machines yet.</div>`; return; }
+  $("#machines").innerHTML = ms.map(m => {
+    const used = m.usable_memory - m.free_memory;
+    const ready = (m.engines || []).filter(d => d.ready);
+    return `<div class="card">
+      <div class="row between"><span class="name">${esc(m.name)}${m.local ? ` <span class="pill info">server</span>` : ""}</span>
+        ${S.token && !m.local ? `<button class="btn small danger" data-remove="${esc(m.key)}" title="Send this machine away">Remove</button>` : `<span class="tiny">${m.rtt_ms != null ? m.rtt_ms.toFixed(1) + " ms" : ""}</span>`}</div>
+      <div class="sub">${esc(m.chip)} · ${esc(m.backend)}${m.gpu_cores ? ` · ${m.gpu_cores} GPU cores` : ""} · ${m.cpu_cores} CPU cores</div>
+      <div class="bar"><div style="width:${100 * used / Math.max(1, m.usable_memory)}%"></div></div>
+      <div class="tiny">${fmtB(used)} promised to models · ${fmtB(m.free_memory)} free of ${fmtB(m.usable_memory)} usable</div>
+      <div class="tiny">~${m.bandwidth_gbs.toFixed(0)} GB/s memory${m.measured ? " (measured)" : ""} · ~${m.tflops.toFixed(2)} TFLOP/s${m.on_battery ? " · on battery" : ""}</div>
+      <div class="chips">${(m.engines || []).map(d => `<span class="chip ${d.ready ? "ok" : "no"}" title="${esc(d.ready ? (d.version || "installed") + " · " + (d.accelerators || []).join("+") : "not installed")}">${esc(engineName(d.engine))}</span>`).join("")}</div>
+      ${!ready.length ? `<div class="note warn">No engine installed here, so it can't run models yet. Pick an engine under <b>Add model</b> to see what to install.</div>` : ""}
+      ${m.roles.length ? `<div class="tiny" style="margin-top:8px">Running: ${m.roles.map(r => esc(r[0].split("/").pop()) + " (" + esc(r[1]) + ", " + esc(r[2]) + ")").join(", ")}</div>` : ""}
+    </div>`;
+  }).join("");
+  document.querySelectorAll("[data-remove]").forEach(b => b.onclick = async () => {
+    if (!confirm("Remove this machine? Its models stop and it leaves the cluster.")) return;
+    try { await api("/api/machines/remove", { machine: b.dataset.remove }); refresh(); } catch (e) { toast(e.message); }
+  });
+}
+
+function engineName(id) { return (S.st?.engines || []).find(e => e.id === id)?.name || id; }
+
+function renderEvents() {
+  const ev = S.st.events.slice(-80).reverse();
+  $("#events").innerHTML = ev.map(e => `<div class="ev ${esc(e.level)}"><span class="t">${esc(e.at)}</span><span class="i">${e.level === "ok" ? "✓" : e.level === "warn" ? "!" : e.level === "error" ? "✗" : "·"}</span><span>${e.model ? `<b>${esc(e.model.split("/").pop())}</b> ` : ""}${esc(e.text)}</span></div>`).join("") || `<div class="tiny">Nothing yet.</div>`;
+}
+
+$("#add-btn").onclick = () => { if (needToken()) return; $("#add").hidden = !$("#add").hidden; $("#add-btn").textContent = $("#add").hidden ? "+ Add model" : "Close"; render(); };
+$("#detect-btn").onclick = async () => { if (needToken()) return; try { await api("/api/machines/detect", {}); toast("Looking for engines on every machine…"); setTimeout(refresh, 2500); setTimeout(refresh, 8000); } catch (e) { toast(e.message); } };
+$("#stop-btn").onclick = async () => { if (!confirm("Stop the whole cluster? Every model stops and joined machines exit.")) return; try { await api("/api/stop", {}); toast("Stopping…"); } catch (e) { toast(e.message); } };
+
+// ---- add model: engines --------------------------------------------------
+function securityBadge(e) {
+  if (e.multi_machine === "single") return `<span class="pill">one machine per model</span>`;
+  const k = e.security.kind;
+  if (k === "tendril_tunnel") return `<span class="pill good" title="${esc(e.security.what)}">🔒 split traffic encrypted by Tendril</span>`;
+  if (k === "engine_encrypted") return `<span class="pill good">🔒 engine encrypts its traffic</span>`;
+  if (k === "trusted_network_only") return `<span class="pill warn" title="${esc(e.security.risk)}">⚠ splits only on a trusted network</span>`;
+  return "";
+}
+function splitLabel(m) { return { single: "one machine", layers: "splits layers across any machines", homogeneous: "splits across identical GPU machines", engine_managed: "forms its own cluster" }[m] || m; }
+function renderEngines() {
+  const es = S.st.engines;
+  $("#engines").innerHTML = es.map(e => {
+    const r = readyOn(e.id);
+    return `<div class="card ${S.engine === e.id ? "sel" : ""}" data-engine="${esc(e.id)}" style="cursor:pointer">
+      <div class="row between"><span class="name">${esc(e.name)}</span><span class="pill ${r.ready.length ? "ready" : "bad"}">${r.ready.length ? `ready on ${r.ready.length}/${r.total}` : "not installed"}</span></div>
+      <div class="sub" style="margin:4px 0 8px">${esc(e.summary)}</div>
+      <div class="row">${e.tasks.map(t => `<span class="pill info">${TASK[t] || t}</span>`).join("")}${e.inputs.includes("image") && e.tasks.includes("chat") ? `<span class="pill info">image input</span>` : ""}${securityBadge(e)}</div>
+      <div class="tiny" style="margin-top:6px">${esc(e.platforms)} · ${splitLabel(e.multi_machine)}</div></div>`;
+  }).join("");
+  document.querySelectorAll("[data-engine]").forEach(c => c.onclick = () => { if (S.engine !== c.dataset.engine) { S.engine = c.dataset.engine; S.plan = null; S.trusted = false; } renderEngines(); });
+  renderEnginePanel();
+}
+function renderEnginePanel() {
+  const p = $("#engine-panel");
+  const e = S.st.engines.find(x => x.id === S.engine);
+  if (!e) { p.innerHTML = ""; p.dataset.engine = ""; return; }
+  const ms = S.st.machines;
+  const r = readyOn(e.id);
+  const rows = ms.map(m => {
+    const d = (m.engines || []).find(x => x.engine === e.id) || { ready: false, missing: e.requirements.map(q => ({ name: q.name, why: q.why, install: null })) };
+    const missing = (d.missing || []).map(x => `<div style="margin-top:6px"><b>${esc(x.name)}</b> <span class="sub">— ${esc(x.why)}</span>${x.install ? `<div class="cmd"><code>${esc(x.install)}</code><button class="btn small" data-copy="${esc(x.install)}">Copy</button></div>` : ""}</div>`).join("");
+    return `<tr><td><b>${esc(m.name)}</b><div class="tiny">${esc(m.os)} · ${esc(m.backend)}</div></td>
+      <td>${d.ready ? `<span class="pill ready">✓ ready</span> <span class="tiny">${esc(d.version || "")}${(d.accelerators || []).length ? " · " + esc(d.accelerators.join("+")) : ""}</span>` : `<span class="pill bad">✗ missing</span>`}
+      ${d.ready && d.missing?.length ? `<div class="tiny" style="margin-top:6px">Optional:</div>` : ""}${missing}
+      ${(d.notes || []).map(n => `<div class="tiny" style="margin-top:4px">${esc(n)}</div>`).join("")}</td></tr>`;
+  }).join("");
+  const status = `${!r.ready.length ? `<div class="note bad"><b class="t">${esc(e.name)} isn't installed on any machine yet.</b>Install it on at least one machine with the commands below, then press <b>Check again</b>. Machines without it are left out of the plan.</div>`
+      : r.ready.length < r.total ? `<div class="note warn"><b class="t">${esc(e.name)} is ready on ${r.ready.length} of ${r.total} machines.</b>The others are left out of the plan until it's installed there.</div>` : ""}
+    ${e.security.kind === "trusted_network_only" ? `<div class="note warn"><b class="t">⚠ Splitting a model across machines needs a trusted network</b>${esc(e.security.what)} ${esc(e.security.risk)}</div>` : ""}
+    ${e.security.kind === "tendril_tunnel" ? `<div class="note good"><b class="t">🔒 Encrypted by Tendril</b>${esc(e.security.what)}</div>` : ""}
+    <div class="card" style="margin-top:10px"><table><tr><th style="width:28%">Machine</th><th>${esc(e.name)}</th></tr>${rows}</table>
+      <div class="row" style="margin-top:10px"><button class="btn small" id="recheck">Check again</button><span class="tiny">after installing, or set <code>TENDRIL_&lt;PROGRAM&gt;</code> to a program's path</span></div></div>`;
+  // Refreshes only update the machine status, so typing isn't interrupted.
+  if (p.dataset.engine === e.id) {
+    $("#engine-status").innerHTML = status;
+    $("#recheck").onclick = () => $("#detect-btn").click();
+    $("#plan-btn").disabled = !r.ready.length;
     return;
   }
-  t.innerHTML = '';
-  history.forEach((m, i) => t.appendChild(msgEl(m, i)));
-  scrollDown(true);
+  p.dataset.engine = e.id;
+  p.innerHTML = `<h2>2. ${esc(e.name)}: what each machine needs</h2><div id="engine-status">${status}</div>
+    <h2>3. The model</h2>
+    <div class="card">
+      <label class="f" for="m-model">Model</label>
+      <input class="in" id="m-model" placeholder="${esc(e.example_model)}">
+      <div class="tiny" style="margin-top:4px">${esc(e.model_hint)} · e.g. <a href="#" id="m-example">${esc(e.example_model)}</a></div>
+      <details><summary>Options</summary><div class="fields">
+        <div><label class="f">Quantization</label><input class="in" id="m-quant" placeholder="engine default"></div>
+        <div><label class="f">Context (tokens)</label><input class="in" id="m-ctx" type="number" placeholder="8192"></div>
+        <div><label class="f">Conversations at once</label><input class="in" id="m-conc" type="number" placeholder="${e.tasks[0] === "chat" ? 4 : 1}"></div>
+        ${e.multi_machine !== "single" ? `<div><label class="f">At least N machines</label><input class="in" id="m-min" type="number" placeholder="1"></div>` : ""}
+      </div></details>
+      <div class="row" style="margin-top:12px"><button class="btn primary" id="plan-btn" ${r.ready.length ? "" : "disabled"}>Show the plan</button><span class="tiny">Nothing is downloaded until you confirm.</span></div>
+    </div>
+    <div id="plan"></div>`;
+  $("#recheck").onclick = () => $("#detect-btn").click();
+  $("#m-example").onclick = ev => { ev.preventDefault(); $("#m-model").value = e.example_model; };
+  $("#plan-btn").onclick = () => doPlan();
+  $("#m-model").onkeydown = ev => { if (ev.key === "Enter") doPlan(); };
+  renderPlan();
 }
-
-function msgEl(m, i) {
-  const el = document.createElement('div');
-  el.className = 'msg ' + (m.role === 'user' ? 'user' : 'ai');
-  const b = document.createElement('div');
-  b.className = 'bubble';
-  if (m.role === 'user') b.textContent = m.content; else b.innerHTML = m.error ? `<div class="error">${esc(m.error)}</div>` : md(m.content || '');
-  el.appendChild(b);
-  if (m.role !== 'user' && (m.stats || m.content)) {
-    const meta = document.createElement('div');
-    meta.className = 'meta';
-    if (m.stats) meta.innerHTML = `<span>${m.model && multi() ? `<b>${esc(short(m.model))}</b> · ` : ''}${m.stats.tokens} tokens · ${m.stats.tps.toFixed(1)} tok/s · first token ${fmtMs(m.stats.ttft)}${m.stats.cached ? ` · ${m.stats.cached} prompt tokens from cache` : ''}</span>`;
-    const copy = document.createElement('button'); copy.textContent = 'Copy';
-    copy.onclick = () => { navigator.clipboard?.writeText(m.content); copy.textContent = 'Copied'; setTimeout(() => copy.textContent = 'Copy', 1200); };
-    meta.appendChild(copy);
-    if (i === history.length - 1) {
-      const re = document.createElement('button'); re.textContent = 'Regenerate';
-      re.onclick = () => { if (busy) return; history.pop(); save(); renderThread(); generate(); };
-      meta.appendChild(re);
-    }
-    el.appendChild(meta);
-  }
-  return el;
+function planRequest() {
+  const n = id => { const v = parseInt($(id)?.value); return isNaN(v) ? undefined : v; };
+  const req = { engine: S.engine, model: ($("#m-model").value || $("#m-model").placeholder).trim() };
+  const q = $("#m-quant").value.trim(); if (q) req.quantize = q;
+  if (n("#m-ctx")) req.context = n("#m-ctx");
+  if (n("#m-conc")) req.concurrency = n("#m-conc");
+  if ($("#m-min") && n("#m-min")) req.min_machines = n("#m-min");
+  return req;
 }
-
-function scrollDown(force) {
-  const box = $('messages');
-  if (force || box.scrollHeight - box.scrollTop - box.clientHeight < 160) box.scrollTop = box.scrollHeight;
+async function doPlan() {
+  if (needToken()) return;
+  const req = planRequest(); S.planReq = req; S.trusted = false;
+  $("#plan").innerHTML = `<div class="card" style="margin-top:12px"><span class="sub">Looking at ${esc(req.model)} and the machines…</span></div>`;
+  try { S.plan = await api("/api/plan", req); } catch (e) { S.plan = { error: e.message }; }
+  renderPlan();
 }
-function save() { store.set('history', history.slice(-100)); }
-
-function setBusy(v) {
-  busy = v;
-  const s = $('send');
-  s.classList.toggle('stop', v);
-  s.innerHTML = v ? '<svg width="12" height="12" viewBox="0 0 12 12"><rect width="12" height="12" rx="2" fill="currentColor"/></svg>'
-                  : '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 13V3M3.5 7.5 8 3l4.5 4.5" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-  updateSend();
-}
-function updateSend() { $('send').disabled = !busy && (!$('input').value.trim() || !ready); }
-
-async function send() {
-  if (busy) { controller?.abort(); return; }
-  const text = $('input').value.trim();
-  if (!text || !ready) return;
-  $('input').value = ''; autosize();
-  history.push({ role: 'user', content: text });
-  save(); renderThread();
-  await generate();
-}
-
-async function generate() {
-  const msgs = [];
-  if (settings.system.trim()) msgs.push({ role: 'system', content: settings.system });
-  history.forEach(m => { if (!m.error) msgs.push({ role: m.role, content: m.content }); });
-  const reply = { role: 'assistant', content: '', model: lastStatus?.model };
-  history.push(reply);
-  const el = msgEl(reply, history.length - 1);
-  $('thread').appendChild(el);
-  const bubble = el.querySelector('.bubble');
-  bubble.classList.add('caret');
-  scrollDown(true);
-  setBusy(true);
-  controller = new AbortController();
-  const t0 = performance.now(); let first = null, pending = false;
-  try {
-    const r = await fetch('/v1/chat/completions', { method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
-      body: JSON.stringify({ model: lastStatus?.model || 'tendril', messages: msgs, stream: true, temperature: settings.temperature, max_tokens: settings.maxTokens, stream_options: { include_usage: true } }) });
-    if (!r.ok) { const j = await r.json().catch(() => ({})); throw new Error(j?.error?.message || ('HTTP ' + r.status)); }
-    const reader = r.body.getReader(); const dec = new TextDecoder(); let buf = '';
-    while (true) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let idx;
-      while ((idx = buf.indexOf('\n\n')) >= 0) {
-        const chunk = buf.slice(0, idx); buf = buf.slice(idx + 2);
-        for (const line of chunk.split('\n')) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6);
-          if (data === '[DONE]') continue;
-          const j = JSON.parse(data);
-          if (j.error) throw new Error(j.error.message);
-          const d = j.choices?.[0]?.delta?.content;
-          if (d) {
-            if (first === null) first = performance.now() - t0;
-            reply.content += d;
-            if (!pending) { pending = true; requestAnimationFrame(() => { bubble.innerHTML = md(reply.content); pending = false; scrollDown(); }); }
-          }
-          if (j.usage) reply.stats = { tokens: j.usage.completion_tokens, tps: j.tendril?.decode_tokens_per_sec || 0, ttft: j.tendril?.ttft_ms ?? first, cached: j.usage.prompt_tokens_details?.cached_tokens || 0 };
-        }
-      }
-    }
-  } catch (e) {
-    if (e.name !== 'AbortError') reply.error = e.message;
-  }
-  setBusy(false);
-  save();
-  const idx = history.indexOf(reply);
-  el.replaceWith(msgEl(reply, idx));
-  scrollDown();
-}
-
-// ---- cluster panel --------------------------------------------------------
-const pillLabel = { ready: 'Ready', loading: 'Loading', waiting: 'Waiting for machines', starting: 'Starting', failed: 'Failed', empty: 'No model' };
-function renderStatus(s) {
-  lastStatus = s;
-  const st = s.status || {};
-  const state = st.state || 'starting';
-  ready = state === 'ready';
-  $('pill').className = 'pill ' + (state === 'empty' ? 'nomodel' : state); $('pillText').textContent = pillLabel[state] || state;
-  renderModels(s);
-  $('input').placeholder = multi() ? `Message ${short(s.model)}…` : 'Message the model…';
-  $('model').textContent = !s.model ? 'No model yet — add one in the dashboard'
-    : `${multi() ? '' : s.model + ' · '}${s.architecture} · ${fmtParams(s.params)} params · ${s.format === 'native' ? 'full precision' : s.format} · ${s.context.toLocaleString()} ctx`;
-  $('joinCmd').textContent = s.join;
-  $('hint').textContent = ready ? 'Enter to send · Shift+Enter for a new line' : (state === 'loading' ? 'The model is loading — this takes a moment the first time.' : state === 'waiting' ? 'Waiting for enough machines to run this model.' : 'Starting…');
-  updateSend();
-
-  let card = '';
-  if (state === 'ready') {
-    const m = s.metrics.recent.slice(-1)[0];
-    card = `<div class="big">${st.predicted_tps.toFixed(1)} <span class="sub">tok/s predicted</span></div>
-      <div class="sub">${esc(st.plan)}${m ? ` · last reply ${m.decode_tps.toFixed(1)} tok/s, first token ${fmtMs(m.ttft_ms)}` : ''}</div>`;
-  } else if (state === 'waiting') {
-    card = `<div style="font-weight:600">${!s.model ? 'No model chosen yet' : multi() ? 'Waiting for room in the pool' : 'Not enough memory yet'}</div><div class="sub">${esc(st.reason)}</div>
-      ${st.advice?.length ? '<ul class="advice">' + st.advice.slice(0, 3).map(a => '<li>' + esc(a) + '</li>').join('') + '</ul>' : ''}`;
-  } else if (state === 'loading') {
-    card = `<div style="font-weight:600">Loading ${esc(st.plan)}</div>` + st.stages.map(g => {
-      const pct = g.total ? Math.round(g.done / g.total * 100) : (g.phase === 'ready' ? 100 : 0);
-      return `<div class="sub" style="margin-top:8px">${esc(g.node)} — ${esc(g.phase)}${g.total && (g.phase === 'sending' || g.phase === 'downloading') ? ` ${fmtBytes(g.done)} / ${fmtBytes(g.total)}` : ''}</div><div class="bar"><div style="width:${pct}%"></div></div>`;
-    }).join('');
-  } else if (state === 'failed') {
-    card = `<div class="error">${esc(st.error)}</div>`;
-  } else card = '<div class="sub">Starting…</div>';
-  $('statusCard').innerHTML = card;
-
-  const m = s.metrics;
-  const last = m.recent.slice(-1)[0];
-  $('sTps').textContent = last ? last.decode_tps.toFixed(1) : '–';
-  $('sReq').textContent = m.requests;
-  $('sTok').textContent = m.completion_tokens > 9999 ? (m.completion_tokens / 1000).toFixed(1) + 'k' : m.completion_tokens;
-  const fmtK = (n) => n > 9999 ? (n / 1000).toFixed(1) + 'k' : n;
-  $('cacheLine').textContent = m.prefix_hits
-    ? `Prefix cache: ${m.prefix_hits} turn${m.prefix_hits === 1 ? '' : 's'} resumed · ${fmtK(m.cached_tokens)} prompt tokens not recomputed · ${m.parked_ram} parked in memory, ${m.parked_disk} on disk`
-    : (m.parked_ram || m.parked_disk ? `Prefix cache: ${m.parked_ram} conversation(s) parked in memory, ${m.parked_disk} on disk` : '');
-  if (m.spec_steps > 0) {
-    const rate = m.drafted_tokens ? Math.round(m.accepted_tokens / m.drafted_tokens * 100) : 0;
-    $('cacheLine').textContent += ($('cacheLine').textContent ? ' · ' : '') +
-      `Speculation: ${rate}% of ${fmtK(m.drafted_tokens)} drafted tokens accepted`;
-  }
-  const pts = m.recent.map(r => r.decode_tps).slice(-30);
-  if (pts.length > 1) {
-    const max = Math.max(...pts, 1);
-    const d = pts.map((v, i) => `${(i / (pts.length - 1) * 100).toFixed(1)},${(38 - v / max * 34).toFixed(1)}`).join(' ');
-    $('spark').innerHTML = `<polyline points="${d}" fill="none" stroke="var(--accent)" stroke-width="1.6" vector-effect="non-scaling-stroke"/>`;
-  }
-
-  // Pipeline: nodes in stage order, then idle nodes.
-  const stages = s.plan?.stages || [];
-  const byName = Object.fromEntries(s.nodes.map(n => [n.name, n]));
-  const ordered = stages.map(g => ({ g, n: byName[g.node] })).filter(x => x.n);
-  const idle = s.nodes.filter(n => !stages.some(g => g.node === n.name));
-  let html = '';
-  const tel = s.telemetry && s.telemetry.samples > 0 ? s.telemetry : null;
-  ordered.forEach(({ g, n }, i) => {
-    const pct = Math.min(100, Math.round(g.peak / g.usable * 100));
-    const measured = tel?.stages?.[i]?.compute_ms;
-    const batch = tel?.stages?.[i]?.batch;
-    if (i > 0) {
-      const link = n.local ? byName[ordered[i - 1].n.name] : n;
-      html += `<div class="link">${link?.rtt_ms != null ? fmtMs(link.rtt_ms) + ' · ' + (link.bandwidth_gbps || 0).toFixed(1) + ' Gb/s' : 'activations'} ↓</div>`;
-    }
-    html += `<div class="node active"><div class="top"><span class="name">${esc(n.name)}${n.local ? ' <span class="tag">this server</span>' : ''}</span><span class="chip">${esc(shortChip(n.chip))} · ${n.backend}</span></div>
-      <div class="role">${esc(g.components)}</div>
-      <div class="bar ${pct > 90 ? 'warn' : ''}"><div style="width:${pct}%"></div></div>
-      <div class="chip">${fmtBytes(g.peak)} of ${fmtBytes(g.usable)} · ${measured != null ? `${fmtMs(measured)}/token measured (${fmtMs(g.decode_ms)} predicted)` : `${fmtMs(g.decode_ms)}/token predicted`}${batch > 1.05 ? ` · batching ×${batch.toFixed(1)}` : ''}${n.on_battery ? ' · on battery' : ''}</div></div>`;
-  });
-  idle.forEach(n => {
-    html += `<div class="node" style="margin-top:10px"><div class="top"><span class="name">${esc(n.name)}</span><span class="chip">${esc(shortChip(n.chip))} · ${n.backend}</span></div>
-      <div class="role idle">${idleLabel(s, n)}${n.rtt_ms != null ? ' · ' + fmtMs(n.rtt_ms) : ''}</div></div>`;
-  });
-  if (tel && ordered.length > 1) {
-    html += `<div class="sub" style="margin-top:10px">Per token: ${fmtMs(tel.step_ms)} measured (${fmtMs(tel.predicted_step_ms)} predicted), of which ${fmtMs(tel.transfer_ms)} network &amp; scheduling.</div>`;
-  }
-  $('pipeline').innerHTML = html || '<div class="sub">No machines yet.</div>';
-  renderDash(s);
-}
-
-// Several models share the machines: header picker + a list in the panel.
-function renderModels(s) {
-  const ms = s.models || [];
-  const on = ms.length > 1;
-  $('picker').classList.toggle('on', on);
-  document.body.classList.toggle('multi', on);
-  $('modelsSection').style.display = on ? '' : 'none';
-  $('statusTitle').textContent = on ? `Status · ${short(s.model)}` : 'Status';
-  if (!on) return;
-  const sel = $('modelSel');
-  const opts = ms.map(m => `<option value="${esc(m.id)}"${m.id === s.model ? ' selected' : ''}>${esc(short(m.id))}${m.state === 'ready' ? '' : ' — ' + (pillLabel[m.state] || m.state).toLowerCase()}</option>`).join('');
-  if (sel.dataset.opts !== opts && document.activeElement !== sel) { sel.innerHTML = opts; sel.dataset.opts = opts; }
-  $('modelList').innerHTML = ms.map(m => {
-    const where = (m.machines || []).map(x => `${esc(x.name)} ${fmtBytes(x.budget)}`).join(' + ');
-    const sub = m.state === 'ready' ? `${fmtParams(m.params)} params · ${where}${m.active ? ` · ${m.active} generating` : ''}`
-      : m.reason ? esc(m.reason) : (pillLabel[m.state] || m.state);
-    return `<button class="mrow${m.id === s.model ? ' on' : ''}" data-id="${esc(m.id)}"><span class="dot ${m.state}"></span>
-      <span style="min-width:0"><div class="mname">${esc(m.id)}</div><div class="msub">${sub}</div></span></button>`;
-  }).join('');
-  $('modelList').querySelectorAll('.mrow').forEach(b => b.onclick = () => pick(b.dataset.id));
-}
-function idleLabel(s, n) {
-  if (!multi()) return `idle · ${esc(n.usable)} available`;
-  const users = s.models.filter(m => m.id !== s.model && (m.machines || []).some(x => x.name === n.name)).map(m => esc(short(m.id)));
-  return users.length ? `running ${users.join(', ')} · not part of this model's share` : `idle · ${esc(n.usable)} available`;
-}
-function pick(id) {
-  if (!id || id === lastStatus?.model) return;
-  selected = id; store.set('model', id);
-  poll().then(() => { if (!history.length) renderThread(); $('input').focus(); });
-}
-$('modelSel').onchange = (e) => pick(e.target.value);
-
-function addEvent(e, prepend) {
-  const icon = { ok: '✓', warn: '!', error: '✗', info: '·' }[e.level] || '·';
-  for (const id of ['events', 'dEvents']) {
-    const box = $(id);
-    const div = document.createElement('div');
-    div.className = 'ev ' + e.level;
-    div.innerHTML = `<span class="t">${esc(e.at)}</span><span class="i">${icon}</span><span>${e.model ? `<span class="mt">${esc(short(e.model))}</span>` : ''}${esc(e.text)}</span>`;
-    box.prepend(div);
-    while (box.children.length > 120) box.lastChild.remove();
-  }
-}
-
-// ---- dashboard --------------------------------------------------------------
-const MODEL_COLORS = ['#16a34a', '#2563eb', '#d97706', '#9333ea', '#db2777', '#0891b2', '#65a30d'];
-const MACHINE_COLORS = ['#2563eb', '#16a34a', '#d97706', '#9333ea', '#db2777', '#0891b2', '#dc2626', '#65a30d', '#7c3aed', '#0d9488'];
-let token = store.get('token', null);
-let view = store.get('view', null);
-const unlocked = () => !!token;
-const gb = (b) => fmtBytes(b);
-
-function setView(v) {
-  view = v; store.set('view', v);
-  document.body.classList.toggle('view-dash', v === 'dash');
-  document.body.classList.toggle('view-chat', v !== 'dash');
-  $('vChat').classList.toggle('on', v !== 'dash'); $('vDash').classList.toggle('on', v === 'dash');
-  if (v !== 'dash') { if (!history.length) renderThread(); $('input').focus(); }
-}
-$('vChat').onclick = () => setView('chat');
-$('vDash').onclick = () => setView('dash');
-
-function toast(msg, isErr) {
-  const t = document.createElement('div');
-  t.className = 'toast' + (isErr ? ' err' : ''); t.textContent = msg;
-  document.body.appendChild(t); setTimeout(() => t.remove(), isErr ? 6000 : 3500);
-}
-
-function renderLock() {
-  const b = $('lockBtn');
-  b.classList.toggle('on', unlocked());
-  b.textContent = unlocked() ? '🔓 Controls on' : '🔒 Unlock';
-  b.title = unlocked() ? 'Click to lock (forget the token in this browser)' : 'Controls need the cluster token';
-  $('addModelBtn').style.display = unlocked() ? '' : 'none';
-  $('stopBtn').style.display = unlocked() ? '' : 'none';
-  $('machHint').textContent = unlocked() ? '' : 'Unlock to add models, remove machines or stop the cluster';
-}
-
-// Ask for the token, then run `then` (if given).
-let afterUnlock = null;
-function unlock(then) {
-  afterUnlock = then || null;
-  $('tokIn').value = ''; $('tokErr').style.display = 'none';
-  $('unlockDlg').showModal(); $('tokIn').focus();
-}
-$('lockBtn').onclick = () => {
-  if (unlocked()) { token = null; store.set('token', null); renderLock(); if (lastStatus) renderDash(lastStatus); toast('Controls locked in this browser'); }
-  else unlock();
-};
-$('tokCancel').onclick = () => $('unlockDlg').close();
-async function tryToken() {
-  const t = $('tokIn').value.trim();
-  if (!t) return;
-  const r = await fetch('/api/auth', { headers: { Authorization: 'Bearer ' + t } }).catch(() => null);
-  if (r && r.status === 204) {
-    token = t; store.set('token', t); $('unlockDlg').close(); renderLock();
-    if (lastStatus) renderDash(lastStatus);
-    const f = afterUnlock; afterUnlock = null; if (f) f();
-  } else {
-    $('tokErr').textContent = r ? 'That is not this cluster\'s token.' : 'Server unreachable.'; $('tokErr').style.display = '';
-  }
-}
-$('tokOk').onclick = tryToken;
-$('tokIn').addEventListener('keydown', (e) => { if (e.key === 'Enter') tryToken(); });
-
-// POST a control request with the token.
-async function api(path, body) {
-  const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + (token || '') }, body: JSON.stringify(body || {}) });
-  const j = await r.json().catch(() => ({}));
-  if (r.status === 401) { token = null; store.set('token', null); renderLock(); throw new Error('The token was not accepted — unlock again.'); }
-  if (!r.ok) { const e = new Error(j?.error?.message || ('HTTP ' + r.status)); e.status = r.status; throw e; }
-  return j;
-}
-
-function modelColor(s, id) { const i = (s.models || []).findIndex(m => m.id === id); return MODEL_COLORS[(i < 0 ? 0 : i) % MODEL_COLORS.length]; }
-
-function renderDash(s) {
-  const ms = s.machines || [];
-  const models = s.models || [];
-  const usable = ms.reduce((a, m) => a + (m.usable_memory || 0), 0);
-  const gbs = ms.reduce((a, m) => a + (m.weight_gbs ?? m.spec_bandwidth_gbs * 0.7), 0);
-  const tf = ms.reduce((a, m) => a + (m.tflops ?? m.spec_tflops * 0.5), 0);
-  $('dTitle').textContent = models.length ? 'Your cluster' : 'Your cluster is ready for a model';
-  $('dSub').textContent = models.length
-    ? `${models.length} model${models.length === 1 ? '' : 's'} on ${ms.length} machine${ms.length === 1 ? '' : 's'} · Tendril ${s.version || ''}`
-    : `${ms.length} machine${ms.length === 1 ? '' : 's'} in the pool. Add a model — Tendril shows how it would be split before downloading anything.`;
-  $('dFacts').innerHTML = `<span class="fact"><b>${ms.length}</b> machine${ms.length === 1 ? '' : 's'}</span>
-    <span class="fact"><b>${gb(usable)}</b> for models</span>
-    <span class="fact"><b>${gbs.toFixed(0)} GB/s</b> decode</span>
-    <span class="fact"><b>${tf.toFixed(1)}</b> TFLOP/s prefill</span>`;
-
-  // Models
-  let mh = models.map(m => {
-    const col = modelColor(s, m.id);
-    const st = m.id === s.model ? (s.status || {}) : {};
-    let line;
-    if (m.state === 'ready') line = `${fmtParams(m.params)} params${m.id === s.model && st.predicted_tps ? ` · ~${st.predicted_tps.toFixed(1)} tok/s` : ''}${m.active ? ` · ${m.active} generating` : ''}`;
-    else if (m.state === 'loading' && st.stages) line = st.stages.map(g => `${esc(g.node)}: ${esc(g.phase)}${g.total ? ' ' + Math.round(g.done / g.total * 100) + '%' : ''}`).join(' · ');
-    else line = esc(m.reason || pillLabel[m.state] || m.state);
-    const where = (m.machines || []).map(x => `${esc(x.name)} ${gb(x.budget)}`).join(' + ');
-    return `<div class="mcard">
-      <div class="t"><span class="nm"><i style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${col};margin-right:7px"></i>${esc(m.id)}</span><span class="pill ${m.state}"><span class="dot"></span>${esc(pillLabel[m.state] || m.state)}</span></div>
-      <div class="progress">${line}</div>
-      ${where ? `<div class="hw">Memory share: ${where}</div>` : ''}
-      <div class="acts"><button class="btn" data-chat="${esc(m.id)}" ${m.state === 'ready' ? '' : 'disabled'}>Chat</button>
-        ${unlocked() ? `<button class="btn danger" data-unload="${esc(m.id)}">Unload</button>` : ''}</div>
+function renderPlan() {
+  const p = S.plan, el = $("#plan"); if (!el) return;
+  if (!p) { el.innerHTML = ""; return; }
+  if (p.error) { el.innerHTML = `<div class="note bad"><b class="t">Can't plan this model</b>${esc(p.error)}</div>`; return; }
+  const unavailable = p.unavailable.length ? `<div class="note warn"><b class="t">Left out (no ${esc(p.engine.name)}):</b>${p.unavailable.map(u => `<div style="margin-top:4px"><b>${esc(u.machine)}</b>: missing ${u.missing.map(m => esc(m.name) + (m.install ? ` — <code>${esc(m.install)}</code>` : "")).join("; ") || "the engine"}</div>`).join("")}</div>` : "";
+  if (!p.fits) { el.innerHTML = `<h2>4. Plan</h2><div class="note bad"><b class="t">${esc(p.model)} can't run here</b>${esc(p.reason || "")}</div>${unavailable}`; return; }
+  const total = p.stages.reduce((a, s) => a + s.weight_bytes, 0) || 1;
+  const strip = p.stages.length > 1 ? `<div class="split">${p.stages.map((s, i) => `<div style="flex:${Math.max(s.weight_bytes / total, .04)};background:${COLORS[i % COLORS.length]}" title="${esc(s.machine)}">${esc(s.machine)}</div>`).join("")}</div>` : "";
+  const layers = s => s.layers[1] > s.layers[0] ? `${s.layers[0]}–${s.layers[1] - 1}` : "–";
+  const table = `<table><tr><th>Machine</th><th>Layers</th><th class="num">Weights</th><th class="num">Memory</th><th>Moves over the network</th></tr>
+    ${p.stages.map((s, i) => `<tr><td><span style="display:inline-block;width:9px;height:9px;border-radius:3px;background:${COLORS[i % COLORS.length]};margin-right:6px"></span><b>${esc(s.machine)}</b>${s.serves_api ? " ★" : ""}<div class="tiny">${esc(s.backend)}</div></td>
+      <td>${layers(s)}</td><td class="num">${fmtB(s.weight_bytes)}<div class="tiny">${s.weight_pct.toFixed(0)}%</div></td>
+      <td class="num">${fmtB(s.memory_needed)}<div class="tiny">of ${fmtB(s.memory_free)} free</div></td><td class="sub">${esc(s.transfer)}</td></tr>`).join("")}</table>`;
+  const sec = p.needs_trusted_network
+    ? `<div class="note warn"><b class="t">⚠ This split needs a trusted network</b>${esc(p.security)}<div style="margin-top:6px">${esc(p.risk || "")}</div>
+        <label class="consent"><input type="checkbox" id="trust" ${S.trusted ? "checked" : ""}> These machines are on a private network I trust, and I accept that this model's traffic between them is not encrypted.</label>
+        <div class="tiny" style="margin-top:6px">Or keep it on one machine: set “At least N machines” to 1 and pick an engine that runs it alone, or use llama.cpp, whose split traffic Tendril encrypts.</div></div>`
+    : `<div class="note good"><b class="t">🔒 ${p.stages.length > 1 ? "Traffic between machines is encrypted" : "Runs on one machine"}</b>${esc(p.security)}</div>`;
+  el.innerHTML = `<h2>4. Plan</h2><div class="card">
+      <div class="row between"><span class="name">${esc(p.model)}</span><span class="sub">${esc(p.engine.name)} · ${TASK[p.task] || p.task}${p.vision ? " · sees images" : ""}</span></div>
+      <div class="sub">${p.layered ? p.layers + " layers · " : ""}${fmtB(p.weight_bytes)} · ${p.context} tokens × ${p.concurrency} conversations${p.tokens_per_sec ? ` · ~${p.tokens_per_sec.toFixed(1)} tok/s predicted` : ""}</div>
+      ${strip}${table}
+      ${p.notes.length ? `<div class="tiny" style="margin-top:8px">${p.notes.map(esc).join(" · ")}</div>` : ""}
+      ${sec}${unavailable}
+      <details><summary>Commands Tendril will run</summary>${p.commands.map(c => `<div class="tiny" style="margin-top:6px"><b>${esc(c[0])}</b></div><div class="log">${esc(c[1])}</div>`).join("")}</details>
+      <div class="row" style="margin-top:12px"><button class="btn primary" id="load-btn">Load ${esc(p.model.split("/").pop())}</button><button class="btn" id="replan">Plan again</button></div>
     </div>`;
-  }).join('');
-  if (!models.length) {
-    mh = unlocked()
-      ? `<div class="mcard addcard" id="addFirst"><div class="plus">+</div><div style="font-weight:600;color:var(--text)">Add your first model</div><div class="sub">Any HuggingFace model or catalog name. You'll see the plan before anything downloads.</div></div>`
-      : `<div class="mcard addcard" id="addFirst"><div class="plus">🔒</div><div style="font-weight:600;color:var(--text)">Unlock to add a model</div><div class="sub">Enter the cluster token that <code>tendril serve</code> printed.</div></div>`;
-  }
-  $('dModels').innerHTML = mh;
-  $('dModels').querySelectorAll('[data-chat]').forEach(b => b.onclick = () => { pick(b.dataset.chat); setView('chat'); });
-  $('dModels').querySelectorAll('[data-unload]').forEach(b => b.onclick = async () => {
-    if (!confirm(`Unload ${b.dataset.unload}? Its memory is freed for other models; machines stay in the pool.`)) return;
-    b.disabled = true;
-    try { await api('/api/models/unload', { model: b.dataset.unload }); toast('Unloaded ' + b.dataset.unload); poll(); }
-    catch (e) { toast(e.message, true); b.disabled = false; }
-  });
-  const af = $('addFirst'); if (af) af.onclick = openPlan;
-
-  // Machines
-  let html = ms.map(m => {
-    const segs = (m.roles || []).filter(r => r.budget > 0);
-    const used = segs.reduce((a, r) => a + r.budget, 0);
-    const bar = segs.map(r => `<span style="width:${Math.min(100, r.budget / Math.max(1, m.usable_memory) * 100)}%;background:${modelColor(s, r.model)}"></span>`).join('');
-    const legend = segs.map(r => `<span><i style="background:${modelColor(s, r.model)}"></i>${esc(short(r.model))} ${gb(r.budget)}</span>`).join('');
-    const roles = (m.roles || []).filter(r => r.role && r.role !== 'not used' && r.role !== 'idle');
-    const dec = m.weight_gbs != null ? `${m.weight_gbs.toFixed(1)} GB/s<span class="meas">measured</span>` : `~${(m.spec_bandwidth_gbs * 0.7).toFixed(0)} GB/s<span class="est">spec</span>`;
-    const pre = m.tflops != null ? `${m.tflops.toFixed(2)} TFLOP/s<span class="meas">measured</span>` : `~${(m.spec_tflops * 0.5).toFixed(1)} TFLOP/s<span class="est">spec</span>`;
-    const link = m.local ? 'this server' : (m.rtt_ms != null ? `${fmtMs(m.rtt_ms)} · ${(m.bandwidth_gbps || 0).toFixed(1)} Gb/s` : 'measuring…');
-    return `<div class="mcard">
-      <div class="t"><span class="nm">${esc(m.name)}${m.local ? ' <span class="tag">this server</span>' : ''}</span><span class="hw">${esc(m.backend)}</span></div>
-      <div class="hw">${esc(shortChip(m.chip))}${m.gpu_cores ? ` · ${m.gpu_cores} GPU cores` : ''} · ${m.cpu_cores} CPU cores · ${esc(m.os)}</div>
-      <div class="mem" title="Memory reserved per model">${bar}</div>
-      <div class="legend">${legend || '<span>No model uses it yet</span>'}<span style="margin-left:auto">${gb(used)} of ${gb(m.usable_memory)} usable · ${gb(m.total_memory)} total</span></div>
-      <div class="kvs"><span class="k">Decode</span><span class="v">${dec}</span><span class="k">Prefill</span><span class="v">${pre}</span><span class="k">Link</span><span class="v">${link}</span>${m.on_battery ? '<span class="k">Power</span><span class="v" style="color:var(--warn)">on battery</span>' : ''}</div>
-      ${roles.length ? `<div class="roles">${roles.map(r => `<div class="r"><b style="color:${modelColor(s, r.model)}">${esc(short(r.model))}</b><span>${esc(r.role)}</span></div>`).join('')}</div>` : ''}
-      ${unlocked() && !m.local ? `<div class="acts"><button class="btn danger" data-remove="${esc(m.id)}" data-name="${esc(m.name)}">Remove</button></div>` : ''}
-    </div>`;
-  }).join('');
-  html += `<div class="mcard addcard" style="cursor:default"><div class="plus">+</div><div style="font-weight:600;color:var(--text)">Add a machine</div>
-    <div class="sub">Run on any computer on your network:</div><div class="join" style="text-align:left;width:100%"><span>${esc(s.join || '')}</span><button data-copy>Copy</button></div></div>`;
-  $('dMachines').innerHTML = html;
-  $('dMachines').querySelectorAll('[data-copy]').forEach(b => b.onclick = () => { navigator.clipboard?.writeText(s.join || ''); b.textContent = 'Copied'; setTimeout(() => b.textContent = 'Copy', 1200); });
-  $('dMachines').querySelectorAll('[data-remove]').forEach(b => b.onclick = async () => {
-    if (!confirm(`Remove ${b.dataset.name}? It unloads everything and its \`tendril join\` exits.`)) return;
-    b.disabled = true;
-    try { await api('/api/machines/remove', { id: b.dataset.remove }); toast('Removed ' + b.dataset.name); setTimeout(poll, 800); }
-    catch (e) { toast(e.message, true); b.disabled = false; }
-  });
-  renderLock();
-}
-
-// ---- plan → load ------------------------------------------------------------
-const SUGGEST = ['qwen2.5-0.5b', 'qwen2.5-1.5b', 'llama-3.2-3b', 'Qwen/Qwen2.5-7B-Instruct', 'meta-llama/Llama-3.1-8B-Instruct', 'Qwen/Qwen2.5-Coder-7B-Instruct'];
-function openPlan() {
-  if (!unlocked()) { unlock(openPlan); return; }
-  $('pmOut').innerHTML = '';
-  $('pmSugg').innerHTML = SUGGEST.map(m => `<button class="chip2" data-m="${esc(m)}">${esc(m)}</button>`).join('');
-  $('pmSugg').querySelectorAll('[data-m]').forEach(b => b.onclick = () => { $('pmModel').value = b.dataset.m; planNow(); });
-  $('planDlg').showModal(); $('pmModel').focus();
-}
-$('addModelBtn').onclick = openPlan;
-$('planClose').onclick = () => $('planDlg').close();
-$('pmPlan').onclick = () => planNow();
-$('pmModel').addEventListener('keydown', (e) => { if (e.key === 'Enter') planNow(); });
-
-function planBody() {
-  const b = { model: $('pmModel').value.trim() };
-  if ($('pmFmt').value) b.quantize = $('pmFmt').value;
-  if ($('pmCtx').value) b.context = parseInt($('pmCtx').value);
-  return b;
-}
-async function planNow(notice) {
-  const body = planBody();
-  if (!body.model) { $('pmModel').focus(); return; }
-  $('pmOut').innerHTML = `<div class="plansum" style="margin-top:16px"><span class="spin"></span>Reading ${esc(body.model)}'s config and tensor table (no weights) and planning it across ${(lastStatus?.machines || []).length} machine(s)…</div>`;
-  $('pmPlan').disabled = true;
-  try { renderPlan(await api('/api/plan', body), body, notice); }
-  catch (e) { $('pmOut').innerHTML = `<div class="verdict no">${esc(e.message)}</div>`; }
-  $('pmPlan').disabled = false;
-}
-
-function renderPlan(p, body, notice) {
-  const colorOf = (name) => MACHINE_COLORS[Math.max(0, (p.machine_names || []).indexOf(name)) % MACHINE_COLORS.length];
-  let h = (notice ? `<div class="verdict no" style="background:var(--warn-soft);color:var(--warn)">! ${esc(notice)}</div>` : '') + `<div style="margin-top:18px;font-size:15px"><b>${esc(p.model)}</b> <span class="sub">· ${esc(p.architecture)} · ${fmtParams(p.params)} params · ${p.layers} layers · ${p.context.toLocaleString()} ctx</span></div>`;
-  h += `<div class="plansum">Model weights: <b style="color:var(--text)">${gb(p.weight_bytes)}</b> in ${esc(p.format)} · across ${p.machines} machine${p.machines === 1 ? '' : 's'}</div>`;
-  if (p.shares?.length) {
-    h += `<div class="wbar">${p.shares.map(sh => `<div style="width:${Math.max(sh.weight_pct, 6)}%;background:${colorOf(sh.machine)}" title="${esc(sh.machine)}: ${esc(sh.components)}"><b>${esc(sh.machine)}</b>${sh.weight_pct.toFixed(0)}% · ${gb(sh.weight_bytes)}</div>`).join('')}</div>`;
-    h += `<div class="pgrid">${p.shares.map((sh, i) => {
-      const pct = Math.min(100, sh.memory_needed / Math.max(1, sh.memory_budget) * 100);
-      return `<div class="pbox" style="border-color:${colorOf(sh.machine)}">
-        <div class="nm">${i + 1}. ${esc(sh.machine)} <span class="sub">${esc(sh.backend)}</span></div>
-        <div>${esc(sh.components)}</div>
-        <div><b>${gb(sh.weight_bytes)}</b> of weights <span class="sub">(${sh.weight_pct.toFixed(1)}%)</span></div>
-        <div class="bar ${pct > 92 ? 'warn' : ''}" style="margin:4px 0 0"><div style="width:${pct}%"></div></div>
-        <div class="sub">needs ${gb(sh.memory_needed)} of ${gb(sh.memory_budget)} · KV ${gb(sh.kv_bytes)}</div>
-        <div class="sub">downloads ${gb(sh.weight_bytes)} · ${fmtMs(sh.decode_ms)}/token</div>
-      </div>`; }).join('')}</div>`;
-    h += `<div class="verdict ok">✓ Fits · ~${(p.tokens_per_sec || 0).toFixed(1)} tok/s · first token ~${fmtMs(p.ttft_ms)} — each machine downloads only its share, in parallel.</div>`;
-  } else {
-    h += `<div class="verdict no">✗ Doesn't fit: ${esc(p.reason || 'not enough memory')}</div>`;
-  }
-  if (p.displaces?.length) h += `<div class="verdict no" style="background:var(--warn-soft);color:var(--warn)">! Loading it leaves no room for ${p.displaces.map(esc).join(', ')}.</div>`;
-  if (p.alternatives?.length) {
-    h += `<div class="plansum" style="margin-top:14px">Other weight formats — click to plan with one:</div><div class="chips">${p.alternatives.map(a =>
-      `<button class="chip2 ${a.fits ? 'ok' : 'no'}" data-fmt="${esc(a.format)}">${esc(a.format)} · ${gb(a.weight_bytes)} · ${a.fits ? '~' + (a.tokens_per_sec || 0).toFixed(1) + ' tok/s' : "doesn't fit"}</button>`).join('')}</div>`;
-  }
-  if (p.advice?.length) h += `<ul class="advice">${p.advice.slice(0, 4).map(a => '<li>' + esc(a) + '</li>').join('')}</ul>`;
-  h += `<div class="row" style="justify-content:flex-start;margin-top:16px"><button class="btn primary" id="pmLoad" ${p.shares?.length ? '' : 'disabled'}>Load ${esc(short(p.model))}</button><span class="sub" style="align-self:center">${p.shares?.length ? 'Starts the downloads and loads it on these machines.' : ''}</span></div>`;
-  $('pmOut').innerHTML = h;
-  $('pmOut').querySelectorAll('[data-fmt]').forEach(b => b.onclick = () => { $('pmFmt').value = b.dataset.fmt; planNow(); });
-  const lb = $('pmLoad');
-  if (lb) lb.onclick = async () => {
-    lb.disabled = true; lb.textContent = 'Loading…';
+  const trust = $("#trust"), load = $("#load-btn");
+  const sync = () => { load.disabled = p.needs_trusted_network && !S.trusted; };
+  if (trust) trust.onchange = () => { S.trusted = trust.checked; sync(); };
+  sync();
+  $("#replan").onclick = () => doPlan();
+  load.onclick = async () => {
+    load.disabled = true;
     try {
-      // Load exactly the plan on screen; refused if the pool changed since.
-      const r = await api('/api/models', Object.assign({}, body, { expect_version: p.pool_version }));
-      $('planDlg').close();
-      selected = r.loaded; store.set('model', r.loaded);
-      toast(`Loading ${short(r.loaded)} — machines are downloading their shares`);
-      poll();
+      const r = await api("/api/models", { ...S.planReq, trusted_network: S.trusted, expect_version: p.pool_version });
+      toast("Loading " + r.loading); S.plan = null; S.engine = null; $("#add").hidden = true; $("#add-btn").textContent = "+ Add model"; refresh();
+      window.scrollTo({ top: 0, behavior: "smooth" });
     } catch (e) {
-      if (e.status === 409) { planNow('The machines changed while this was open — here is the new plan. Check it and load again.'); return; }
-      toast(e.message, true); lb.disabled = false; lb.textContent = 'Load ' + short(p.model);
+      if (e.kind === "pool_changed") { toast("The machines changed — here is the new plan."); doPlan(); }
+      else { toast(e.message); sync(); }
     }
   };
 }
 
-$('stopBtn').onclick = async () => {
-  if (!confirm('Stop the cluster? Every model unloads and joined machines exit.')) return;
-  try { await api('/api/stop'); toast('Stopping the cluster…'); } catch (e) { toast(e.message, true); }
-};
-
-let eventsLoaded = false;
-async function poll() {
-  try {
-    let r = await fetch('/api/status' + (selected ? '?model=' + encodeURIComponent(selected) : ''));
-    if (r.status === 404) { selected = null; store.set('model', null); r = await fetch('/api/status'); }
-    const s = await r.json();
-    const wasEmpty = !lastStatus;
-    if (wasEmpty && !view) setView(s.model ? 'chat' : 'dash');
-    renderStatus(s);
-    if (!eventsLoaded) { eventsLoaded = true; s.events.forEach(e => addEvent(e)); }
-    if (wasEmpty && !history.length) renderThread();
-  } catch {
-    $('pill').className = 'pill failed'; $('pillText').textContent = 'Server unreachable';
-    ready = false; updateSend();
+// ---- chat ----------------------------------------------------------------
+function readyModels() { return (S.st?.deployments || []).filter(d => d.status === "ready"); }
+function current() { return readyModels().find(d => d.name === S.chat.model); }
+function renderChatBar() {
+  const ms = readyModels(), sel = $("#chat-model");
+  if (!ms.find(d => d.name === S.chat.model)) S.chat.model = ms[0]?.name || null;
+  const opts = ms.map(d => `<option value="${esc(d.name)}" ${d.name === S.chat.model ? "selected" : ""}>${esc(d.name)} · ${esc(d.engine_name)}</option>`).join("");
+  if (sel.innerHTML !== opts) sel.innerHTML = opts || `<option>no model ready</option>`;
+  const d = current();
+  const kind = d ? d.task : null;
+  $("#chat-kind").textContent = d ? (TASK[kind] || kind) + (d.vision ? " · sees images" : "") : "load a model first";
+  $("#img-size").hidden = kind !== "image_generation";
+  $("#attach").hidden = !(d && (d.vision || kind === "transcription"));
+  $("#file").accept = kind === "transcription" ? "audio/*" : "image/*";
+  $("#input").placeholder = kind === "image_generation" ? "Describe the image…" : kind === "transcription" ? "Attach an audio file (📎), optionally add a prompt…" : "Message…";
+  $("#hint").textContent = d ? `${d.engine_name} on ${d.plan.stages.map(s => s.machine).join(" + ")} · OpenAI-compatible API at ${location.origin}/v1` : "";
+  if (!S.chat.thread.length) renderThread();
+}
+$("#chat-model").onchange = () => { S.chat.model = $("#chat-model").value; store.set("tendril-chat-model", S.chat.model); S.chat.thread = []; S.chat.images = []; renderThumbs(); renderChatBar(); renderThread(); };
+$("#clear-chat").onclick = () => { S.chat.abort?.abort(); S.chat.thread = []; S.chat.images = []; renderThumbs(); renderThread(); };
+$("#attach").onclick = () => $("#file").click();
+$("#file").onchange = async () => {
+  for (const f of $("#file").files) {
+    const url = await new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(f); });
+    if (current()?.task === "transcription") S.chat.images = [{ file: f, url, name: f.name }];
+    else S.chat.images.push({ url, name: f.name });
   }
+  $("#file").value = ""; renderThumbs();
+};
+function renderThumbs() {
+  $("#thumbs").innerHTML = S.chat.images.map((im, i) => `<span>${im.file ? `<span class="pill">🎵 ${esc(im.name)}</span>` : `<img src="${im.url}" alt="">`}<button data-rm="${i}">×</button></span>`).join("");
+  document.querySelectorAll("[data-rm]").forEach(b => b.onclick = () => { S.chat.images.splice(+b.dataset.rm, 1); renderThumbs(); });
 }
-function listen() {
-  const es = new EventSource('/api/events');
-  es.onmessage = (m) => { try { addEvent(JSON.parse(m.data)); poll(); } catch {} };
-  es.onerror = () => { es.close(); setTimeout(listen, 3000); };
+function md(t) {
+  const parts = String(t).split(/```/);
+  return parts.map((p, i) => i % 2 ? `<pre><code>${esc(p.replace(/^[a-z0-9]*\n/i, ""))}</code></pre>` :
+    esc(p).replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>").split(/\n{2,}/).map(x => x.trim() ? `<p>${x.replace(/\n/g, "<br>")}</p>` : "").join("")).join("");
+}
+function renderThread() {
+  const th = $("#thread"), d = current();
+  if (!S.chat.thread.length) {
+    th.innerHTML = `<div class="welcome"><svg viewBox="0 0 32 32" width="34" height="34"><path d="M16 29c0-9 0-14 6-19M16 20c-2-4-6-6-10-6 1 5 4 8 10 6zM22 10c2-3 5-4 8-4-1 4-4 6-8 4z" fill="none" stroke="#22c55e" stroke-width="2.5" stroke-linecap="round"/></svg>
+      <h1>${d ? esc(d.name.split("/").pop()) : "No model is ready"}</h1><div>${d ? (d.task === "image_generation" ? "Describe an image to generate." : d.task === "transcription" ? "Attach an audio file to transcribe it." : d.vision ? "Ask anything — you can attach images too." : "Ask anything.") : "Load one on the Cluster tab."}</div></div>`;
+    return;
+  }
+  th.innerHTML = S.chat.thread.map(m => {
+    if (m.role === "user") return `<div class="msg user"><div class="bubble">${esc(m.text)}${(m.images || []).map(u => `<img src="${u}" alt="">`).join("")}${m.audio ? `<div>🎵 ${esc(m.audio)}</div>` : ""}</div></div>`;
+    return `<div class="msg ai"><div class="bubble ${m.pending ? "caret" : ""}">${m.error ? `<div class="note bad">${esc(m.error)}</div>` : md(m.text || "")}${(m.images || []).map(u => `<img src="${u}" alt="generated image">`).join("")}</div>${m.meta ? `<div class="tiny" style="margin-top:4px">${esc(m.meta)}</div>` : ""}</div>`;
+  }).join("");
+  $("#messages").scrollTop = $("#messages").scrollHeight;
+}
+$("#input").oninput = () => { const t = $("#input"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 220) + "px"; };
+$("#input").onkeydown = e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); } };
+$("#send").onclick = () => send();
+async function send() {
+  const d = current(); if (!d) { toast("No model is ready"); return; }
+  const text = $("#input").value.trim();
+  const att = S.chat.images; S.chat.images = []; renderThumbs();
+  if (d.task === "transcription") return transcribe(d, text, att[0]);
+  if (!text && !att.length) return;
+  $("#input").value = ""; $("#input").oninput();
+  if (d.task === "image_generation") return generate(d, text);
+  const user = { role: "user", text, images: att.map(a => a.url) };
+  const ai = { role: "ai", text: "", pending: true };
+  S.chat.thread.push(user, ai); renderThread();
+  const messages = S.chat.thread.filter(m => !m.pending && !m.error).map(m => m.role === "user"
+    ? { role: "user", content: m.images?.length ? [{ type: "text", text: m.text }, ...m.images.map(u => ({ type: "image_url", image_url: { url: u } }))] : m.text }
+    : { role: "assistant", content: m.text });
+  const t0 = performance.now(); let n = 0;
+  S.chat.abort = new AbortController();
+  try {
+    const r = await fetch("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json" }, signal: S.chat.abort.signal,
+      body: JSON.stringify({ model: d.name, messages, stream: true, stream_options: { include_usage: true } }) });
+    if (!r.ok) { const v = await r.json().catch(() => ({})); throw new Error(v.error?.message || r.statusText); }
+    const rd = r.body.getReader(), dec = new TextDecoder(); let buf = "", usage = null;
+    for (;;) {
+      const { value, done } = await rd.read(); if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i; while ((i = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim(); if (data === "[DONE]") continue;
+        let v; try { v = JSON.parse(data); } catch { continue; }
+        if (v.error) throw new Error(v.error.message || "error");
+        const delta = v.choices?.[0]?.delta?.content; if (delta) { ai.text += delta; n++; renderThread(); }
+        if (v.usage) usage = v.usage;
+      }
+    }
+    const secs = (performance.now() - t0) / 1000, toks = usage?.completion_tokens || n;
+    ai.meta = `${toks} tokens · ${(toks / Math.max(secs, .001)).toFixed(1)} tok/s`;
+  } catch (e) { if (e.name !== "AbortError") ai.error = e.message; }
+  ai.pending = false; renderThread();
+}
+async function generate(d, prompt) {
+  const ai = { role: "ai", text: "", pending: true };
+  S.chat.thread.push({ role: "user", text: prompt }, ai); renderThread();
+  const t0 = performance.now();
+  try {
+    const v = await api("/v1/images/generations", { model: d.name, prompt, size: $("#img-size").value, n: 1 });
+    ai.images = (v.data || []).map(x => x.b64_json ? "data:image/png;base64," + x.b64_json : x.url).filter(Boolean);
+    ai.meta = `${ai.images.length} image${ai.images.length === 1 ? "" : "s"} · ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+  } catch (e) { ai.error = e.message; }
+  ai.pending = false; renderThread();
+}
+async function transcribe(d, prompt, a) {
+  if (!a?.file) { toast("Attach an audio file first (📎)"); return; }
+  $("#input").value = "";
+  const ai = { role: "ai", text: "", pending: true };
+  S.chat.thread.push({ role: "user", text: prompt, audio: a.name }, ai); renderThread();
+  const fd = new FormData(); fd.append("file", a.file, a.name); fd.append("model", d.name); if (prompt) fd.append("prompt", prompt);
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/v1/audio/transcriptions", { method: "POST", body: fd });
+    const v = await r.json(); if (!r.ok) throw new Error(v.error?.message || r.statusText);
+    ai.text = v.text || "(no speech found)"; ai.meta = `${((performance.now() - t0) / 1000).toFixed(1)} s`;
+  } catch (e) { ai.error = e.message; }
+  ai.pending = false; renderThread();
 }
 
-// ---- wiring ---------------------------------------------------------------
-function autosize() { const t = $('input'); t.style.height = 'auto'; t.style.height = Math.min(t.scrollHeight, 220) + 'px'; }
-$('input').addEventListener('input', () => { autosize(); updateSend(); });
-$('input').addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); send(); } });
-$('send').onclick = send;
-$('newChat').onclick = () => { if (busy) controller?.abort(); history = []; save(); renderThread(); $('input').focus(); };
-$('copyJoin').onclick = () => { navigator.clipboard?.writeText($('joinCmd').textContent); $('copyJoin').textContent = 'Copied'; setTimeout(() => $('copyJoin').textContent = 'Copy', 1200); };
-document.querySelectorAll('.tabs button').forEach(b => b.onclick = () => {
-  document.querySelectorAll('.tabs button').forEach(x => x.classList.toggle('on', x === b));
-  document.body.classList.toggle('show-cluster', b.dataset.tab === 'cluster');
-});
-const dlg = $('settings');
-$('settingsBtn').onclick = () => { $('sys').value = settings.system; $('temp').value = settings.temperature; $('tempV').textContent = settings.temperature; $('maxTok').value = settings.maxTokens; dlg.showModal(); };
-$('temp').oninput = () => $('tempV').textContent = $('temp').value;
-$('closeSettings').onclick = () => { settings = { system: $('sys').value, temperature: parseFloat($('temp').value), maxTokens: Math.max(1, parseInt($('maxTok').value) || 1024) }; store.set('settings', settings); dlg.close(); };
-
-if (view) setView(view);
+// ---- start -------------------------------------------------------------
 renderLock();
-renderThread();
-poll(); setInterval(poll, 2000); listen();
-// A token saved earlier may be stale (server restarted with another one).
-if (token) fetch('/api/auth', { headers: { Authorization: 'Bearer ' + token } }).then(r => { if (r.status === 401) { token = null; store.set('token', null); renderLock(); } }).catch(() => {});
+setView(store.get("tendril-view") === "chat" ? "chat" : "cluster");
+refresh();
+setInterval(refresh, 2000);
+try { const es = new EventSource("/api/events"); es.onmessage = () => { clearTimeout(es._t); es._t = setTimeout(refresh, 150); }; } catch {}
 </script>
 </body>
 </html>

@@ -313,7 +313,7 @@ table{{width:100%;border-collapse:collapse;font-size:13.5px;font-variant-numeric
         model = esc(model),
         plan_label = esc(plan["label"].as_str().unwrap_or("")),
         pred_tps = plan["tokens_per_sec"].as_f64().unwrap_or(0.0),
-        now = tendril_cluster::coordinator::clock(),
+        now = tendril_cluster::machine::clock(),
         tput = line_chart(
             "Total throughput vs concurrency",
             "concurrent requests",

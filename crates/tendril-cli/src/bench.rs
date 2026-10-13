@@ -16,7 +16,8 @@ use tendril_core::units::fmt_ms;
 
 #[derive(Args, Debug, Clone)]
 pub struct BenchArgs {
-    /// Benchmark this model in-process (starts a local server). Omit to use --url.
+    /// Model to benchmark (default: the server's first chat model).
+    #[arg(long, short = 'm')]
     pub model: Option<String>,
     /// Server to benchmark.
     #[arg(long, default_value = "http://127.0.0.1:8080", env = "TENDRIL_URL")]
@@ -45,9 +46,6 @@ pub struct BenchArgs {
     /// Also run a multi-turn conversation of this many turns (shows prefix caching).
     #[arg(long, default_value_t = 0)]
     pub turns: usize,
-    /// Weight format when benchmarking a model in-process.
-    #[arg(long, short = 'q', default_value = "native")]
-    pub quantize: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -135,12 +133,13 @@ fn make_prompt(tokens: usize, salt: usize, words_per_token: f64) -> String {
 async fn one(
     client: &reqwest::Client,
     url: &str,
+    model: &str,
     prompt: String,
     max: usize,
     seed: u64,
 ) -> Result<Sample> {
     let body = json!({
-        "model": "bench", "prompt": prompt, "max_tokens": max, "stream": true, "temperature": 0.7,
+        "model": model, "prompt": prompt, "max_tokens": max, "stream": true, "temperature": 0.7,
         "seed": seed, "ignore_eos": true, "stream_options": {"include_usage": true},
     });
     let t0 = Instant::now();
@@ -234,23 +233,8 @@ pub fn run(a: BenchArgs) -> Result<()> {
         .enable_all()
         .build()?;
     rt.block_on(async move {
-        let (url, local) = match &a.model {
-            Some(m) => {
-                let (url, c) = crate::serve::start_local_for_bench(
-                    m,
-                    &a.quantize,
-                    a.concurrency.iter().copied().max().unwrap_or(1),
-                )
-                .await?;
-                (url, Some(c))
-            }
-            None => (a.url.trim_end_matches('/').to_string(), None),
-        };
-        let r = bench(&a, &url).await;
-        if let Some(c) = local {
-            c.shutdown(true).await;
-        }
-        r
+        let url = a.url.trim_end_matches('/').to_string();
+        bench(&a, &url).await
     })
 }
 
@@ -262,14 +246,43 @@ async fn bench(a: &BenchArgs, url: &str) -> Result<()> {
         .get(format!("{url}/api/status"))
         .send()
         .await
-        .with_context(|| format!("no Tendril server at {url} — start one with `tendril serve <model>` or pass a model to benchmark in-process"))?
+        .with_context(|| format!("no Tendril server at {url} — start one with `tendril serve`"))?
         .json()
         .await?;
-    if status["status"]["state"] != "ready" {
-        bail!("the server is not ready ({})", status["status"]["state"]);
+    let deps = status["deployments"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let dep = deps
+        .iter()
+        .find(|d| match &a.model {
+            Some(m) => d["name"] == json!(m),
+            None => d["task"] == json!("chat"),
+        })
+        .cloned()
+        .with_context(|| match &a.model {
+            Some(m) => format!("the server has no model named {m}"),
+            None => "the server has no chat model loaded".into(),
+        })?;
+    if dep["status"] != "ready" {
+        bail!("{} is not ready ({})", dep["name"], dep["status"]);
     }
-    let model = status["model"].as_str().unwrap_or("?").to_string();
-    let plan = status["plan"].clone();
+    let model = dep["name"].as_str().unwrap_or("?").to_string();
+    let p = &dep["plan"];
+    let label = format!(
+        "{} on {}",
+        dep["engine_name"].as_str().unwrap_or(""),
+        p["stages"]
+            .as_array()
+            .map(|st| st
+                .iter()
+                .filter_map(|s| s["machine"].as_str())
+                .collect::<Vec<_>>()
+                .join(" → "))
+            .unwrap_or_default()
+    );
+    let plan =
+        json!({"label": label, "tokens_per_sec": p["tokens_per_sec"], "ttft_ms": p["ttft_ms"]});
     if !a.json {
         println!();
         println!("{} {}", bold("Tendril bench ·"), bold(cyan(&model)));
@@ -281,22 +294,9 @@ async fn bench(a: &BenchArgs, url: &str) -> Result<()> {
         println!();
         print!("  {} warming up… ", dim("·"));
     }
-    // Learn this tokenizer's words-per-token so prompt lengths hit their targets.
-    let mut wpt = 0.75;
-    let probe = make_prompt(400, 1, wpt);
-    if let Ok(r) = client
-        .post(format!("{url}/tokenize"))
-        .json(&json!({"prompt": probe}))
-        .send()
-        .await
-    {
-        if let Ok(v) = r.json::<Value>().await {
-            if let Some(n) = v["count"].as_f64().filter(|n| *n > 0.0) {
-                wpt = (wpt * 400.0 / n).clamp(0.05, 4.0);
-            }
-        }
-    }
-    one(&client, url, make_prompt(32, 999, wpt), 8, 1)
+    // Roughly 0.75 words per token for English text.
+    let wpt = 0.75;
+    one(&client, url, &model, make_prompt(32, 999, wpt), 8, 1)
         .await
         .context("warm-up request failed")?;
     if !a.json {
@@ -318,6 +318,7 @@ async fn bench(a: &BenchArgs, url: &str) -> Result<()> {
                         one(
                             &client,
                             url,
+                            &model,
                             make_prompt(p, salt, wpt),
                             a.output_tokens,
                             salt as u64,
@@ -391,6 +392,7 @@ async fn bench(a: &BenchArgs, url: &str) -> Result<()> {
             let s = one(
                 &client,
                 url,
+                &model,
                 history.clone(),
                 a.output_tokens,
                 7 + turn as u64,
@@ -412,13 +414,7 @@ async fn bench(a: &BenchArgs, url: &str) -> Result<()> {
             conversation.push(json!({"turn": turn, "prompt_tokens": s.prompt_tokens, "cached_tokens": s.cached_tokens, "ttft_ms": s.ttft_ms}));
         }
     }
-    let after: Value = client
-        .get(format!("{url}/api/status"))
-        .send()
-        .await?
-        .json()
-        .await?;
-    let tel = after["telemetry"].clone();
+    let tel = Value::Null;
 
     if a.json {
         println!(
@@ -468,7 +464,7 @@ async fn bench(a: &BenchArgs, url: &str) -> Result<()> {
 
     // Prediction vs measurement.
     let pred_tps = plan["tokens_per_sec"].as_f64().unwrap_or(0.0);
-    if let Some(r1) = rows.iter().find(|r| r.concurrency == 1) {
+    if let (Some(r1), true) = (rows.iter().find(|r| r.concurrency == 1), pred_tps > 0.0) {
         heading("Planner prediction vs measured");
         let err = (pred_tps - r1.request_tps) / r1.request_tps.max(1e-9) * 100.0;
         ui::kv(&[(
@@ -526,5 +522,5 @@ fn all_samples_itl(s: &[Sample]) -> Vec<f64> {
 }
 
 fn chrono_stamp() -> String {
-    tendril_cluster::coordinator::clock().replace(':', "")
+    tendril_cluster::machine::clock().replace(':', "")
 }

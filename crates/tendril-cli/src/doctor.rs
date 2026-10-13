@@ -39,7 +39,7 @@ pub fn run() -> Result<()> {
         Backend::Cpu => line(
             Status::Warn,
             "Accelerator",
-            format!("none found — {} will run models on the CPU ({} cores). Fine for small models or as a helper node.", n.chip, n.cpu_cores),
+            format!("none found — engines will run models on the CPU ({} cores). Fine for small models or as a helper machine.", n.cpu_cores),
         ),
     }
 
@@ -104,6 +104,29 @@ pub fn run() -> Result<()> {
         }
     }
 
+    // Engines.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let found = rt.block_on(tendril_engines::detect_all());
+    let ready: Vec<String> = found
+        .iter()
+        .filter(|d| d.ready)
+        .map(|d| d.engine.clone())
+        .collect();
+    if ready.is_empty() {
+        line(
+            Status::Warn,
+            "Engines",
+            format!(
+                "none installed — this machine can't run models yet; {} shows how to add one",
+                cyan("tendril engines")
+            ),
+        );
+    } else {
+        line(Status::Ok, "Engines", ready.join(", "));
+    }
+
     // Power.
     match n.on_battery {
         Some(true) => line(
@@ -163,7 +186,7 @@ pub fn run() -> Result<()> {
     println!();
     println!(
         "{}",
-        dim("Next: tendril plan <model>   ·   tendril fit <model>   ·   tendril node --probe")
+        dim("Next: tendril engines   ·   tendril serve   ·   tendril plan <model>")
     );
     Ok(())
 }

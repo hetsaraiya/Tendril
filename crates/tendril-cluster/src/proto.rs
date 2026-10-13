@@ -1,114 +1,76 @@
-//! Messages exchanged between the coordinator and agents.
+//! Messages between the server (pool) and the agents on each machine.
+//!
+//! Engine types (detections, roles) travel as JSON strings: they use serde
+//! features the compact binary format can't decode.
 
 use serde::{Deserialize, Serialize};
 use tendril_core::NodeProfile;
-use tendril_engine::model::StageSpec;
-use tendril_engine::sampler::SamplingParams;
 
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 
-/// Activation tensors on the wire (raw little-endian bytes).
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WireTensor {
-    /// "f32", "bf16" or "f16".
-    pub dtype: String,
-    pub shape: Vec<usize>,
-    #[serde(with = "serde_bytes")]
-    pub data: Vec<u8>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum Payload {
-    Tokens(Vec<u32>),
-    Hidden(WireTensor),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SampleSetup {
-    pub params: SamplingParams,
-    /// Prompt tokens, for repetition penalties.
-    pub history: Vec<u32>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TensorEntry {
-    pub name: String,
-    pub dtype: String,
-    pub shape: Vec<usize>,
-    pub len: u64,
-}
-
-/// Where a stage can download its tensors itself instead of receiving them
-/// from the coordinator: `files[i]` locates `tensors[i]` of the `LoadStage`.
+/// Another role of a deployment, as a starting role needs to reach it.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct WeightSource {
-    /// `<endpoint>/<repo>/resolve/<revision>`.
-    pub base_url: String,
-    /// (checkpoint file, absolute byte offset of the tensor's data).
-    pub files: Vec<(String, u64)>,
+pub struct Peer {
+    pub role: String,
+    /// The peer machine's tunnel endpoint (`ip:port`).
+    pub tunnel: String,
+    /// The peer machine's LAN address (for engines on a trusted network).
+    pub host: String,
+    /// The peer process's ports: "" is its main port, others by name.
+    pub ports: Vec<(String, u16)>,
 }
 
-/// Time one stage spent on one message, microseconds.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
-pub struct StageTime {
-    pub stage: u32,
-    /// Waiting in the stage's queue.
-    pub queue_us: u32,
-    /// Running the stage (including (de)serializing activations).
-    pub compute_us: u32,
-    /// Sequences that shared this stage pass (continuous batching).
-    pub batch: u16,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
-pub enum KvOpKind {
-    /// Keep only the first `len` positions (reuse a shared prompt prefix).
-    Truncate { len: u32 },
-    /// Move the KV to this machine's disk and free memory.
-    Spill,
-    /// Load spilled KV back into memory.
-    Restore,
-    /// Delete a spilled sequence's files.
-    Drop,
-}
-
-/// Draft tokens and the (sparse) distributions they were drawn from.
+/// What a role on a machine is doing.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct Draft {
-    pub tokens: Vec<u32>,
-    pub q: Vec<Vec<(u32, f32)>>,
-}
-
-/// Where a stage sends its output.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub enum NextHop {
-    /// Another stage's data port.
-    Stage(String),
-    /// The coordinator's data port (last stage).
-    Coordinator(String),
+pub enum RoleState {
+    Downloading {
+        file: String,
+        done: u64,
+        total: u64,
+    },
+    Starting,
+    /// The process runs and listens on these ports ("" = main).
+    Started {
+        ports: Vec<(String, u16)>,
+    },
+    /// Engine-specific preparation (pulling a model, placing it).
+    Preparing {
+        what: String,
+        done: u64,
+        total: u64,
+    },
+    Ready,
+    Failed {
+        error: String,
+        log: Vec<String>,
+    },
+    Exited {
+        code: Option<i32>,
+        log: Vec<String>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Msg {
-    // ---- control plane --------------------------------------------------
+    // ---- control ---------------------------------------------------------
     Hello {
         protocol: u32,
         version: String,
         profile: NodeProfile,
-        data_port: u16,
-        backends: Vec<String>,
-        /// Which of the pool's models this session serves (None = the first).
-        model: Option<String>,
-        /// Random per-process id: sessions from one machine share it, so the
-        /// pool can split that machine's memory between models.
+        /// Port of this machine's tunnel listener.
+        tunnel_port: u16,
+        /// Random per-process id (survives reconnects).
         machine: u64,
+        /// Runs inside the server process (the server's own compute).
+        local: bool,
+        /// `Vec<Detection>` as JSON.
+        engines: String,
     },
     Welcome {
-        node_id: u32,
-        name: String,
+        key: String,
         cluster: String,
-        /// Every model the pool serves; the agent opens one session per model.
-        models: Vec<String>,
+        /// The address the server sees for this machine.
+        address: String,
     },
     Reject {
         reason: String,
@@ -119,243 +81,43 @@ pub enum Msg {
     Pong {
         t: u64,
     },
-    /// Bandwidth probe; the agent answers with ProbeAck.
-    Probe {
-        #[serde(with = "serde_bytes")]
-        data: Vec<u8>,
+    /// Server → agent: look for engines again (after installing one).
+    Detect,
+    /// Agent → server: engines found (`Vec<Detection>` as JSON).
+    Engines {
+        engines: String,
     },
-    ProbeAck {
-        len: u64,
+    /// Server → agent: start one role of a deployment.
+    Start {
+        deployment: String,
+        /// `Role` as JSON.
+        role: String,
+        peers: Vec<Peer>,
+        /// Isolation name for engines with their own discovery.
+        namespace: String,
     },
-    LoadStage {
-        epoch: u64,
-        index: u32,
-        model_key: String,
-        config_json: String,
-        spec: StageSpec,
-        format: String,
-        device: String,
-        tensors: Vec<TensorEntry>,
-        next: NextHop,
-        /// Download the tensors from here; ask the coordinator (NeedWeights)
-        /// only if that fails. None: the coordinator sends them.
-        source: Option<WeightSource>,
+    Stop {
+        deployment: String,
+        role: String,
     },
-    /// Agent → coordinator: send me these tensors (not cached locally).
-    NeedWeights {
-        epoch: u64,
-        names: Vec<String>,
+    /// Agent → server.
+    RoleUpdate {
+        deployment: String,
+        role: String,
+        state: RoleState,
     },
-    WeightData {
-        epoch: u64,
-        name: String,
-        offset: u64,
-        #[serde(with = "serde_bytes")]
-        data: Vec<u8>,
-    },
-    WeightsDone {
-        epoch: u64,
-    },
-    LoadProgress {
-        epoch: u64,
-        phase: String,
-        done: u64,
-        total: u64,
-    },
-    StageReady {
-        epoch: u64,
-        weight_bytes: u64,
-        load_ms: u64,
-        device: String,
-    },
-    LoadFailed {
-        epoch: u64,
-        error: String,
-    },
-    Unload {
-        epoch: u64,
-    },
-    /// End a session. `leave`: the whole cluster is going away (or this
-    /// machine was removed) and the agent process should exit; otherwise only
-    /// this model stopped and the machine stays in the pool.
+    /// End the session. `leave`: the agent process exits.
     Bye {
         reason: String,
         leave: bool,
     },
 
-    // ---- data plane -----------------------------------------------------
-    /// Identify a data connection's sender.
-    /// `results`: true when the sender is the last stage returning tokens to
-    /// the coordinator; false when it feeds a stage's input.
-    DataHello {
-        epoch: u64,
-        results: bool,
+    // ---- tunnels -----------------------------------------------------------
+    /// Open a byte stream to a role's main port on this machine
+    /// (`deployment/role`). The answer is `Opened` or `Reject`; after
+    /// `Opened` both sides send raw frames, an empty one ending each side.
+    Open {
+        target: String,
     },
-    Forward {
-        epoch: u64,
-        seq: u64,
-        pos: u32,
-        payload: Payload,
-        want_logits: bool,
-        sample: Option<SampleSetup>,
-        /// Per-stage timings appended as the message travels the pipeline.
-        trace: Vec<StageTime>,
-        /// Speculative draft to verify: the payload is [last token, drafts...].
-        draft: Option<Draft>,
-    },
-    /// Tokens accepted by speculative verification, plus one sampled token.
-    Tokens {
-        epoch: u64,
-        seq: u64,
-        pos: u32,
-        tokens: Vec<u32>,
-        trace: Vec<StageTime>,
-    },
-    /// Sampled token from the last stage.
-    Token {
-        epoch: u64,
-        seq: u64,
-        pos: u32,
-        token: u32,
-        trace: Vec<StageTime>,
-    },
-    /// Free a sequence's KV on every stage (travels down the chain).
-    Release {
-        epoch: u64,
-        seq: u64,
-    },
-    /// Manage a parked sequence's KV on every stage (travels down the chain;
-    /// the last stage returns it to the coordinator as an acknowledgement).
-    KvOp {
-        epoch: u64,
-        seq: u64,
-        op: KvOpKind,
-        ok: bool,
-        error: Option<String>,
-    },
-    /// A stage failed on a sequence (travels down the chain to the coordinator).
-    StageError {
-        epoch: u64,
-        seq: u64,
-        stage: u32,
-        error: String,
-    },
-
-    // ---- pool membership (kept last: variant indices above are stable) ----
-    /// Pool → agent: the models the pool serves now. The agent opens a
-    /// session for each one it doesn't serve yet.
-    Models {
-        models: Vec<String>,
-    },
-}
-
-impl WireTensor {
-    /// The payload as little-endian N-byte words.
-    fn words<const N: usize>(&self) -> impl Iterator<Item = [u8; N]> + '_ {
-        let d = &self.data;
-        (0..d.len() / N).map(move |i| {
-            let mut w = [0u8; N];
-            w.copy_from_slice(&d[i * N..i * N + N]);
-            w
-        })
-    }
-
-    pub fn from_tensor(t: &candle_core::Tensor) -> anyhow::Result<WireTensor> {
-        use candle_core::DType;
-        let shape = t.dims().to_vec();
-        let flat = t.flatten_all()?;
-        let (dtype, data) = match t.dtype() {
-            DType::F32 => ("f32", bytes_of(&flat.to_vec1::<f32>()?)),
-            DType::BF16 => (
-                "bf16",
-                bytes_of(
-                    &flat
-                        .to_vec1::<half::bf16>()?
-                        .iter()
-                        .map(|x| x.to_bits())
-                        .collect::<Vec<u16>>(),
-                ),
-            ),
-            DType::F16 => (
-                "f16",
-                bytes_of(
-                    &flat
-                        .to_vec1::<half::f16>()?
-                        .iter()
-                        .map(|x| x.to_bits())
-                        .collect::<Vec<u16>>(),
-                ),
-            ),
-            other => anyhow::bail!("unsupported activation dtype {other:?}"),
-        };
-        Ok(WireTensor {
-            dtype: dtype.into(),
-            shape,
-            data,
-        })
-    }
-
-    pub fn to_tensor(&self, device: &candle_core::Device) -> anyhow::Result<candle_core::Tensor> {
-        use candle_core::Tensor;
-        let n: usize = self.shape.iter().product();
-        let elem = match self.dtype.as_str() {
-            "f32" => 4,
-            "bf16" | "f16" => 2,
-            d => anyhow::bail!("unsupported wire dtype {d}"),
-        };
-        if self.shape.len() > 4 || n.checked_mul(elem) != Some(self.data.len()) {
-            anyhow::bail!(
-                "activation tensor has {} bytes for shape {:?} ({})",
-                self.data.len(),
-                self.shape,
-                self.dtype
-            );
-        }
-        let t = match self.dtype.as_str() {
-            "f32" => {
-                let v: Vec<f32> = self.words::<4>().map(f32::from_le_bytes).collect();
-                Tensor::from_vec(v, self.shape.clone(), device)?
-            }
-            "bf16" => {
-                let v: Vec<half::bf16> = self
-                    .words::<2>()
-                    .map(|c| half::bf16::from_bits(u16::from_le_bytes(c)))
-                    .collect();
-                Tensor::from_vec(v, self.shape.clone(), device)?
-            }
-            _ => {
-                let v: Vec<half::f16> = self
-                    .words::<2>()
-                    .map(|c| half::f16::from_bits(u16::from_le_bytes(c)))
-                    .collect();
-                Tensor::from_vec(v, self.shape.clone(), device)?
-            }
-        };
-        Ok(t)
-    }
-}
-
-fn bytes_of<T: Copy>(v: &[T]) -> Vec<u8> {
-    let n = std::mem::size_of_val(v);
-    let mut out = vec![0u8; n];
-    // SAFETY: plain-old-data copy; little-endian hosts (x86_64, aarch64).
-    unsafe { std::ptr::copy_nonoverlapping(v.as_ptr() as *const u8, out.as_mut_ptr(), n) };
-    out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn tensor_roundtrip() {
-        let t = candle_core::Tensor::new(&[[1.5f32, -2.0], [3.25, 4.0]], &candle_core::Device::Cpu)
-            .unwrap();
-        let w = WireTensor::from_tensor(&t).unwrap();
-        let back = w.to_tensor(&candle_core::Device::Cpu).unwrap();
-        assert_eq!(back.to_vec2::<f32>().unwrap(), t.to_vec2::<f32>().unwrap());
-        let mut bad = w.clone();
-        bad.shape = vec![100, 100];
-        assert!(bad.to_tensor(&candle_core::Device::Cpu).is_err());
-    }
+    Opened,
 }
