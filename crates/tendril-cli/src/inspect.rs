@@ -44,10 +44,10 @@ pub fn run(a: InspectArgs) -> Result<()> {
                 "{} ({}){}",
                 m.arch.label(),
                 m.model_type,
-                if m.arch.executable() {
+                if m.arch.known() {
                     String::new()
                 } else {
-                    format!(" {}", yellow("— planning only"))
+                    format!(" {}", yellow("— generic estimate"))
                 }
             ),
         ),

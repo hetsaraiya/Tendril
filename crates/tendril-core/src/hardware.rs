@@ -294,16 +294,16 @@ pub fn detect_local(consider_free_memory: bool) -> NodeProfile {
 }
 
 /// Bump when the benchmark changes so every machine measures again.
-pub const BENCH_VERSION: u32 = 1;
+pub const BENCH_VERSION: u32 = 2;
 
 /// A machine's measured speed, kept until its hardware changes.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Benchmark {
     /// What was measured (see [`fingerprint`]).
     pub fingerprint: String,
-    /// Weights streamed per second by the decode kernels, GB/s.
+    /// Memory read speed while streaming weights, GB/s.
     pub weight_gbs: f64,
-    /// Matrix-multiply throughput (prefill), TFLOP/s.
+    /// Matrix-multiply throughput (prefill), TFLOP/s, on the CPU.
     pub tflops: f64,
     /// Plain memory copy, GB/s (for reference).
     pub copy_gbs: f64,
@@ -367,17 +367,13 @@ pub fn save_benchmark(b: &Benchmark) {
     }
 }
 
-/// Use this hardware's measured speed in place of spec-sheet numbers.
+/// Use this hardware's measured speed in place of spec-sheet numbers
+/// (CPU machines; see [`measure`]).
 pub fn apply_benchmark(node: &mut NodeProfile) {
-    match saved_benchmark(node) {
-        Some(b) => {
-            node.measured_bandwidth_gbs = Some(b.weight_gbs);
-            node.measured_tflops = Some(b.tflops);
-        }
-        None => {
-            node.measured_bandwidth_gbs = None;
-            node.measured_tflops = None;
-        }
+    node.measured_bandwidth_gbs = None;
+    node.measured_tflops = None;
+    if let Some(b) = saved_benchmark(node) {
+        apply_measured_cpu(node, &b);
     }
 }
 
@@ -483,6 +479,107 @@ fn run_with_timeout(cmd: &str, args: &[&str], timeout: Duration) -> Option<Strin
     }
 }
 
+/// Measure this machine: memory bandwidth and CPU matrix throughput (a few
+/// seconds). GPUs are left to their spec-sheet numbers: each engine has its
+/// own kernels, so no single measurement is right for all of them.
+pub fn measure(p: &NodeProfile) -> Benchmark {
+    let t0 = Instant::now();
+    let copy = probe_memory_bandwidth();
+    let read = probe_read_bandwidth();
+    let tflops = probe_cpu_tflops();
+    Benchmark {
+        fingerprint: fingerprint(p),
+        weight_gbs: read,
+        tflops,
+        copy_gbs: copy,
+        device: "CPU".into(),
+        measured_at: String::new(),
+        seconds: t0.elapsed().as_secs_f64(),
+    }
+}
+
+/// Use a CPU benchmark only for machines that run models on the CPU.
+pub fn apply_measured_cpu(node: &mut NodeProfile, b: &Benchmark) {
+    if node.backend == Backend::Cpu {
+        node.measured_bandwidth_gbs = Some(b.weight_gbs);
+        node.measured_tflops = Some(b.tflops);
+    }
+}
+
+/// Multi-threaded sequential reads (what decoding does with weights), GB/s.
+pub fn probe_read_bandwidth() -> f64 {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(32);
+    let per_thread = (512 * MIB as usize) / threads / 8;
+    let data: Vec<Vec<u64>> = (0..threads)
+        .map(|i| vec![i as u64 + 1; per_thread])
+        .collect();
+    let mut best = 0.0f64;
+    for _ in 0..4 {
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            for d in &data {
+                s.spawn(move || {
+                    let mut acc = [0u64; 4];
+                    for i in (0..d.len() - d.len() % 4).step_by(4) {
+                        acc[0] = acc[0].wrapping_add(d[i]);
+                        acc[1] = acc[1].wrapping_add(d[i + 1]);
+                        acc[2] = acc[2].wrapping_add(d[i + 2]);
+                        acc[3] = acc[3].wrapping_add(d[i + 3]);
+                    }
+                    std::hint::black_box(acc);
+                });
+            }
+        });
+        let gbs = (per_thread * 8 * threads) as f64 / start.elapsed().as_secs_f64() / 1e9;
+        best = best.max(gbs);
+    }
+    best
+}
+
+/// fp32 matrix multiply on every core, TFLOP/s (a blocked kernel the
+/// compiler vectorizes; engines with tuned kernels do better).
+pub fn probe_cpu_tflops() -> f64 {
+    const N: usize = 256;
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(64);
+    let a: Vec<f32> = (0..N * N).map(|i| (i % 7) as f32 * 0.1).collect();
+    let b: Vec<f32> = (0..N * N).map(|i| (i % 5) as f32 * 0.2).collect();
+    let mut best = 0.0f64;
+    for _ in 0..3 {
+        let start = Instant::now();
+        let reps = 4;
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                let (a, b) = (&a, &b);
+                s.spawn(move || {
+                    let mut c = vec![0f32; N * N];
+                    for _ in 0..reps {
+                        for i in 0..N {
+                            let row = &mut c[i * N..(i + 1) * N];
+                            for k in 0..N {
+                                let x = a[i * N + k];
+                                let bk = &b[k * N..(k + 1) * N];
+                                for (r, y) in row.iter_mut().zip(bk) {
+                                    *r += x * y;
+                                }
+                            }
+                        }
+                    }
+                    std::hint::black_box(&c);
+                });
+            }
+        });
+        let flops = 2.0 * (N * N * N) as f64 * reps as f64 * threads as f64;
+        best = best.max(flops / start.elapsed().as_secs_f64() / 1e12);
+    }
+    best
+}
+
 /// Measure achievable memory bandwidth with a multi-threaded copy.
 /// Returns GB/s (decimal). Takes well under a second.
 pub fn probe_memory_bandwidth() -> f64 {
@@ -529,13 +626,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("TENDRIL_BENCH_FILE", dir.join("b.json"));
         let mut p = crate::presets::node_from_spec("box", "m4:16").unwrap();
+        p.use_backend(Backend::Cpu);
         let spec_bw = p.effective_bandwidth_gbs();
         save_benchmark(&Benchmark {
             fingerprint: fingerprint(&p),
             weight_gbs: 42.0,
             tflops: 1.5,
             copy_gbs: 60.0,
-            device: "Metal".into(),
+            device: "CPU".into(),
             measured_at: "now".into(),
             seconds: 1.0,
         });
@@ -546,18 +644,22 @@ mod tests {
             "measured replaces the spec sheet"
         );
         assert_eq!(p.effective_tflops(), 1.5);
-        // More memory (or another backend) is different hardware: measure again.
+        // More memory is different hardware: measure again.
         let mut bigger = crate::presets::node_from_spec("box", "m4:32").unwrap();
-        apply_benchmark(&mut bigger);
+        bigger.use_backend(Backend::Cpu);
         assert!(bigger.measured_bandwidth_gbs.is_none());
-        p.use_backend(Backend::Cpu);
-        assert!(
-            p.measured_bandwidth_gbs.is_none(),
-            "the CPU wasn't benchmarked"
-        );
+        // GPUs keep their spec-sheet numbers (each engine has its own kernels).
+        p.use_backend(Backend::Metal);
+        assert!(p.measured_bandwidth_gbs.is_none());
         assert_ne!(p.effective_bandwidth_gbs(), spec_bw);
         std::env::remove_var("TENDRIL_BENCH_FILE");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cpu_probes_measure_something() {
+        assert!(probe_cpu_tflops() > 0.0);
+        assert!(probe_read_bandwidth() > 0.0);
     }
 
     #[test]

@@ -123,8 +123,9 @@ impl Arch {
             Arch::Other => "Unknown",
         }
     }
-    /// Architectures Tendril's execution engine can run.
-    pub fn executable(self) -> bool {
+    /// Architectures Tendril has exact memory formulas for (others are
+    /// planned with generic transformer formulas).
+    pub fn known(self) -> bool {
         !matches!(self, Arch::Other)
     }
 }

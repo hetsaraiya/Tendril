@@ -1,6 +1,6 @@
 //! `tendril chat` and `tendril status`: talk to a running `tendril serve`.
 
-use crate::ui::{self, *};
+use crate::ui::*;
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use serde_json::{json, Value};
@@ -12,7 +12,7 @@ pub struct ChatArgs {
     /// Server URL.
     #[arg(long, default_value = "http://127.0.0.1:8080", env = "TENDRIL_URL")]
     pub url: String,
-    /// Model to talk to when the server runs several (default: its first).
+    /// Model to talk to when the server runs several (default: the first chat model).
     #[arg(long, short = 'm')]
     pub model: Option<String>,
     /// System prompt.
@@ -31,7 +31,7 @@ pub struct ChatArgs {
 pub struct StatusArgs {
     #[arg(long, default_value = "http://127.0.0.1:8080", env = "TENDRIL_URL")]
     pub url: String,
-    /// Show this model's pipeline when the server runs several.
+    /// Show only this model.
     #[arg(long, short = 'm')]
     pub model: Option<String>,
     #[arg(long)]
@@ -40,19 +40,36 @@ pub struct StatusArgs {
 
 #[derive(Args, Debug)]
 pub struct LoadArgs {
-    /// HuggingFace id, catalog name or a folder on the server.
+    /// The model, in the engine's terms (`tendril engines` shows examples).
     pub model: String,
+    /// Engine to run it with: llama.cpp, vllm, sglang, ollama, mlx, exo,
+    /// comfyui, sd.cpp, whisper.cpp.
+    #[arg(long, short = 'e', default_value = "llama.cpp")]
+    pub engine: String,
     #[arg(long, default_value = "http://127.0.0.1:8080", env = "TENDRIL_URL")]
     pub url: String,
     /// Cluster token (default: the one `tendril serve` saved on this machine).
     #[arg(long, env = "TENDRIL_TOKEN")]
     pub token: Option<String>,
-    /// Weight format: native, q8_0, q6_k, q4_k (default: the server's).
+    /// Quantization (engine-specific, e.g. Q4_K_M for llama.cpp).
     #[arg(long, short = 'q')]
     pub quantize: Option<String>,
     /// Tokens per conversation, e.g. 8k (default: the server's).
     #[arg(long, short = 'c')]
     pub context: Option<String>,
+    /// Conversations at once (default: the server's).
+    #[arg(long)]
+    pub concurrency: Option<usize>,
+    /// Only use these machines (names, comma-separated).
+    #[arg(long, value_delimiter = ',')]
+    pub machines: Option<Vec<String>>,
+    /// Split across at least this many machines.
+    #[arg(long)]
+    pub min_machines: Option<usize>,
+    /// The machines share a private network you trust (needed to split a
+    /// model with engines whose own traffic isn't encrypted).
+    #[arg(long)]
+    pub trusted_network: bool,
     /// Load without asking.
     #[arg(long, short = 'y')]
     pub yes: bool,
@@ -77,15 +94,24 @@ fn control(url: &str, token: &str, path: &str, body: &Value) -> Result<Value> {
     Ok(v)
 }
 
-/// `tendril load`: plan a model across the pool, show what each machine
-/// gets, and load it once confirmed. Each machine then downloads only its
-/// own layers.
+fn ask(q: &str) -> Result<bool> {
+    print!("{q} [Y/n] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    let l = line.trim().to_ascii_lowercase();
+    Ok(!(l == "n" || l == "no"))
+}
+
+/// `tendril load`: plan a model with an engine, show what each machine
+/// gets and what it needs, and load it once confirmed.
 pub fn load(a: LoadArgs) -> Result<()> {
     let token = match &a.token {
         Some(t) => t.clone(),
         None => tendril_cluster::token::load_or_create()?,
     };
-    let mut req = json!({"model": a.model});
+    let mut req =
+        json!({"model": a.model, "engine": a.engine, "trusted_network": a.trusted_network});
     if let Some(q) = &a.quantize {
         req["quantize"] = json!(q);
     }
@@ -94,24 +120,49 @@ pub fn load(a: LoadArgs) -> Result<()> {
             .with_context(|| format!("cannot parse --context '{c}'"))?;
         req["context"] = json!(n);
     }
-    eprintln!("{} Planning {} across the pool…", dim("·"), bold(&a.model));
+    if let Some(n) = a.concurrency {
+        req["concurrency"] = json!(n);
+    }
+    if let Some(m) = &a.machines {
+        req["machines"] = json!(m);
+    }
+    if let Some(n) = a.min_machines {
+        req["min_machines"] = json!(n);
+    }
+    eprintln!(
+        "{} Planning {} with {}…",
+        dim("·"),
+        bold(&a.model),
+        bold(&a.engine)
+    );
     let v = loop {
         let p = control(&a.url, &token, "/api/plan", &req)?;
         print_plan(&p);
         if p["fits"] != json!(true) {
-            bail!("not loading: it doesn't fit on the machines in the pool");
+            bail!(
+                "not loading: {}",
+                p["reason"]
+                    .as_str()
+                    .unwrap_or("it can't run on these machines")
+            );
         }
-        if !a.yes {
-            print!("\n  Load it? Each machine downloads only its share. [Y/n] ");
-            std::io::stdout().flush()?;
-            let mut line = String::new();
-            std::io::stdin().lock().read_line(&mut line)?;
-            if line.trim().eq_ignore_ascii_case("n") || line.trim().eq_ignore_ascii_case("no") {
-                println!("{}", dim("  Not loaded."));
-                return Ok(());
+        if p["needs_trusted_network"] == json!(true) && req["trusted_network"] != json!(true) {
+            println!();
+            println!(
+                "  {} {}",
+                warn_mark(),
+                bold("This split sends the engine's traffic between machines unencrypted.")
+            );
+            println!("    {}", p["risk"].as_str().unwrap_or(""));
+            if a.yes || !ask("  Are these machines on a private network you trust?")? {
+                bail!("not loading: confirm a trusted network with --trusted-network, or limit it to one machine with --machines");
             }
+            req["trusted_network"] = json!(true);
         }
-        // Load exactly this plan: refused if the pool changed meanwhile.
+        if !a.yes && !ask("\n  Load it?")? {
+            println!("{}", dim("  Not loaded."));
+            return Ok(());
+        }
         let mut confirmed = req.clone();
         confirmed["expect_version"] = p["pool_version"].clone();
         match control(&a.url, &token, "/api/models", &confirmed) {
@@ -126,22 +177,11 @@ pub fn load(a: LoadArgs) -> Result<()> {
         }
     };
     println!(
-        "{} Loading {} — machines are downloading their shares; watch with `tendril status` or the dashboard",
+        "{} Loading {} — watch with `tendril status` or the dashboard",
         ok_mark(),
-        bold(v["loaded"].as_str().unwrap_or(&a.model))
+        bold(v["loading"].as_str().unwrap_or(&a.model))
     );
     Ok(())
-}
-
-fn fmt_params(n: u64) -> String {
-    let n = n as f64;
-    if n >= 1e9 {
-        format!("{:.1}B", n / 1e9)
-    } else if n >= 1e6 {
-        format!("{:.0}M", n / 1e6)
-    } else {
-        format!("{:.0}K", n / 1e3)
-    }
 }
 
 fn print_plan(p: &Value) {
@@ -152,96 +192,94 @@ fn print_plan(p: &Value) {
         bold("Plan ·"),
         bold(cyan(p["model"].as_str().unwrap_or(""))),
         dim(format!(
-            "{} · {} params · {} layers · {} weights ({}) · {} ctx",
-            p["architecture"].as_str().unwrap_or(""),
-            fmt_params(p["params"].as_u64().unwrap_or(0)),
+            "with {} · {} · {} layers · {} · {} ctx × {}",
+            p["engine"]["name"].as_str().unwrap_or(""),
+            p["task"].as_str().unwrap_or(""),
             p["layers"],
             b(&p["weight_bytes"]),
-            p["format"].as_str().unwrap_or(""),
-            p["context"]
+            p["context"],
+            p["concurrency"]
         ))
     );
-    let shares = p["shares"].as_array().cloned().unwrap_or_default();
-    if !shares.is_empty() {
-        let mut t = Table::new(&[
-            "MACHINE",
-            "GETS",
-            "WEIGHTS",
-            "SHARE",
-            "MEMORY NEEDED",
-            "DOWNLOADS",
-        ]);
-        for s in &shares {
+    for n in p["notes"].as_array().cloned().unwrap_or_default() {
+        println!("  {} {}", dim("·"), dim(n.as_str().unwrap_or("")));
+    }
+    let stages = p["stages"].as_array().cloned().unwrap_or_default();
+    if !stages.is_empty() {
+        let mut t = Table::new(&["MACHINE", "LAYERS", "WEIGHTS", "SHARE", "MEMORY", "MOVES"]);
+        for s in &stages {
+            let l = &s["layers"];
+            let layers = if l[1].as_u64().unwrap_or(0) > 0 {
+                format!("{}–{}", l[0], l[1].as_u64().unwrap_or(1) - 1)
+            } else {
+                "–".into()
+            };
             t.row(vec![
                 bold(format!(
-                    "{} {}",
+                    "{}{} {}",
                     s["machine"].as_str().unwrap_or(""),
+                    if s["serves_api"] == json!(true) {
+                        " ★"
+                    } else {
+                        ""
+                    },
                     dim(format!("({})", s["backend"].as_str().unwrap_or("")))
                 )),
-                s["components"].as_str().unwrap_or("").to_string(),
+                layers,
                 b(&s["weight_bytes"]).to_string(),
                 format!("{:.0}%", s["weight_pct"].as_f64().unwrap_or(0.0)),
-                format!("{} of {}", b(&s["memory_needed"]), b(&s["memory_budget"])),
-                b(&s["weight_bytes"]).to_string(),
+                format!(
+                    "{} of {} free",
+                    b(&s["memory_needed"]),
+                    b(&s["memory_free"])
+                ),
+                dim(s["transfer"].as_str().unwrap_or("")),
             ]);
         }
         t.print();
+        if let Some(tps) = p["tokens_per_sec"].as_f64() {
+            println!(
+                "  {} ~{:.1} tok/s predicted · ★ serves the API",
+                ok_mark(),
+                tps
+            );
+        }
         println!(
-            "  {} ~{:.1} tok/s · first token ~{}",
-            ok_mark(),
-            p["tokens_per_sec"].as_f64().unwrap_or(0.0),
-            tendril_core::units::fmt_ms(p["ttft_ms"].as_f64().unwrap_or(0.0))
+            "  {} {}",
+            dim("Network:"),
+            dim(p["security"].as_str().unwrap_or(""))
         );
     } else {
         println!(
-            "  {} doesn't fit: {}",
+            "  {} {}",
             bad_mark(),
             p["reason"].as_str().unwrap_or("not enough memory")
         );
     }
-    let displaced: Vec<&str> = p["displaces"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
-        .unwrap_or_default();
-    if !displaced.is_empty() {
+    for u in p["unavailable"].as_array().cloned().unwrap_or_default() {
+        let missing: Vec<String> = u["missing"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|m| {
+                format!(
+                    "{}{}",
+                    m["name"].as_str().unwrap_or(""),
+                    m["install"]
+                        .as_str()
+                        .map(|i| format!(" ({i})"))
+                        .unwrap_or_default()
+                )
+            })
+            .collect();
         println!(
-            "  {} loading it leaves no room for: {}",
+            "  {} {} can't run {}: missing {}",
             warn_mark(),
-            displaced.join(", ")
+            bold(u["machine"].as_str().unwrap_or("")),
+            p["engine"]["name"].as_str().unwrap_or(""),
+            missing.join("; ")
         );
-    }
-    let fits_other: Vec<String> = p["alternatives"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter(|x| x["fits"] == json!(true))
-                .map(|x| {
-                    format!(
-                        "{} ({}, ~{:.1} tok/s)",
-                        x["format"].as_str().unwrap_or(""),
-                        b(&x["weight_bytes"]),
-                        x["tokens_per_sec"].as_f64().unwrap_or(0.0)
-                    )
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    if !fits_other.is_empty() {
-        println!(
-            "  {} other formats that fit: {}  {}",
-            cyan("→"),
-            fits_other.join(" · "),
-            dim("(--quantize <format>)")
-        );
-    }
-    for adv in p["advice"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
-        .iter()
-        .take(3)
-    {
-        println!("  {} {}", cyan("→"), dim(adv.as_str().unwrap_or("")));
     }
 }
 
@@ -252,14 +290,11 @@ fn client() -> Result<reqwest::blocking::Client> {
         .build()?)
 }
 
-fn fetch_status(url: &str, model: Option<&str>) -> Result<Value> {
-    let mut req = client()?.get(format!("{}/api/status", url.trim_end_matches('/')));
-    if let Some(m) = model {
-        req = req.query(&[("model", m)]);
-    }
-    let r = req.send().with_context(|| {
-        format!("no Tendril server at {url} — start one with `tendril serve <model>`")
-    })?;
+fn fetch_status(url: &str) -> Result<Value> {
+    let r = client()?
+        .get(format!("{}/api/status", url.trim_end_matches('/')))
+        .send()
+        .with_context(|| format!("no Tendril server at {url} — start one with `tendril serve`"))?;
     let ok = r.status().is_success();
     let v: Value = r.json()?;
     if !ok {
@@ -271,38 +306,56 @@ fn fetch_status(url: &str, model: Option<&str>) -> Result<Value> {
     Ok(v)
 }
 
-/// Other models the server runs, for hints.
-fn other_models(st: &Value) -> Vec<String> {
-    let me = st["model"].as_str().unwrap_or("");
-    st["models"]
+/// Chat models the server runs: (name, status).
+fn chat_models(st: &Value) -> Vec<(String, String)> {
+    st["deployments"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|m| m["id"].as_str())
-                .filter(|id| *id != me)
-                .map(String::from)
-                .collect()
-        })
+        .cloned()
         .unwrap_or_default()
+        .iter()
+        .filter(|d| d["task"] == json!("chat"))
+        .map(|d| {
+            (
+                d["name"].as_str().unwrap_or("").to_string(),
+                d["status"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect()
 }
 
 pub fn chat(mut a: ChatArgs) -> Result<()> {
-    let st = fetch_status(&a.url, a.model.as_deref())?;
-    let model = st["model"].as_str().unwrap_or("model").to_string();
-    // Pin the resolved name so every request goes to the same model.
+    let st = fetch_status(&a.url)?;
+    let models = chat_models(&st);
+    let model = match &a.model {
+        Some(m) => m.clone(),
+        None => match models.first() {
+            Some((m, _)) => m.clone(),
+            None => bail!("no chat model is loaded — `tendril load <model> --engine <engine>`"),
+        },
+    };
     a.model = Some(model.clone());
-    let state = st["status"]["state"].as_str().unwrap_or("");
-    if state != "ready" {
+    let state = |st: &Value| {
+        chat_models(st)
+            .into_iter()
+            .find(|(n, _)| *n == model)
+            .map(|(_, s)| s)
+            .unwrap_or_default()
+    };
+    if state(&st) != "ready" {
         println!(
-            "{} {} is not ready yet ({state}). Waiting…",
+            "{} {} is not ready yet ({}). Waiting…",
             warn_mark(),
-            model
+            model,
+            state(&st)
         );
         loop {
             std::thread::sleep(Duration::from_secs(2));
-            let s = fetch_status(&a.url, a.model.as_deref())?;
-            if s["status"]["state"] == "ready" {
+            let s = state(&fetch_status(&a.url)?);
+            if s == "ready" {
                 break;
+            }
+            if s == "failed" || s.is_empty() {
+                bail!("{model} failed to load — see `tendril status`");
             }
         }
     }
@@ -321,7 +374,11 @@ pub fn chat(mut a: ChatArgs) -> Result<()> {
         send(&a, &history, true)?;
         return Ok(());
     }
-    let others = other_models(&st);
+    let others: Vec<String> = models
+        .iter()
+        .map(|(n, _)| n.clone())
+        .filter(|n| *n != model)
+        .collect();
     if !others.is_empty() {
         println!(
             "{}",
@@ -354,37 +411,31 @@ pub fn chat(mut a: ChatArgs) -> Result<()> {
                 continue;
             }
             "/model" | "/models" => {
-                let st = fetch_status(&a.url, a.model.as_deref())?;
-                for m in st["models"].as_array().cloned().unwrap_or_default() {
-                    let id = m["id"].as_str().unwrap_or("");
-                    let mark = if Some(id) == a.model.as_deref() {
+                for (id, state) in chat_models(&fetch_status(&a.url)?) {
+                    let mark = if Some(id.as_str()) == a.model.as_deref() {
                         "›"
                     } else {
                         " "
                     };
-                    println!(
-                        "{} {} {}",
-                        cyan(mark),
-                        bold(id),
-                        dim(m["state"].as_str().unwrap_or(""))
-                    );
+                    println!("{} {} {}", cyan(mark), bold(&id), dim(state));
                 }
                 continue;
             }
             l if l.starts_with("/model ") => {
-                let want = l["/model ".len()..].trim();
-                match fetch_status(&a.url, Some(want)) {
-                    Ok(st) => {
-                        let id = st["model"].as_str().unwrap_or(want).to_string();
-                        println!(
-                            "{}",
-                            dim(format!(
-                                "(now talking to {id}; the conversation carries over)"
-                            ))
-                        );
-                        a.model = Some(id);
-                    }
-                    Err(e) => println!("{} {e:#}", bad_mark()),
+                let want = l["/model ".len()..].trim().to_string();
+                if chat_models(&fetch_status(&a.url)?)
+                    .iter()
+                    .any(|(n, _)| *n == want)
+                {
+                    println!(
+                        "{}",
+                        dim(format!(
+                            "(now talking to {want}; the conversation carries over)"
+                        ))
+                    );
+                    a.model = Some(want);
+                } else {
+                    println!("{} no chat model named {want}", bad_mark());
                 }
                 continue;
             }
@@ -405,7 +456,7 @@ pub fn chat(mut a: ChatArgs) -> Result<()> {
 
 fn send(a: &ChatArgs, history: &[Value], plain: bool) -> Result<String> {
     let body = json!({
-        "model": a.model.as_deref().unwrap_or("tendril"), "messages": history, "stream": true, "temperature": a.temperature,
+        "model": a.model.as_deref().unwrap_or(""), "messages": history, "stream": true, "temperature": a.temperature,
         "max_tokens": a.max_tokens, "stream_options": {"include_usage": true},
     });
     let resp = client()?
@@ -422,6 +473,7 @@ fn send(a: &ChatArgs, history: &[Value], plain: bool) -> Result<String> {
             v["error"]["message"].as_str().unwrap_or("request failed")
         );
     }
+    let t0 = std::time::Instant::now();
     let mut out = String::new();
     let mut stats = None;
     for line in BufReader::new(resp).lines() {
@@ -447,15 +499,13 @@ fn send(a: &ChatArgs, history: &[Value], plain: bool) -> Result<String> {
     }
     println!();
     if let (Some(s), false) = (stats, plain) {
+        let secs = t0.elapsed().as_secs_f64();
+        let n = s["usage"]["completion_tokens"].as_u64().unwrap_or(0);
         println!(
             "{}",
             dim(format!(
-                "      {} tokens · {:.1} tok/s · first token {:.0} ms",
-                s["usage"]["completion_tokens"],
-                s["tendril"]["decode_tokens_per_sec"]
-                    .as_f64()
-                    .unwrap_or(0.0),
-                s["tendril"]["ttft_ms"].as_f64().unwrap_or(0.0)
+                "      {n} tokens · {:.1} tok/s",
+                n as f64 / secs.max(1e-3)
             ))
         );
     }
@@ -463,7 +513,7 @@ fn send(a: &ChatArgs, history: &[Value], plain: bool) -> Result<String> {
 }
 
 pub fn status(a: StatusArgs) -> Result<()> {
-    let st = fetch_status(&a.url, a.model.as_deref())?;
+    let st = fetch_status(&a.url)?;
     if a.json {
         println!("{}", serde_json::to_string_pretty(&st)?);
         return Ok(());
@@ -471,112 +521,111 @@ pub fn status(a: StatusArgs) -> Result<()> {
     println!();
     println!(
         "{} {}",
-        bold("Tendril ·"),
-        bold(cyan(
-            st["model"].as_str().unwrap_or("pool open, no model yet")
-        ))
+        bold("Tendril · cluster"),
+        bold(cyan(st["cluster"].as_str().unwrap_or("")))
     );
-    let state = st["status"]["state"].as_str().unwrap_or("?");
-    let line = match state {
-        "ready" => format!(
-            "{} ready · {} · ~{:.1} tok/s predicted",
-            ok_mark(),
-            st["status"]["plan"].as_str().unwrap_or(""),
-            st["status"]["predicted_tps"].as_f64().unwrap_or(0.0)
-        ),
-        "loading" => format!(
-            "{} loading {}",
-            warn_mark(),
-            st["status"]["plan"].as_str().unwrap_or("")
-        ),
-        "waiting" => format!(
-            "{} waiting: {}",
-            warn_mark(),
-            st["status"]["reason"].as_str().unwrap_or("")
-        ),
-        "failed" => format!(
-            "{} failed: {}",
-            bad_mark(),
-            st["status"]["error"].as_str().unwrap_or("")
-        ),
-        other => other.to_string(),
-    };
-    println!("  {line}");
-    let models = st["models"].as_array().cloned().unwrap_or_default();
-    if models.len() > 1 {
-        heading("Models");
-        let mut t = Table::new(&["MODEL", "STATE", "SHARE", "ACTIVE"]);
-        for m in &models {
-            let share = m["machines"]
-                .as_array()
-                .map(|xs| {
-                    xs.iter()
-                        .map(|x| {
-                            format!(
-                                "{} {}",
-                                x["name"].as_str().unwrap_or(""),
-                                tendril_core::Bytes(x["budget"].as_u64().unwrap_or(0))
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(" + ")
-                })
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| m["reason"].as_str().unwrap_or("–").to_string());
-            let id = m["id"].as_str().unwrap_or("");
-            t.row(vec![
-                if id == st["model"].as_str().unwrap_or("") {
-                    bold(cyan(id))
-                } else {
-                    bold(id)
-                },
-                m["state"].as_str().unwrap_or("").to_string(),
-                share,
-                m["active"].to_string(),
-            ]);
-        }
-        t.print();
+    heading("Models");
+    let deps = st["deployments"].as_array().cloned().unwrap_or_default();
+    if deps.is_empty() {
         println!(
             "  {}",
-            dim("Below: the highlighted model. Pick another with --model <name>.")
+            dim("none loaded — `tendril load <model> --engine <engine>` or the dashboard")
         );
     }
-    heading("Machines");
-    let mut t = Table::new(&["NAME", "HARDWARE", "BACKEND", "MEMORY", "LINK", "RUNS"]);
-    for n in st["nodes"].as_array().cloned().unwrap_or_default() {
-        let link = match (n["rtt_ms"].as_f64(), n["bandwidth_gbps"].as_f64()) {
-            _ if n["local"].as_bool() == Some(true) => dim("coordinator"),
-            (Some(r), Some(b)) => format!("{} · {:.1} Gb/s", tendril_core::units::fmt_ms(r), b),
-            _ => dim("measuring…"),
+    for d in &deps {
+        if a.model.as_deref().is_some_and(|m| d["name"] != json!(m)) {
+            continue;
+        }
+        let status = d["status"].as_str().unwrap_or("");
+        let mark = match status {
+            "ready" => ok_mark(),
+            "failed" => bad_mark(),
+            _ => warn_mark(),
         };
+        println!(
+            "  {mark} {} {} {}",
+            bold(d["name"].as_str().unwrap_or("")),
+            dim(format!(
+                "({}, {})",
+                d["engine_name"].as_str().unwrap_or(""),
+                d["task"].as_str().unwrap_or("")
+            )),
+            match status {
+                "failed" => red(d["reason"].as_str().unwrap_or("failed")),
+                s => s.to_string(),
+            }
+        );
+        for r in d["roles"].as_array().cloned().unwrap_or_default() {
+            let (done, total) = (
+                r["done"].as_u64().unwrap_or(0),
+                r["total"].as_u64().unwrap_or(0),
+            );
+            let prog = if total > 0 {
+                format!(
+                    " {}/{}",
+                    tendril_core::Bytes(done),
+                    tendril_core::Bytes(total)
+                )
+            } else {
+                String::new()
+            };
+            println!(
+                "      {} on {}: {}{}{}",
+                r["id"].as_str().unwrap_or(""),
+                r["machine_name"].as_str().unwrap_or(""),
+                r["state"].as_str().unwrap_or(""),
+                r["detail"]
+                    .as_str()
+                    .filter(|x| !x.is_empty())
+                    .map(|x| format!(" · {x}"))
+                    .unwrap_or_default(),
+                prog
+            );
+        }
+    }
+    heading("Machines");
+    let mut t = Table::new(&["NAME", "HARDWARE", "MEMORY FREE", "ENGINES", "LINK"]);
+    for m in st["machines"].as_array().cloned().unwrap_or_default() {
+        let engines: Vec<String> = m["engines"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .filter(|e| e["ready"] == json!(true))
+            .map(|e| e["engine"].as_str().unwrap_or("").to_string())
+            .collect();
         t.row(vec![
-            bold(n["name"].as_str().unwrap_or("")),
-            n["chip"].as_str().unwrap_or("").to_string(),
-            n["backend"].as_str().unwrap_or("").to_string(),
-            n["usable"].as_str().unwrap_or("").to_string(),
-            link,
-            n["role"].as_str().unwrap_or("").to_string(),
+            bold(format!(
+                "{}{}",
+                m["name"].as_str().unwrap_or(""),
+                if m["local"] == json!(true) {
+                    " (server)"
+                } else {
+                    ""
+                }
+            )),
+            format!(
+                "{} · {}",
+                m["chip"].as_str().unwrap_or(""),
+                m["backend"].as_str().unwrap_or("")
+            ),
+            format!(
+                "{} of {}",
+                tendril_core::Bytes(m["free_memory"].as_u64().unwrap_or(0)),
+                tendril_core::Bytes(m["usable_memory"].as_u64().unwrap_or(0))
+            ),
+            if engines.is_empty() {
+                yellow("none")
+            } else {
+                engines.join(", ")
+            },
+            m["rtt_ms"]
+                .as_f64()
+                .map(tendril_core::units::fmt_ms)
+                .unwrap_or_else(|| dim("–")),
         ]);
     }
     t.print();
-    let m = &st["metrics"];
-    heading("Traffic");
-    ui::kv(&[
-        (
-            "Requests",
-            format!(
-                "{} total · {} active · {} queued · {} errors",
-                m["requests"], m["active"], m["queued"], m["errors"]
-            ),
-        ),
-        (
-            "Tokens",
-            format!(
-                "{} prompt · {} generated",
-                m["prompt_tokens"], m["completion_tokens"]
-            ),
-        ),
-    ]);
     println!();
     println!(
         "  {} {}",

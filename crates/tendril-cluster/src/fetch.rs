@@ -1,23 +1,21 @@
-//! Downloading exactly the tensors one stage needs from a remote checkpoint
-//! (HuggingFace or a mirror) with HTTP range requests.
+//! Downloading model files: several HTTP range requests at once per file,
+//! each retried on its own, into a `.part` file renamed when complete.
 
-use crate::proto::{TensorEntry, WeightSource};
-use crate::shard::ShardWriter;
 use anyhow::{bail, Context, Result};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use tendril_core::model::source::{download_client, hf_endpoint};
 
-/// A client for `base_url`. The machine's own HuggingFace token is attached
-/// only when the URL is its configured HuggingFace endpoint, so a coordinator
-/// can never make it send the token elsewhere.
-pub fn client_for(base_url: &str) -> Result<reqwest::blocking::Client> {
-    if !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
-        bail!("refusing to download weights from {base_url}");
+/// A client for `url`. The machine's own HuggingFace token is attached only
+/// when the URL is its configured HuggingFace endpoint, so a server can never
+/// make it send the token elsewhere.
+pub fn client_for(url: &str) -> Result<reqwest::blocking::Client> {
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        bail!("refusing to download from {url}");
     }
-    if base_url.starts_with(&format!("{}/", hf_endpoint())) {
+    if url.starts_with(&format!("{}/", hf_endpoint())) {
         return download_client();
     }
     Ok(reqwest::blocking::Client::builder()
@@ -26,11 +24,10 @@ pub fn client_for(base_url: &str) -> Result<reqwest::blocking::Client> {
         .build()?)
 }
 
-/// Bytes per range request. Large tensors are split so several connections
-/// share them; small ones are fetched whole.
+/// Bytes per range request.
 const CHUNK: u64 = 32 << 20;
 
-/// Connections per machine (`TENDRIL_DOWNLOAD_STREAMS` overrides).
+/// Connections per file (`TENDRIL_DOWNLOAD_STREAMS` overrides).
 fn streams() -> usize {
     std::env::var("TENDRIL_DOWNLOAD_STREAMS")
         .ok()
@@ -40,63 +37,73 @@ fn streams() -> usize {
         .min(64)
 }
 
-/// One range request: `len` bytes of `file` from `src`, into the shard at `dst`.
+/// One range request: `len` bytes at `at`.
 struct Piece {
-    file: String,
-    src: u64,
-    dst: u64,
+    at: u64,
     len: u64,
-    tensor: String,
 }
 
-/// Download a stage's tensors into a shard at `path`, over several
-/// connections at once (each tensor split into ≤32 MiB range requests,
-/// each retried on its own). `progress(done, total)` is called as bytes
-/// arrive.
-pub fn download_shard(
-    client: &reqwest::blocking::Client,
-    source: &WeightSource,
-    entries: &[TensorEntry],
-    path: &Path,
+/// Download `url` (`size` bytes) to `dest`. A complete file of the right
+/// size is kept as is. `progress(done, total)` is called as bytes arrive.
+pub fn download_file(
+    url: &str,
+    size: u64,
+    dest: &Path,
     progress: &mut dyn FnMut(u64, u64),
-) -> Result<PathBuf> {
-    if entries.len() != source.files.len() {
-        bail!("weight source doesn't match the tensor list");
+) -> Result<()> {
+    if std::fs::metadata(dest).is_ok_and(|m| m.len() == size && size > 0) {
+        progress(size, size);
+        return Ok(());
     }
-    let mut w = ShardWriter::create(path, entries)?;
-    let total = w.total;
-    let base = source.base_url.trim_end_matches('/');
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    }
+    let client = client_for(url)?;
+    let part = dest.with_extension(format!(
+        "{}part",
+        dest.extension()
+            .map(|e| format!("{}.", e.to_string_lossy()))
+            .unwrap_or_default()
+    ));
+    if size == 0 {
+        // Unknown size: one plain request.
+        let mut resp = client
+            .get(url)
+            .send()
+            .with_context(|| format!("GET {url}"))?;
+        check(resp.status().as_u16(), url, false)?;
+        let mut out = std::fs::File::create(&part)?;
+        let n = std::io::copy(&mut resp, &mut out)?;
+        progress(n, n);
+        drop(out);
+        std::fs::rename(&part, dest)?;
+        return Ok(());
+    }
+    {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&part)?;
+        f.set_len(size)?;
+    }
     let mut pieces = Vec::new();
-    for (e, (file, offset)) in entries.iter().zip(&source.files) {
-        if file.is_empty() || file.contains("..") || file.starts_with('/') {
-            bail!("invalid checkpoint file name {file:?}");
-        }
-        let (dst, len) = w.region(&e.name).context("tensor missing from shard")?;
-        let mut at = 0;
-        while at < len {
-            let n = CHUNK.min(len - at);
-            pieces.push(Piece {
-                file: file.clone(),
-                src: offset.checked_add(at).context("bad offset")?,
-                dst: dst + at,
-                len: n,
-                tensor: e.name.clone(),
-            });
-            at += n;
-        }
+    let mut at = 0;
+    while at < size {
+        let n = CHUNK.min(size - at);
+        pieces.push(Piece { at, len: n });
+        at += n;
     }
     let queue = Mutex::new(pieces.into_iter());
     let done = AtomicU64::new(0);
     let failed: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-    let workers = streams();
-    std::thread::scope(|s| -> Result<()> {
+    std::thread::scope(|s| {
         let mut handles = Vec::new();
-        for _ in 0..workers {
-            let (queue, done, failed) = (&queue, &done, &failed);
-            let shard = w.path().to_path_buf();
+        for _ in 0..streams() {
+            let (queue, done, failed, client, part) = (&queue, &done, &failed, &client, &part);
             handles.push(s.spawn(move || {
                 let r = (|| -> Result<()> {
-                    let mut out = std::fs::OpenOptions::new().write(true).open(&shard)?;
+                    let mut out = std::fs::OpenOptions::new().write(true).open(part)?;
                     let mut buf = vec![0u8; 1 << 20];
                     loop {
                         if failed.lock().unwrap().is_some() {
@@ -105,11 +112,10 @@ pub fn download_shard(
                         let Some(p) = queue.lock().unwrap().next() else {
                             return Ok(());
                         };
-                        let url = format!("{base}/{}", p.file);
                         let mut tries = 0;
                         loop {
                             let mut got = 0u64;
-                            match fetch_piece(client, &url, &p, &mut out, &mut buf, &mut |n| {
+                            match fetch_piece(client, url, &p, &mut out, &mut buf, &mut |n| {
                                 got += n;
                                 done.fetch_add(n, Ordering::Relaxed);
                             }) {
@@ -121,7 +127,7 @@ pub fn download_shard(
                                         return Err(err);
                                     }
                                     tries += 1;
-                                    tracing::warn!("retrying {}: {err:#}", p.tensor);
+                                    tracing::warn!("retrying {url} @{}: {err:#}", p.at);
                                     std::thread::sleep(std::time::Duration::from_millis(
                                         300 << tries,
                                     ));
@@ -135,23 +141,29 @@ pub fn download_shard(
                 }
             }));
         }
-        // Report progress from this thread while the workers download.
         while handles.iter().any(|h| !h.is_finished()) {
-            progress(done.load(Ordering::Relaxed), total);
+            progress(done.load(Ordering::Relaxed), size);
             std::thread::sleep(std::time::Duration::from_millis(200));
         }
-        Ok(())
-    })?;
+    });
     if let Some(e) = failed.into_inner().unwrap() {
         return Err(e);
     }
-    let got = done.load(Ordering::Relaxed);
-    progress(got, total);
-    w.add_written(got);
-    w.finish()
+    progress(done.load(Ordering::Relaxed), size);
+    std::fs::rename(&part, dest).with_context(|| format!("save {}", dest.display()))?;
+    Ok(())
 }
 
-/// Fetch one piece into `out` at its place in the shard.
+fn check(status: u16, url: &str, ranged: bool) -> Result<()> {
+    match status {
+        206 if ranged => Ok(()),
+        200 if !ranged => Ok(()),
+        401 | 403 => bail!("{url}: access denied — the model may be gated: accept its license on huggingface.co and set HF_TOKEN on this machine"),
+        s if ranged => bail!("{url}: HTTP {s} (expected a byte range)"),
+        s => bail!("{url}: HTTP {s}"),
+    }
+}
+
 fn fetch_piece(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -163,18 +175,14 @@ fn fetch_piece(
     if p.len == 0 {
         return Ok(());
     }
-    let end = p.src.checked_add(p.len - 1).context("bad offset")?;
+    let end = p.at + p.len - 1;
     let mut resp = client
         .get(url)
-        .header(reqwest::header::RANGE, format!("bytes={}-{end}", p.src))
+        .header(reqwest::header::RANGE, format!("bytes={}-{end}", p.at))
         .send()
         .with_context(|| format!("GET {url}"))?;
-    match resp.status().as_u16() {
-        206 => {}
-        401 | 403 => bail!("{url}: access denied — the model may be gated: accept its license on huggingface.co and set HF_TOKEN on this machine"),
-        s => bail!("{url}: HTTP {s} (expected a byte range)"),
-    }
-    out.seek(SeekFrom::Start(p.dst))?;
+    check(resp.status().as_u16(), url, true)?;
+    out.seek(SeekFrom::Start(p.at))?;
     let mut at = 0u64;
     while at < p.len {
         let want = buf.len().min((p.len - at) as usize);
@@ -250,55 +258,29 @@ mod tests {
 
     #[test]
     fn downloads_in_parallel_chunks_and_retries() {
-        // A checkpoint with a 70 MiB tensor (split into 32 MiB requests) and a small one.
         let big = 70usize << 20;
-        let small = 5000usize;
-        let file: Vec<u8> = (0..big + small + 300)
-            .map(|i| (i * 31 % 251) as u8)
-            .collect();
+        let file: Vec<u8> = (0..big + 777).map(|i| (i * 31 % 251) as u8).collect();
         let (base, peak) = server(Arc::new(file.clone()));
-        let entries = vec![
-            TensorEntry {
-                name: "a".into(),
-                dtype: "U8".into(),
-                shape: vec![big],
-                len: big as u64,
-            },
-            TensorEntry {
-                name: "b".into(),
-                dtype: "U8".into(),
-                shape: vec![small],
-                len: small as u64,
-            },
-        ];
-        let source = WeightSource {
-            base_url: base.clone(),
-            files: vec![
-                ("m.safetensors".into(), 100),
-                ("m.safetensors".into(), (big + 200) as u64),
-            ],
-        };
+        let url = format!("{base}/m.gguf");
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("shard.safetensors");
+        let dest = dir.path().join("org/m.gguf");
         let mut last = 0;
-        let out = download_shard(
-            &client_for(&base).unwrap(),
-            &source,
-            &entries,
-            &path,
-            &mut |d, t| {
-                assert!(d <= t);
-                last = d;
-            },
+        download_file(&url, file.len() as u64, &dest, &mut |d, t| {
+            assert!(d <= t);
+            last = d;
+        })
+        .unwrap();
+        assert_eq!(last, file.len() as u64);
+        assert!(peak.load(Ordering::SeqCst) > 1, "requests ran in parallel");
+        assert_eq!(std::fs::read(&dest).unwrap(), file);
+        assert!(!dir.path().join("org/m.gguf.part").exists());
+        // Already there: nothing is fetched again.
+        download_file(
+            "http://127.0.0.1:1/never",
+            file.len() as u64,
+            &dest,
+            &mut |_, _| {},
         )
         .unwrap();
-        assert_eq!(last, (big + small) as u64);
-        assert!(peak.load(Ordering::SeqCst) > 1, "requests ran in parallel");
-        // The shard holds exactly the two tensors' bytes, in order.
-        let got = std::fs::read(&out).unwrap();
-        let hlen = u64::from_le_bytes(got[..8].try_into().unwrap()) as usize;
-        let data = &got[8 + hlen..];
-        assert_eq!(&data[..big], &file[100..100 + big]);
-        assert_eq!(&data[big..], &file[big + 200..big + 200 + small]);
     }
 }

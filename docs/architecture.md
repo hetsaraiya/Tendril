@@ -1,156 +1,104 @@
 # Tendril architecture
 
-How the pieces fit, what crosses the network and why.
+Tendril runs no models itself. It finds machines, measures them, plans where a model goes,
+moves files, secures the network, starts the inference engine the user picked on the right
+machines, and serves one OpenAI-compatible API in front of all of them.
 
 ## Crates
 
-| Crate | Role |
+| Crate | What it does |
 |---|---|
-| `tendril-core` | Hardware profiles, model inspection (config.json, safetensors headers, GGUF, HuggingFace over range requests), the memory model and the placement planner. No execution. |
-| `tendril-engine` | Executes a *stage*: a contiguous slice of a decoder-only transformer (embeddings? + layers [a, b) + head?). Tokenizer, chat templates, sampling. |
-| `tendril-cluster` | Encrypted transport, the agent (`tendril join`), the coordinator (`tendril serve`), weight shards, the OpenAI-compatible HTTP API and the web UI. |
-| `tendril-cli` | The `tendril` binary. |
+| `tendril-core` | Hardware detection and measurement, model inspection (GGUF, safetensors, HF configs) and the planner: memory per machine, layer splits, predicted speed. No I/O beyond reading headers. |
+| `tendril-engines` | The `Engine` trait and one type per engine (llama.cpp, vLLM, SGLang, Ollama, MLX-LM, exo, ComfyUI, sd.cpp, whisper.cpp): detection, model resolution, launch recipes, API translation. |
+| `tendril-cluster` | Encrypted links and tunnels, the agent on every machine, the pool on the server, downloads, LAN discovery, the HTTP API and dashboard. |
+| `tendril-cli` | The `tendril` command. |
 
-## Life of a cluster
+## The engine trait
 
-```text
-tendril serve M            tendril join C --token T       tendril join C --token T
-┌───────────────┐          ┌─────────────────┐            ┌─────────────────┐
-│ coordinator   │◀─control─│ agent (m5-air)  │            │ agent (desktop) │
-│  + local stage│          └─────────────────┘            └─────────────────┘
-└───────────────┘
- 1. Agents connect to the control port (7420), prove the token (Noise NNpsk0) and send
-    their hardware profile. The coordinator measures each link (ping RTT, 4 MiB probe).
- 2. The planner runs over the live machines: exact DP over contiguous layer cuts for
-    every ordered subset, honest per-machine memory budgets. No fit → "waiting" status
-    with advice; each join/leave triggers a re-plan.
- 3. Loading: each agent receives `LoadStage` with the exact tensor list for its layers.
-    It asks for the tensors it hasn't cached; the coordinator streams them (4 MiB
-    chunks, bounded queue). The agent writes a standard safetensors *shard* and loads it.
- 4. Data plane: stage i connects to stage i+1's data port; the last stage connects back
-    to the coordinator. The first stage is fed by the coordinator.
-```
+Each engine is a class that decides its own behaviour (`crates/tendril-engines/src/engine.rs`):
 
-## Per-token data flow
+- `info()` — name, tasks (chat / image generation / transcription), input and output
+  modalities, how it spans machines (`Single`, `Layers`, `Homogeneous`, `EngineManaged`),
+  how its traffic between machines is protected (`Security`), requirements with install
+  commands per OS.
+- `locate()` / `detect()` — run on every machine: is it installed, which version, which
+  accelerators, what is missing and how to install it. Shown per machine in the dashboard.
+- `resolve()` — turn what the user typed into a `ResolvedModel`: files to download, a memory
+  model for the planner (real layers for GGUF/HF models; a one-block spec for image, audio
+  and registry models), whether it takes images.
+- `arrange()` — adjust Tendril's placement to how the engine really lays the model out, so
+  the plan shown is the plan that runs. llama.cpp puts RPC devices first and the serving
+  machine's GPU last (or its CPU layers first), and gets exact `--tensor-split` values.
+- `roles()` — the processes to start: program, arguments with placeholders (`{port}`,
+  `{file:N}`, `{peer:ROLE}`, …), environment, readiness check, ordering (`after`,
+  `after_started`).
+- `prepare()` — work after the process is up (Ollama pulls the model, exo places it).
+- `api()`, `images()`, `transcribe()` — OpenAI-compatible engines are proxied as they are;
+  ComfyUI and whisper.cpp are translated.
 
-```text
-coordinator ──tokens──▶ stage 0 ──hidden──▶ stage 1 ──hidden──▶ … ──▶ last stage
-     ▲                                                                  │ samples
-     └──────────────────────────── token id ────────────────────────────┘
-```
+`Security` is the per-engine answer to "who encrypts the traffic between machines":
 
-- Prefill is split into chunks (≤512 tokens, fewer for long contexts so attention
-  scratch stays under ~256 MiB). Chunks are sent back to back and pipeline through the
-  stages; only the final chunk computes logits.
-- The last stage **samples** (temperature/top-k/top-p/min-p/penalties, seeded), so a
-  single token id — not a vocabulary-sized logits vector — returns per step.
-- Each stage owns the KV cache of its layers for every sequence. `Release` travels the
-  chain to free it when a request ends, is cancelled or fails.
-- Every message carries the plan *epoch*; work from an old plan is dropped. Positions
-  are checked, so duplicated or reordered work fails loudly instead of corrupting KV.
-- Errors travel down the chain to the coordinator and end the request with a message.
+| Kind | Meaning | Engines |
+|---|---|---|
+| `LocalOnly` | one machine per model; only the API leaves it, through Tendril | Ollama, MLX-LM, ComfyUI, sd.cpp, whisper.cpp |
+| `TendrilTunnel` | plain TCP on known ports: bound to localhost, carried by Tendril | llama.cpp |
+| `EngineEncrypted` | the engine encrypts and authenticates itself | (none yet) |
+| `TrustedNetworkOnly` | dynamic ports Tendril can't wrap: needs the user's consent | vLLM, SGLang, exo |
 
-## Discovery and recovery
+## Life of a model
 
-- **Discovery:** the coordinator broadcasts a UDP beacon (port 7419) every second with
-  the model, control port, machine count, state and a fingerprint (hash) of the cluster
-  token. `tendril join --token T` listens for the beacon whose fingerprint matches.
-- **Recovery:** every request keeps a log of committed tokens (the KV it has built).
-  When a machine in the pipeline disconnects, the coordinator tears the plan down and
-  sends each request a `Lost` notice; the request waits for a new plan (new epoch),
-  replays its committed tokens in ≤64-token chunks (the same kernels as decoding, so the
-  rebuilt KV is identical on CPU) and continues sampling. Each request only accepts
-  results stamped with the epoch it currently runs on.
+1. **Machines join.** `tendril serve` starts the pool and an agent for this machine;
+   `tendril join` starts an agent elsewhere. Each agent sends its hardware profile and its
+   engine detections.
+2. **Plan.** `POST /api/plan`: the engine resolves the model; machines without the engine are
+   set aside with what they miss; memory other models were promised is subtracted; the core
+   planner splits the layers (one machine for `Single` engines; every machine for
+   `EngineManaged`); `arrange()` and `roles()` produce the final placement and commands. The
+   preview carries the pool version.
+3. **Confirm.** `POST /api/models` repeats the plan and refuses if the pool changed
+   (`expect_version`) or if the split needs a trusted network the user didn't confirm.
+4. **Run.** The pool sends each role to its machine in dependency order. The agent downloads
+   the role's files (parallel ranges, resumable), picks free ports, opens tunnel ends for the
+   roles it talks to, expands placeholders, starts the process in its own process group,
+   waits for readiness, runs `prepare()`, and reports every step (shown live in the dashboard).
+5. **Serve.** When the API role is ready, the pool opens a local forwarder to it (direct on
+   the server's machine, a tunnel otherwise) and the HTTP layer proxies requests there.
+6. **Stop.** Unload, failure of any role, or its machine leaving stops every process of the
+   deployment (SIGTERM, then SIGKILL, to the whole process group) and frees its memory.
 
-## Model pools
+## Tunnels
 
-`tendril serve A B C` starts one coordinator per model. Each has its own pipeline,
-batching, prefix cache and recovery. A `Pool` sits in front of them:
-
-- **Control port:** the pool accepts every agent connection. It reads the `Hello`, which
-  names a model and carries the agent's random per-process **machine id**, and hands the
-  session to that model's coordinator. `Welcome` lists every model, and the agent opens
-  one session per model (each with its own data port and stage).
-- **Allocation:** when any model's machines change, the pool merges what every model
-  sees into one cluster (machines keyed by machine id, links from whichever model
-  measured them). It then runs `tendril_core::pool::allocate`:
-  - every placement order is tried (listed order and largest-first when there are more
-    than five models);
-  - in each order, a model is planned with the ordinary planner on the memory the
-    previous models left;
-  - its **budget** on a machine is its stage's peak ÷ (1 − safety) plus 32 MiB, so
-    re-planning inside the budget finds the same split;
-  - the winner places the most models, then prefers earlier-listed models, then the
-    highest summed log-throughput;
-  - a model already running stays on its machines unless moving is ≥25% faster.
-- **Planning inside a share:** a coordinator's cluster snapshot drops machines where its
-  budget is zero and caps `usable_memory` at the budget elsewhere. If the running
-  pipeline no longer fits its budget, the coordinator tears it down (requests resume via
-  recovery). Budgets that shrink are applied 1.5 s before budgets that grow, so memory
-  is freed before another model loads into it.
-- **Events** carry an optional `model` tag. Machine join and leave events come only from
-  the first model, so a machine is reported once.
-
-## Plan first, one planner
-
-The pool is the only planner. It builds one view of the machines from:
-- each machine's profile, including its saved benchmark;
-- the links it measures when a machine joins (five sequential pings, then a 4 MiB
-  transfer, before any model is loaded).
-
-From that view it computes:
-- `POST /api/plan`: the preview, which places the candidate next to the loaded models with
-  `tendril_core::pool::allocate` and reports each machine's layers, weight bytes, %
-  of the model, memory needed versus its budget, and alternatives in other weight formats;
-- each model's share and exact split after loading (the same allocation).
-
-A model's coordinator runs the split the pool hands it (`PoolLink::plan`, matched to its
-sessions by machine id) instead of planning on its own. So the split that loads is the one
-the preview showed, as long as the machines didn't change in between.
-
-**Benchmarks:** `tendril_engine::hwbench` times a bf16 matrix-vector product over a weight
-far larger than any cache (decode: GB/s of weights streamed) and a 512-token matrix
-multiply (prefill: TFLOP/s) on the device the machine will use. Results are keyed by a
-hardware fingerprint (chip, cores, memory, backend, OS) in
-`~/.config/tendril/benchmarks.json` and replace the spec-sheet estimates in
-`NodeProfile::effective_*`.
-
-**Leaving:** `Bye { leave: true }` (the host stopping, or removing the machine) makes the
-agent process exit. `Bye { leave: false }` (a model unloaded) ends only that model's
-session.
+Every agent runs a tunnel listener. A tunnel is a Noise-encrypted connection that names a
+target `deployment/role`; the listener forwards it to that role's localhost port only if it
+runs the role, and refuses everything else. The other side is a `Forwarder`: a 127.0.0.1
+listener whose connections each open a tunnel. llama-server's `--rpc` list and the pool's API
+route both point at forwarders, so engines only ever talk to localhost.
 
 ## Security
 
-- One cluster token (generated on first `serve`, stored with 0600 permissions). Every
-  TCP connection performs a Noise `NNpsk0_25519_ChaChaPoly_BLAKE2s` handshake keyed by
-  the token: unauthenticated peers can't join, read activations or inject work.
-- Message sizes are bounded (512 MiB) and validated before allocation; tensor shapes are
-  checked against byte lengths.
-- Machines in a cluster see the prompts and activations they process — only join
-  machines you trust. Encryption protects the network, not a participant.
+- One cluster token (generated on first `serve`, stored 0600). Every TCP connection performs
+  a Noise `NNpsk0_25519_ChaChaPoly_BLAKE2s` handshake keyed by the token; frames are bounded
+  before allocation.
+- Engines bind 127.0.0.1. Only `TrustedNetworkOnly` engines spanning machines open LAN ports,
+  and only after explicit consent; each such deployment gets its own namespace derived from
+  the token (exo) — isolation between honest clusters, not authentication.
+- A machine's HuggingFace token is sent only to its configured HuggingFace endpoint.
+- Control endpoints need the cluster token; the inference API is open to the network the
+  server listens on (bind `--host 127.0.0.1` to keep it local).
+- Machines in a cluster see what they process. Encryption protects the network, not a
+  participant: only join machines you trust.
 
-## Engine
+## Discovery
 
-- One generic decoder covers Llama, Mistral, Qwen2/3, Gemma 1/2/3 and Phi-3 through
-  configuration flags (norm style, qk-norm, sandwich norms, soft-capping, sliding
-  windows, local/global RoPE, fused projections). Verified against `transformers`.
-- CPU: hand-written AVX2/F16C (and auto-vectorized NEON) GEMV kernels read weights in
-  their stored precision (bf16/f16/f32) or q8_0 and run on a spinning thread pool;
-  decode runs at DRAM bandwidth. Prefill widens weights in bands and uses a blocked GEMM.
-- GPU (Metal/CUDA): candle kernels in native bf16/f16; optional on-load quantization.
-- Q/K/V and gate/up projections are fused into single matmuls.
-- Sliding-window layers compact their KV so memory tracks the window, not the context.
+The server broadcasts a beacon with a fingerprint of the token (never the token) so
+`tendril join --token T` finds it without an address on the same network.
 
-## What the planner assumes about the engine
+## Testing
 
-The planner's memory model matches the engine: weights in the planned representation,
-KV in f16 on GPUs and f32 on CPUs, tied embeddings duplicated at both ends of a
-pipeline, ~256 MiB attention scratch, transport buffers, backend runtime overhead and a
-safety margin.
-
-## Development aids
-
-- `TENDRIL_SIM_LATENCY_MS=3` delays every data-plane hop, to emulate a slow link
-  (e.g. Wi-Fi) when all machines are one computer.
-- `tendril dev-tiny-model DIR --layers N --hidden H` writes a random-weight model with a
-  byte-level tokenizer for exercising the whole stack without downloads.
+- Unit tests per crate (tensor-split math checked against llama.cpp's own assignment rule,
+  placeholder expansion, tunnels, downloads, planner).
+- `tests/pool.rs` uses a stand-in `exo` to check the trusted-network gate and that unloading
+  stops every process.
+- `tests/engines.rs` runs real llama.cpp: a tiny GGUF (`tools/make_tiny_gguf.py`) on one
+  machine, then split across two agents with RPC through the tunnels; the answers must match.
+  CI builds llama.cpp with RPC for it.

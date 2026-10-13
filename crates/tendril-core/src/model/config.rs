@@ -136,11 +136,11 @@ pub fn spec_from_config(id: &str, origin: &str, raw: &Value) -> Result<ModelSpec
     let stored = stored_quant(raw);
     let mut notes = Vec::new();
     if moe.is_some() {
-        notes.push("Mixture-of-experts: memory is planned for all experts; Tendril cannot execute MoE models yet.".into());
+        notes.push("Mixture-of-experts: memory is planned for all experts.".into());
     }
-    if !arch.executable() {
+    if !arch.known() {
         notes.push(format!(
-            "Architecture '{model_type}' is not supported by Tendril's engine yet; planning uses generic transformer formulas."
+            "Architecture '{model_type}': planning uses generic transformer formulas."
         ));
     }
     let mut spec = ModelSpec {

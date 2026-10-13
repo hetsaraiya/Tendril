@@ -1,8 +1,8 @@
 //! Authenticated, encrypted, framed connections (Noise NNpsk0 over TCP).
 //!
 //! Every connection proves knowledge of the cluster token before any data
-//! flows; a machine without the token cannot join, read activations or
-//! inject work. Messages are length-prefixed and bounded before allocation.
+//! flows; a machine without the token cannot join, read traffic or
+//! reach an engine. Messages are length-prefixed and bounded before allocation.
 
 use crate::proto::Msg;
 use anyhow::{bail, Context, Result};
@@ -17,8 +17,8 @@ use tokio::net::TcpStream;
 const PATTERN: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
 const MAGIC: &[u8; 6] = b"TNDRL\x01";
 const MAX_CHUNK: usize = 65535 - 16;
-/// Largest message accepted (a prefill chunk of a very large model fits easily).
-pub const MAX_MESSAGE: usize = 512 << 20;
+/// Largest message accepted.
+pub const MAX_MESSAGE: usize = 64 << 20;
 
 pub struct Reader {
     inner: BufReader<OwnedReadHalf>,
@@ -131,6 +131,13 @@ impl Writer {
         Ok(())
     }
 
+    /// Send raw bytes as one encrypted frame (tunnels; empty = end of stream).
+    pub async fn send_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.send_raw(bytes).await?;
+        self.inner.flush().await?;
+        Ok(())
+    }
+
     async fn send_raw(&mut self, bytes: &[u8]) -> Result<()> {
         if bytes.len() > MAX_MESSAGE {
             bail!(
@@ -161,6 +168,12 @@ impl Writer {
 
 impl Reader {
     pub async fn recv(&mut self) -> Result<Msg> {
+        let out = self.recv_bytes().await?;
+        postcard::from_bytes(&out).context("malformed message")
+    }
+
+    /// One frame's raw bytes (see [`Writer::send_bytes`]).
+    pub async fn recv_bytes(&mut self) -> Result<Vec<u8>> {
         let mut l = [0u8; 4];
         self.inner.read_exact(&mut l).await?;
         let total = u32::from_be_bytes(l) as usize;
@@ -190,14 +203,13 @@ impl Reader {
         if out.len() != total {
             bail!("frame length mismatch");
         }
-        postcard::from_bytes(&out).context("malformed message")
+        Ok(out)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{Payload, WireTensor};
 
     #[tokio::test]
     async fn roundtrip_and_wrong_token() {
@@ -207,10 +219,10 @@ mod tests {
         let server = tokio::spawn(async move {
             let (s, _) = l.accept().await.unwrap();
             let mut c = accept(s, &good).await.unwrap();
-            for _ in 0..2 {
-                let m = c.reader.recv().await.unwrap();
-                c.writer.send(&m).await.unwrap();
-            }
+            let m = c.reader.recv().await.unwrap();
+            c.writer.send(&m).await.unwrap();
+            let b = c.reader.recv_bytes().await.unwrap();
+            c.writer.send_bytes(&b).await.unwrap();
             // Second client uses the wrong token.
             let (s, _) = l.accept().await.unwrap();
             assert!(accept(s, &good).await.is_err());
@@ -221,29 +233,10 @@ mod tests {
             c.reader.recv().await.unwrap(),
             Msg::Ping { t: 42 }
         ));
-        // A large message spans many encrypted chunks.
-        let big = Msg::Forward {
-            epoch: 1,
-            seq: 2,
-            pos: 3,
-            payload: Payload::Hidden(WireTensor {
-                dtype: "f32".into(),
-                shape: vec![1, 1000, 1000],
-                data: vec![7u8; 4_000_000],
-            }),
-            want_logits: true,
-            sample: None,
-            trace: vec![],
-            draft: None,
-        };
-        c.writer.send(&big).await.unwrap();
-        match c.reader.recv().await.unwrap() {
-            Msg::Forward {
-                payload: Payload::Hidden(t),
-                ..
-            } => assert_eq!(t.data.len(), 4_000_000),
-            _ => panic!(),
-        }
+        // A large frame spans many encrypted chunks.
+        let big = vec![7u8; 4_000_000];
+        c.writer.send_bytes(&big).await.unwrap();
+        assert_eq!(c.reader.recv_bytes().await.unwrap(), big);
         let bad = crate::token::psk("WRONG");
         assert!(connect(&addr, &bad).await.is_err());
         server.await.unwrap();

@@ -1,602 +1,114 @@
-//! End-to-end: two models served from one pool of machines.
+//! The pool's rules, with stand-in engine programs: engines whose traffic
+//! Tendril can't encrypt only span machines after the user confirms a
+//! trusted network, and unloading stops the processes.
 
-use serde_json::{json, Value};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tendril_cluster::agent::{self, AgentOptions};
-use tendril_cluster::coordinator::{Coordinator, ServeOptions, Status};
-use tendril_cluster::http::{router, AppState};
-use tendril_cluster::pool::Pool;
-use tendril_core::Goal;
-use tendril_engine::generate::{GenEvent, GenerateRequest, LocalModel, ModelFiles};
-use tendril_engine::linear::WeightFormat;
-use tendril_engine::sampler::SamplingParams;
+use tendril_cluster::pool::{LoadRequest, NeedsTrust, Pool, PoolOptions, Status};
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trusted_network_is_required_to_span_machines() {
+    use std::os::unix::fs::PermissionsExt;
+    // A fake `exo` that just runs (it never answers HTTP, so it stays loading).
+    let dir = tempfile::tempdir().unwrap();
+    let fake = dir.path().join("exo");
+    let pidfile = dir.path().join("pids");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\necho $$ >> {}\nexec sleep 600\n",
+            pidfile.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::set_var("TENDRIL_EXO", &fake);
 
-fn opts(dir: &std::path::Path, name: &str, port: u16) -> ServeOptions {
-    ServeOptions {
-        model_dir: dir.to_path_buf(),
-        model_name: name.into(),
-        format: WeightFormat::Native,
-        context: 512,
-        concurrency: 2,
-        goal: Goal::Balanced,
-        safety: 0.05,
-        control_port: port,
-        data_port: 0,
-        token: "POOL-TEST".into(),
-        device: "cpu".into(),
-        use_local: true,
-        link: None,
-        name: Some("coord".into()),
-        // Split each model across both machines so the helper hosts a stage
-        // of each: two sessions, two stages, one machine.
-        min_stages: 2,
-        max_memory: None,
-        prefix_cache: true,
-        kv_disk: tendril_core::Bytes::mib(16.0),
-        speculate: true,
-        draft_tokens: 4,
-        recovery_timeout: Duration::from_secs(30),
-        remote: None,
+    let token = "POOL-TEST".to_string();
+    let pool = Pool::start(PoolOptions {
+        control_port: 0,
+        token: token.clone(),
+        name: "t".into(),
+        default_context: 512,
+        default_concurrency: 1,
+    })
+    .await
+    .unwrap();
+    for (name, local) in [("a", true), ("b", false)] {
+        let opts = AgentOptions {
+            server: format!("127.0.0.1:{}", pool.control_port),
+            token: token.clone(),
+            name: Some(name.into()),
+            tunnel_port: 0,
+            cache: dir.path().join(name),
+            once: true,
+            max_memory: None,
+            local,
+        };
+        tokio::spawn(agent::run(opts, Arc::new(|_| {})));
     }
-}
-
-fn reference(dir: &std::path::Path, prompt: &[u32], max: usize) -> String {
-    let mut m = LocalModel::load(
-        ModelFiles::new(dir).unwrap(),
-        candle_core::Device::Cpu,
-        WeightFormat::Native,
-        None,
-    )
-    .unwrap();
-    let mut s = String::new();
-    m.generate(
-        GenerateRequest {
-            prompt: prompt.to_vec(),
-            params: SamplingParams::greedy(),
-            max_tokens: max,
-            stop: vec![],
-            ignore_eos: true,
-        },
-        |e| {
-            if let GenEvent::Text(t) = e {
-                s.push_str(t);
-            }
-            true
-        },
-    )
-    .unwrap();
-    s
-}
-
-async fn wait_ready(c: &Coordinator) {
-    for _ in 0..400 {
-        if matches!(c.status(), Status::Ready { .. }) {
-            return;
-        }
+    let t0 = Instant::now();
+    while pool.machine_count() < 2 {
+        assert!(t0.elapsed() < Duration::from_secs(60));
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("not ready: {:?}\n{:#?}", c.status(), c.history());
-}
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn two_models_share_the_machines_and_route_by_name() {
-    let a_dir = tempfile::tempdir().unwrap();
-    let b_dir = tempfile::tempdir().unwrap();
-    tendril_engine::testing::write_tiny_llama(a_dir.path(), 4, 64, 3, candle_core::DType::F32)
-        .unwrap();
-    tendril_engine::testing::write_tiny_llama(b_dir.path(), 6, 64, 9, candle_core::DType::F32)
-        .unwrap();
-    let cache = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let pool = Pool::start(vec![
-        opts(a_dir.path(), "org/alpha", port),
-        opts(b_dir.path(), "org/beta", port),
-    ])
-    .await
-    .unwrap();
-
-    // One `tendril join` serves every model of the pool.
-    let agent = tokio::spawn(agent::run(
-        AgentOptions {
-            coordinator: format!("127.0.0.1:{port}"),
-            token: "pool-test".into(),
-            name: Some("helper".into()),
-            device: "cpu".into(),
-            data_port: 0,
-            cache: cache.path().to_path_buf(),
-            once: false,
-            max_memory: None,
-        },
-        Arc::new(|m: &str, e| eprintln!("agent[{m}]: {e:?}")),
-    ));
-    for c in &pool.models() {
-        wait_ready(c).await;
-        let nodes = c.nodes();
-        assert_eq!(nodes.len(), 2, "{nodes:?}");
-        assert!(nodes.iter().all(|n| n.role != "idle"), "{nodes:?}");
-    }
-    // Each model got a share of both machines.
-    let shares = pool.shares();
-    assert!(
-        shares.iter().all(|s| s.placed && s.machines.len() == 2),
-        "{shares:?}"
-    );
-
-    // HTTP: the `model` field picks the model.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let http = listener.local_addr().unwrap();
-    let app = router(AppState {
-        pool: pool.clone(),
-        join_command: String::new(),
-    });
-    tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
-    let base = format!("http://{http}");
-
-    let models: Value = client
-        .get(format!("{base}/v1/models"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    let ids: Vec<&str> = models["data"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|m| m["id"].as_str().unwrap())
-        .collect();
-    assert_eq!(ids, ["org/alpha", "org/beta"]);
-
-    let prompt = pool.models()[0]
-        .inner
-        .tok
-        .encode_prompt("hello pool")
-        .unwrap();
-    for (model, dir) in [("beta", b_dir.path()), ("org/alpha", a_dir.path())] {
-        let r: Value = client
-            .post(format!("{base}/v1/completions"))
-            .json(
-                &json!({"model": model, "prompt": "hello pool", "max_tokens": 24,
-                          "temperature": 0, "ignore_eos": true}),
-            )
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        let want = reference(dir, &prompt, 24);
-        assert_eq!(
-            r["choices"][0]["text"].as_str().unwrap(),
-            want,
-            "{model}: {r}"
-        );
-        assert!(r["model"]
-            .as_str()
-            .unwrap()
-            .ends_with(model.trim_start_matches("org/")));
-    }
-
-    // Unknown model: 404 naming the available ones.
-    let r = client
-        .post(format!("{base}/v1/completions"))
-        .json(&json!({"model": "gamma", "prompt": "x"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(r.status(), 404);
-    let body: Value = r.json().await.unwrap();
-    assert!(body["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("org/alpha"));
-
-    // Status lists both models with their shares.
-    let st: Value = client
-        .get(format!("{base}/api/status?model=beta"))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(st["model"], "org/beta");
-    assert_eq!(st["models"].as_array().unwrap().len(), 2);
-    assert_eq!(st["models"][1]["state"], "ready");
-
-    pool.shutdown().await;
-    agent.abort();
-}
-
-/// Serve `file` over HTTP with byte ranges; count the bytes sent.
-fn range_server(file: Vec<u8>) -> (String, Arc<std::sync::atomic::AtomicU64>) {
-    use std::io::{BufRead, BufReader, Write};
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let base = format!(
-        "http://{}/org/tiny/resolve/main",
-        listener.local_addr().unwrap()
-    );
-    let served = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let counter = served.clone();
-    std::thread::spawn(move || {
-        for s in listener.incoming() {
-            let mut s = s.unwrap();
-            let mut r = BufReader::new(s.try_clone().unwrap());
-            let (mut line, mut range) = (String::new(), None);
-            r.read_line(&mut line).unwrap();
-            loop {
-                let mut h = String::new();
-                r.read_line(&mut h).unwrap();
-                if h.trim().is_empty() {
-                    break;
-                }
-                if let Some(v) = h.to_ascii_lowercase().strip_prefix("range: bytes=") {
-                    let (a, b) = v.trim().split_once('-').unwrap();
-                    range = Some((a.parse::<usize>().unwrap(), b.parse::<usize>().unwrap()));
-                }
-            }
-            let (a, b) = range.expect("only range requests");
-            let body = &file[a..=b];
-            counter.fetch_add(body.len() as u64, std::sync::atomic::Ordering::SeqCst);
-            let _ = write!(
-                s,
-                "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            );
-            let _ = s.write_all(body);
-        }
-    });
-    (base, served)
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn machines_join_first_then_each_downloads_only_its_layers() {
-    use tendril_cluster::coordinator::RemoteModel;
-    use tendril_core::model::source::RemoteTensor;
-    // The "HuggingFace" copy of the model, and a folder with only config +
-    // tokenizer, like `tendril serve` keeps for a remote model.
-    let full = tempfile::tempdir().unwrap();
-    tendril_engine::testing::write_tiny_llama(full.path(), 6, 64, 5, candle_core::DType::F32)
-        .unwrap();
-    let meta = tempfile::tempdir().unwrap();
-    for f in std::fs::read_dir(full.path()).unwrap().flatten() {
-        if f.path().extension().is_some_and(|e| e != "safetensors") {
-            std::fs::copy(f.path(), meta.path().join(f.file_name())).unwrap();
-        }
-    }
-    let st = full.path().join("model.safetensors");
-    let (infos, data_start) = tendril_core::model::safetensors::read_local_header(&st).unwrap();
-    let tensors: Vec<RemoteTensor> = infos
-        .into_iter()
-        .map(|t| RemoteTensor {
-            offset: data_start + t.start,
-            len: t.len(),
-            file: "model.safetensors".into(),
-            name: t.name,
-            dtype: t.dtype,
-            shape: t.shape,
-        })
-        .collect();
-    let file = std::fs::read(&st).unwrap();
-    let file_len = file.len() as u64;
-    let (base_url, served) = range_server(file);
-
-    // 1. An empty pool; a machine joins before any model is chosen.
-    let port = free_port();
-    let me = tendril_cluster::coordinator::this_machine(Some("coord"), "cpu", None).unwrap();
-    let pool = Pool::open(port, "POOL-TEST".into(), None, Some(me))
-        .await
-        .unwrap();
-    let agent_cache = tempfile::tempdir().unwrap();
-    let agent = tokio::spawn(agent::run(
-        AgentOptions {
-            coordinator: format!("127.0.0.1:{port}"),
-            token: "pool-test".into(),
-            name: Some("friend".into()),
-            device: "cpu".into(),
-            data_port: 0,
-            cache: agent_cache.path().to_path_buf(),
-            once: false,
-            max_memory: None,
-        },
-        Arc::new(|m: &str, e| eprintln!("agent[{m}]: {e:?}")),
-    ));
-    for _ in 0..100 {
-        if pool.machines().len() == 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(pool.machines().len(), 1, "the machine waits in the pool");
-    assert_eq!(pool.state(), "waiting for a model");
-
-    // 2. Pick the model: split across both machines, weights fetched by range.
-    let coord_cache = tempfile::tempdir().unwrap();
-    let mut o = opts(meta.path(), "org/tiny", port);
-    o.remote = Some(RemoteModel {
-        base_url,
-        tensors,
-        cache: coord_cache.path().to_path_buf(),
-    });
-    pool.add(o).await.unwrap();
-    let c = pool.models()[0].clone();
-    wait_ready(&c).await;
-    assert!(
-        c.nodes().iter().all(|n| n.role != "idle"),
-        "{:?}",
-        c.nodes()
-    );
-
-    // Output is exactly what one machine with the whole model computes.
-    let prompt = c.inner.tok.encode_prompt("hello pool").unwrap();
-    let mut rx = c
-        .generate(tendril_cluster::coordinator::GenRequest {
-            prompt: prompt.clone(),
-            params: SamplingParams::greedy(),
-            max_tokens: 16,
-            stop: vec![],
-            ignore_eos: true,
-        })
-        .await
-        .unwrap();
-    let mut text = String::new();
-    while let Some(out) = rx.recv().await {
-        match out {
-            tendril_cluster::coordinator::GenOut::Text(t) => text.push_str(&t),
-            tendril_cluster::coordinator::GenOut::Done { .. } => break,
-            tendril_cluster::coordinator::GenOut::Error(e) => panic!("{e}"),
-        }
-    }
-    assert_eq!(text, reference(full.path(), &prompt, 16));
-
-    // Each machine downloaded only its own stage: a shard smaller than the
-    // checkpoint, and together not much more than one copy.
-    let shard_size = |dir: &std::path::Path| -> u64 {
-        walk(dir)
-            .iter()
-            .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
-            .map(|p| std::fs::metadata(p).unwrap().len())
-            .sum()
-    };
-    let (mine, theirs) = (
-        shard_size(coord_cache.path()),
-        shard_size(agent_cache.path()),
-    );
-    assert!(mine > 0 && theirs > 0, "both machines hold a shard");
-    assert!(
-        mine < file_len && theirs < file_len,
-        "{mine} {theirs} of {file_len}"
-    );
-    let got = served.load(std::sync::atomic::Ordering::SeqCst);
-    assert!(
-        got < file_len * 12 / 10,
-        "downloaded {got} bytes for a {file_len}-byte checkpoint"
-    );
-
-    pool.shutdown().await;
-    agent.abort();
-}
-
-fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
-    let mut out = vec![];
-    for e in std::fs::read_dir(dir).unwrap().flatten() {
-        if e.path().is_dir() {
-            out.extend(walk(&e.path()));
-        } else {
-            out.push(e.path());
-        }
-    }
-    out
-}
-
-fn join(
-    port: u16,
-    name: &str,
-    cache: &std::path::Path,
-) -> tokio::task::JoinHandle<anyhow::Result<()>> {
-    tokio::spawn(agent::run(
-        AgentOptions {
-            coordinator: format!("127.0.0.1:{port}"),
-            token: "pool-test".into(),
-            name: Some(name.into()),
-            device: "cpu".into(),
-            data_port: 0,
-            cache: cache.to_path_buf(),
-            once: false,
-            max_memory: None,
-        },
-        Arc::new(|m: &str, e| eprintln!("agent[{m}]: {e:?}")),
-    ))
-}
-
-async fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
-    for _ in 0..200 {
-        if f() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out waiting for {what}");
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_previewed_plan_is_what_loads_and_the_host_controls_machines() {
-    use tendril_cluster::pool::{LoadRequest, Resolver};
-    let dir = tempfile::tempdir().unwrap();
-    tendril_engine::testing::write_tiny_llama(dir.path(), 6, 64, 11, candle_core::DType::F32)
-        .unwrap();
-    let port = free_port();
-    let model_dir = dir.path().to_path_buf();
-    let resolve: Resolver = Arc::new(move |req: &LoadRequest| {
-        let mut o = opts(&model_dir, &req.model, port);
-        if let Some(c) = req.context {
-            o.context = c;
-        }
-        Ok(o)
-    });
-    let me = tendril_cluster::coordinator::this_machine(Some("coord"), "cpu", None).unwrap();
-    let pool = Pool::open(port, "POOL-TEST".into(), Some(resolve), Some(me))
-        .await
-        .unwrap();
-    let cache = tempfile::tempdir().unwrap();
-    let friend = join(port, "friend", cache.path());
-    wait_for("the machine to join", || pool.machines().len() == 1).await;
-
-    // Plan first: what each machine would get, nothing loaded yet.
-    let req = LoadRequest {
-        model: "org/tiny".into(),
+    let mut req = LoadRequest {
+        engine: "exo".into(),
+        model: "llama-3.2-1b".into(),
         ..Default::default()
     };
-    let preview = pool.plan(&req).await.unwrap();
-    assert!(preview.fits, "{:?}", preview.reason);
-    assert_eq!(preview.shares.len(), 2, "split across both machines");
-    let pct: f64 = preview.shares.iter().map(|s| s.weight_pct).sum();
-    assert!((pct - 100.0).abs() < 0.01, "shares cover the model: {pct}");
-    let total: u64 = preview.shares.iter().map(|s| s.weight_bytes).sum();
-    assert_eq!(
-        total,
-        preview
-            .plan
-            .as_ref()
-            .unwrap()
-            .stages
-            .iter()
-            .map(|s| s.mem.weights.0)
-            .sum::<u64>()
-    );
-    assert!(pool.models().is_empty(), "planning doesn't load");
+    let plan = pool.plan(&req).await.unwrap();
+    assert!(plan.fits, "{:?}", plan.reason);
+    assert_eq!(plan.stages.len(), 2);
+    assert!(plan.needs_trusted_network);
+    assert!(plan.risk.is_some());
 
-    // Loading runs exactly the previewed split.
-    let confirmed = LoadRequest {
-        expect_version: Some(preview.pool_version),
-        ..req.clone()
-    };
-    pool.load_with(&confirmed).await.unwrap();
-    let c = pool.models()[0].clone();
-    wait_ready(&c).await;
-    let ran = c.last_plan().unwrap().selected.unwrap();
-    let got: Vec<(String, u64, u64)> = ran
-        .stages
-        .iter()
-        .map(|s| (s.node_name.clone(), s.layer_start, s.layer_end))
-        .collect();
-    let want: Vec<(String, u64, u64)> = preview
-        .shares
-        .iter()
-        .map(|s| (s.machine.clone(), s.layers.0, s.layers.1))
-        .collect();
-    assert_eq!(got, want, "the loaded split is the previewed one");
+    // Without consent: refused, nothing starts.
+    let e = pool.load(&req).await.unwrap_err();
+    assert!(e.is::<NeedsTrust>(), "{e:#}");
+    assert!(pool.deployments().is_empty());
 
-    // The dashboard sees both machines with what they run.
-    let views = pool.machine_views();
-    assert_eq!(views.len(), 2);
-    assert!(
-        views.iter().all(|v| v.roles[0].role != "not used"),
-        "{views:?}"
-    );
+    // A stale plan is refused too.
+    req.trusted_network = true;
+    req.expect_version = Some(plan.pool_version + 1);
+    assert!(pool.load(&req).await.is_err());
 
-    // Control requests name the model exactly: a typo unloads nothing.
-    assert!(pool.unload("org/tinyy").await.is_err());
-    assert_eq!(pool.models().len(), 1);
-
-    // Unloading mid-generation ends the request at once (no recovery wait).
-    let mut rx = c
-        .generate(tendril_cluster::coordinator::GenRequest {
-            prompt: c.inner.tok.encode_prompt("keep going").unwrap(),
-            params: SamplingParams::greedy(),
-            max_tokens: 400,
-            stop: vec![],
-            ignore_eos: true,
-        })
-        .await
-        .unwrap();
-    assert!(matches!(
-        rx.recv().await,
-        Some(tendril_cluster::coordinator::GenOut::Text(_))
-    ));
-    let t0 = std::time::Instant::now();
-    pool.unload("org/tiny").await.unwrap();
-    let ended = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match rx.recv().await {
-                Some(tendril_cluster::coordinator::GenOut::Error(e)) => break Some(e),
-                Some(tendril_cluster::coordinator::GenOut::Done { .. }) | None => break None,
-                Some(_) => {}
-            }
+    // With consent: both machines start exo.
+    req.expect_version = Some(plan.pool_version);
+    let name = pool.load(&req).await.unwrap();
+    let t0 = Instant::now();
+    loop {
+        let n = std::fs::read_to_string(&pidfile)
+            .map(|s| s.lines().count())
+            .unwrap_or(0);
+        if n >= 2 {
+            break;
         }
-    })
-    .await
-    .expect("the request ends promptly");
-    assert!(ended.is_some(), "the client is told why");
-    assert!(t0.elapsed() < Duration::from_secs(5));
-    assert!(pool.models().is_empty());
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!friend.is_finished(), "unloading a model keeps machines");
-    assert_eq!(pool.machines().len(), 1);
+        assert!(
+            t0.elapsed() < Duration::from_secs(30),
+            "exo didn't start on both machines"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(pool.deployments()[0].status(), Status::Loading);
 
-    // A plan confirmed after the pool changed is refused…
-    let stale = pool.load_with(&confirmed).await.unwrap_err();
-    assert!(
-        stale.is::<tendril_cluster::pool::PoolChanged>(),
-        "{stale:#}"
-    );
-    // …and a fresh plan of the same model loads again (on the same split).
-    let again = pool.plan(&req).await.unwrap();
-    pool.load_with(&LoadRequest {
-        expect_version: Some(again.pool_version),
-        ..req.clone()
-    })
-    .await
-    .unwrap();
-    let c2 = pool.models()[0].clone();
-    wait_ready(&c2).await;
-    let ran2: Vec<(String, u64, u64)> = c2
-        .last_plan()
+    // Unloading stops them.
+    pool.unload(&name).unwrap();
+    let pids: Vec<i32> = std::fs::read_to_string(&pidfile)
         .unwrap()
-        .selected
-        .unwrap()
-        .stages
-        .iter()
-        .map(|s| (s.node_name.clone(), s.layer_start, s.layer_end))
+        .lines()
+        .filter_map(|l| l.trim().parse().ok())
         .collect();
-    assert_eq!(ran2, want, "reloaded on the same split");
-    pool.unload("org/tiny").await.unwrap();
-
-    // Removing a machine makes its `tendril join` exit.
-    let id = views.iter().find(|v| !v.local).unwrap().id.clone();
-    pool.remove_machine(&id).unwrap();
-    let r = tokio::time::timeout(Duration::from_secs(10), friend).await;
-    assert!(matches!(r, Ok(Ok(Ok(())))), "removed machine exits: {r:?}");
-    assert!(
-        pool.remove_machine("0").is_err(),
-        "the server can't remove itself"
-    );
-
-    // Stopping the server (Ctrl+C or the dashboard) makes joined machines exit.
-    let other = join(port, "other", cache.path());
-    wait_for("the second machine", || {
-        pool.machines()
-            .iter()
-            .map(|m| m.name.as_str())
-            .collect::<Vec<_>>()
-            == ["other"]
-    })
-    .await;
+    let t0 = Instant::now();
+    while pids.iter().any(|p| unsafe { libc::kill(*p, 0) } == 0) {
+        assert!(
+            t0.elapsed() < Duration::from_secs(15),
+            "engine processes still running"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     pool.shutdown().await;
-    let r = tokio::time::timeout(Duration::from_secs(10), other).await;
-    assert!(
-        matches!(r, Ok(Ok(Ok(())))),
-        "joined machine exits with the host: {r:?}"
-    );
 }

@@ -358,9 +358,9 @@ impl GgufHeader {
                 .collect::<Vec<_>>()
                 .join(", ")
         )];
-        if !arch.executable() {
+        if !arch.known() {
             notes.push(format!(
-                "Architecture '{arch_name}' is not supported by Tendril's engine yet."
+                "Architecture '{arch_name}': planning uses generic transformer formulas."
             ));
         }
         Ok(ModelSpec {

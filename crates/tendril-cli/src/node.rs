@@ -7,22 +7,22 @@ use tendril_core::hardware::Backend;
 
 #[derive(Args, Debug)]
 pub struct NodeArgs {
-    /// Benchmark this machine again (decode and prefill speed, ~10 s).
+    /// Measure this machine again (memory and CPU speed, a few seconds).
     /// It is otherwise measured once per hardware setup and reused.
     #[arg(long)]
     pub probe: bool,
-    /// auto, cpu, metal or cuda.
-    #[arg(long, default_value = "auto")]
-    pub device: String,
     #[arg(long)]
     pub json: bool,
 }
 
 pub fn run(a: NodeArgs) -> Result<()> {
     if a.probe {
-        crate::speed::ensure(&a.device, true)?;
+        let p = tendril_cluster::machine::this_machine(None, None);
+        let mut b = tendril_core::hardware::measure(&p);
+        b.measured_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+        tendril_core::hardware::save_benchmark(&b);
     }
-    let n = tendril_cluster::coordinator::this_machine(None, &a.device, None)?;
+    let n = tendril_cluster::machine::this_machine(None, None);
     if a.json {
         println!("{}", serde_json::to_string_pretty(&n)?);
         return Ok(());
@@ -74,7 +74,7 @@ pub fn run(a: NodeArgs) -> Result<()> {
             "Decode speed",
             match n.measured_bandwidth_gbs {
                 Some(m) => format!(
-                    "{} of weights/s measured · spec sheet {:.0} GB/s",
+                    "{} memory read measured · spec sheet {:.0} GB/s",
                     bold(format!("{m:.1} GB")),
                     n.bandwidth_gbs
                 ),
@@ -121,7 +121,11 @@ pub fn run(a: NodeArgs) -> Result<()> {
         println!();
         println!(
             "{}",
-            dim("Not benchmarked yet: `tendril node --probe` measures it (serve and join do it automatically).")
+            dim(if n.backend == Backend::Cpu {
+                "Not measured yet: `tendril node --probe` measures it (serve and join do it automatically)."
+            } else {
+                "GPU speed uses spec-sheet numbers (each engine has its own kernels)."
+            })
         );
     }
     Ok(())
