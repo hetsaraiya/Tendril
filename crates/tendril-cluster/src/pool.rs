@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tendril_core::cluster::{Cluster, Link};
-use tendril_core::hardware::NodeProfile;
+use tendril_core::hardware::{Backend, NodeProfile};
 use tendril_core::planner::{plan, PlanOptions, Workload};
 use tendril_core::Bytes;
 use tendril_engines::{
@@ -326,6 +326,9 @@ pub struct Pool {
     stop: Notify,
     stopping: AtomicBool,
     changed: Notify,
+    /// Held while a load plans and reserves memory, so two loads can't
+    /// promise the same memory.
+    loading: tokio::sync::Mutex<()>,
     pub control_port: u16,
 }
 
@@ -364,6 +367,7 @@ impl Pool {
             stop: Notify::new(),
             stopping: AtomicBool::new(false),
             changed: Notify::new(),
+            loading: tokio::sync::Mutex::new(()),
             control_port,
         });
         tokio::spawn(pool.clone().accept_loop(listener));
@@ -801,6 +805,15 @@ impl Pool {
                 .map(|(_, b)| *b)
                 .sum();
             let mut p = e.profile.clone();
+            if det.devices == 0 && p.backend != Backend::Cpu {
+                // This engine build sees no GPU here: plan for RAM and the CPU.
+                let capped = p.usable_reason.contains("--max-memory");
+                let cap = p.usable_memory;
+                p.use_backend(Backend::Cpu);
+                if capped && cap < p.usable_memory {
+                    p.usable_memory = cap;
+                }
+            }
             p.usable_memory = Bytes(p.usable_memory.0.saturating_sub(used));
             machines.push(Machine {
                 key: e.key.clone(),
@@ -854,6 +867,9 @@ impl Pool {
             MultiMachine::EngineManaged => true,
             _ => model.layered,
         };
+        // A model that is a path on this server can only span machines when the
+        // engine moves the weights to them itself (llama.cpp over RPC).
+        let multi = multi && !(model.local_path.is_some() && !engine.local_path_spans());
         // Which machines may take part: heads always, workers when splitting.
         let mut idx: Vec<usize> = (0..machines.len())
             .filter(|&i| {
@@ -877,6 +893,8 @@ impl Pool {
             );
         }
         let mut peaks: HashMap<String, u64> = HashMap::new();
+        // What the planner gave each machine: (layers, weights, peak).
+        let mut planned: HashMap<String, ((u64, u64), u64, u64)> = HashMap::new();
         let (stages, tps, ttft) = if info.multi_machine == MultiMachine::EngineManaged {
             // The engine splits by itself: every machine takes part, sized by
             // its free memory.
@@ -982,6 +1000,14 @@ impl Pool {
                     weight_bytes: st.mem.weights.0,
                 });
                 peaks.insert(m.key.clone(), st.mem.peak.0);
+                planned.insert(
+                    m.key.clone(),
+                    (
+                        (st.layer_start, st.layer_end),
+                        st.mem.weights.0,
+                        st.mem.peak.0,
+                    ),
+                );
             }
             let layered = model.layered;
             (
@@ -997,10 +1023,67 @@ impl Pool {
             context,
             concurrency,
         };
-        let placement = match engine.arrange(&model, placement, &machines) {
+        let mut placement = match engine.arrange(&model, placement, &machines) {
             Ok(p) => p,
             Err(e) => return fail(preview, format!("{e:#}")),
         };
+        // The engine may lay layers out differently from the planner (SGLang
+        // splits evenly, llama.cpp reorders): size each machine for what it
+        // really holds, and check it still fits.
+        if model.layered {
+            let spec = &model.spec;
+            let total = spec.num_layers;
+            let kv = |r: (u64, u64)| {
+                spec.kv_bytes(
+                    r.0 as usize..r.1 as usize,
+                    context as u64,
+                    concurrency as u64,
+                    2,
+                )
+                .0
+            };
+            let weights = |r: (u64, u64)| {
+                let mut w: u64 = spec.bytes.layers[r.0 as usize..r.1 as usize]
+                    .iter()
+                    .map(|b| b.0)
+                    .sum();
+                if r.0 == 0 {
+                    w += spec.bytes.embed.0;
+                }
+                if r.1 == total {
+                    w += spec.head_bytes().0 + spec.bytes.final_norm.0;
+                }
+                w
+            };
+            for s in &mut placement.stages {
+                let Some(&(old, old_w, old_peak)) = planned.get(&s.machine) else {
+                    continue;
+                };
+                if old == s.layers || s.layers.1 > total || s.layers.0 > s.layers.1 {
+                    continue;
+                }
+                let new_w = weights(s.layers);
+                let peak = (old_peak + new_w + kv(s.layers)).saturating_sub(old_w + kv(old));
+                s.weight_bytes = new_w;
+                peaks.insert(s.machine.clone(), peak);
+                let i = machines.iter().position(|m| m.key == s.machine);
+                let free = i.map(|i| profiles[i].usable_memory.0).unwrap_or(0);
+                if budget(peak) > free {
+                    let name = i.map(|i| machines[i].name.clone()).unwrap_or_default();
+                    return fail(
+                        preview,
+                        format!(
+                            "with {}'s layout {name} would hold layers {}–{} and need {}, but has {} free",
+                            info.name,
+                            s.layers.0,
+                            s.layers.1.saturating_sub(1),
+                            Bytes(budget(peak)),
+                            Bytes(free)
+                        ),
+                    );
+                }
+            }
+        }
         let roles = match engine.roles(&model, &placement, &machines) {
             Ok(r) => r,
             Err(e) => return fail(preview, format!("{e:#}")),
@@ -1065,13 +1148,20 @@ impl Pool {
         if self.stopping.load(Ordering::Relaxed) {
             bail!("the cluster is stopping");
         }
-        let (preview, model, roles, budgets, engine) = self.plan_full(req).await?;
-        if req
-            .expect_version
-            .is_some_and(|v| v != preview.pool_version)
-        {
-            return Err(PoolChanged.into());
-        }
+        // Plan, check and reserve as one step: two loads planned on the same
+        // free memory must not both be accepted.
+        let _reserving = self.loading.lock().await;
+        let (preview, model, roles, budgets, engine) = loop {
+            let planned = self.plan_full(req).await?;
+            let live = self.version();
+            if req.expect_version.is_some_and(|v| v != live) {
+                return Err(PoolChanged.into());
+            }
+            if planned.0.pool_version == live {
+                break planned;
+            }
+            // A machine came or went while planning: plan again.
+        };
         if !preview.fits {
             bail!(
                 "{}",

@@ -56,7 +56,7 @@ async fn file_model(
         let base = file.rsplit('/').next().unwrap_or(&file).to_string();
         let name = match engine_dir {
             Some(_) => base.clone(),
-            None => format!("{}/{}", safe_name(&repo), file),
+            None => format!("{}/{}", repo_dir(&repo, &rev), file),
         };
         return Ok(FileModel {
             id: base,

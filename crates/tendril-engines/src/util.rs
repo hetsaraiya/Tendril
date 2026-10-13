@@ -131,6 +131,16 @@ pub fn safe_name(s: &str) -> String {
         .to_string()
 }
 
+/// Cache directory for a HuggingFace repo at a revision. Repo names only
+/// use `[A-Za-z0-9._-]`, so `/` → `--` keeps distinct repos distinct.
+pub fn repo_dir(repo: &str, revision: &str) -> String {
+    format!(
+        "{}/{}",
+        safe_name(&repo.replace('/', "--")),
+        safe_name(revision)
+    )
+}
+
 /// A shell-friendly rendering of a command line, for logs and docs.
 pub fn command_line(cmd: &[String]) -> String {
     cmd.iter()
@@ -156,5 +166,7 @@ mod tests {
         assert_eq!(even_split(10, 3), vec![4, 3, 3]);
         assert_eq!(ranges(&[4, 3, 3]), vec![(0, 4), (4, 7), (7, 10)]);
         assert_eq!(safe_name("Qwen/Qwen2.5:7b"), "Qwen-Qwen2.5-7b");
+        assert_ne!(repo_dir("a/b-c", "main"), repo_dir("a-b/c", "main"));
+        assert_ne!(repo_dir("a/b", "main"), repo_dir("a/b", "v2"));
     }
 }

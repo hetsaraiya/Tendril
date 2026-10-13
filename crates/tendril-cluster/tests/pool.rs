@@ -25,6 +25,19 @@ async fn trusted_network_is_required_to_span_machines() {
     .unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::env::set_var("TENDRIL_EXO", &fake);
+    // A stand-in HuggingFace that lists the model's files (for its size).
+    let hf = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    std::env::set_var(
+        "TENDRIL_HF_ENDPOINT",
+        format!("http://{}", hf.local_addr().unwrap()),
+    );
+    let app = axum::Router::new().route(
+        "/api/models/{org}/{name}/tree/{rev}",
+        axum::routing::get(|| async {
+            axum::Json(serde_json::json!([{"type": "file", "path": "model.safetensors", "size": 300_000_000u64}]))
+        }),
+    );
+    tokio::spawn(async move { axum::serve(hf, app).await.unwrap() });
 
     let token = "POOL-TEST".to_string();
     let pool = Pool::start(PoolOptions {
@@ -57,11 +70,18 @@ async fn trusted_network_is_required_to_span_machines() {
 
     let mut req = LoadRequest {
         engine: "exo".into(),
-        model: "llama-3.2-1b".into(),
+        model: "mlx-community/Tiny-4bit".into(),
         ..Default::default()
     };
+    // A model-card name has no known size: refused rather than unreserved.
+    let card = LoadRequest {
+        model: "llama-3.2-1b".into(),
+        ..req.clone()
+    };
+    assert!(pool.plan(&card).await.is_err());
     let plan = pool.plan(&req).await.unwrap();
     assert!(plan.fits, "{:?}", plan.reason);
+    assert!(plan.weight_bytes >= 300_000_000);
     assert_eq!(plan.stages.len(), 2);
     assert!(plan.needs_trusted_network);
     assert!(plan.risk.is_some());

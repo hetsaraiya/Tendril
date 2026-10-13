@@ -230,6 +230,11 @@ impl Engine for LlamaCpp {
         })
     }
 
+    fn local_path_spans(&self) -> bool {
+        // ggml-rpc-server receives its layers from llama-server.
+        true
+    }
+
     fn arrange(
         &self,
         model: &ResolvedModel,
@@ -416,12 +421,9 @@ impl Engine for LlamaCpp {
 /// `quantize` wins.
 fn split_quant(model: &str, quantize: Option<&str>) -> (String, Option<String>) {
     let m = model.trim();
+    // Only a known quantization tag after the colon: `C:\m.gguf` is a path.
     let (base, tag) = match m.rsplit_once(':') {
-        Some((b, t))
-            if !t.contains('/') && !b.is_empty() && !m.contains("://") && t.len() <= 12 =>
-        {
-            (b.to_string(), Some(t.to_string()))
-        }
+        Some((b, t)) if !b.is_empty() && is_quant_tag(t) => (b.to_string(), Some(t.to_string())),
         _ => (m.to_string(), None),
     };
     let q = quantize
@@ -429,6 +431,19 @@ fn split_quant(model: &str, quantize: Option<&str>) -> (String, Option<String>) 
         .map(String::from)
         .or(tag);
     (base, q.map(|q| q.to_ascii_uppercase()))
+}
+
+/// Q4_K_M, IQ3_XS, Q8_0, BF16, F16, F32, MXFP4 …
+fn is_quant_tag(t: &str) -> bool {
+    let u = t.to_ascii_uppercase();
+    let body = u.strip_prefix("IQ").or_else(|| u.strip_prefix('Q'));
+    match body {
+        Some(b) => {
+            b.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && b.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => matches!(u.as_str(), "BF16" | "F16" | "F32" | "MXFP4"),
+    }
 }
 
 fn expand(s: &str) -> PathBuf {
@@ -593,7 +608,7 @@ async fn remote(input: &str, quant: Option<&str>) -> Result<Remote> {
             }
         }
     };
-    let dir = safe_name(&repo);
+    let dir = repo_dir(&repo, &revision);
     let mut headers = Vec::new();
     let mut files = Vec::new();
     for f in &chosen {
@@ -799,6 +814,10 @@ mod tests {
             split_quant("Qwen/X-GGUF", Some("Q8_0")).1.as_deref(),
             Some("Q8_0")
         );
+        // Windows paths keep their drive letter.
+        assert_eq!(split_quant("C:\\m.gguf", None), ("C:\\m.gguf".into(), None));
+        assert_eq!(split_quant("D:\\models\\x.gguf", None).1, None);
+        assert_eq!(split_quant("a/b:bf16", None).1.as_deref(), Some("BF16"));
     }
 
     #[test]

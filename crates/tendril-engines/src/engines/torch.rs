@@ -283,6 +283,13 @@ impl Kind {
         let conc = p.concurrency.max(1).to_string();
         let mut roles = Vec::new();
         for (rank, s) in p.stages.iter().enumerate() {
+            // Rank 0 hosts the rendezvous on its own LAN address and port;
+            // the other ranks reach it once it has started.
+            let (master_host, master_port) = if rank == 0 {
+                ("{lan_ip}", "{port:master}")
+            } else {
+                ("{peer_host:server}", "{peer_port:server:master}")
+            };
             let mut l = launch(self.id(), "server", &[]);
             match self {
                 Kind::Vllm => {
@@ -310,10 +317,10 @@ impl Kind {
                                 rank.to_string(),
                             ])
                             .args([
-                                "--master-addr",
-                                "{peer_host:server}",
-                                "--master-port",
-                                "{peer_port:server:master}",
+                                "--master-addr".to_string(),
+                                master_host.to_string(),
+                                "--master-port".to_string(),
+                                master_port.to_string(),
                             ])
                             .env("VLLM_HOST_IP", "{lan_ip}")
                             .env(
@@ -352,8 +359,8 @@ impl Kind {
                                 rank.to_string(),
                             ])
                             .args([
-                                "--dist-init-addr",
-                                "{peer_host:server}:{peer_port:server:master}",
+                                "--dist-init-addr".to_string(),
+                                format!("{master_host}:{master_port}"),
                             ]);
                     }
                 }
@@ -504,6 +511,17 @@ mod tests {
             .contains(&("VLLM_PP_LAYER_PARTITION".into(), "10,18".into())));
         assert!(r[1].launch.args.contains(&"--headless".to_string()));
         assert_eq!(r[1].after_started, vec!["server"]);
+        // Rank 0 doesn't refer to itself as a peer (it starts first).
+        let head = r[0].launch.args.join(" ");
+        assert!(
+            head.contains("--master-addr {lan_ip} --master-port {port:master}"),
+            "{head}"
+        );
+        let worker = r[1].launch.args.join(" ");
+        assert!(
+            worker.contains("--master-addr {peer_host:server}"),
+            "{worker}"
+        );
         let p2 = Placement {
             stages: vec![
                 Stage {

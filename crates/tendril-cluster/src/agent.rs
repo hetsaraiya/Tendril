@@ -201,7 +201,13 @@ impl Agent {
                 address,
             } => {
                 (self.ev)(AgentEvent::Connected { name: key, cluster });
-                address
+                // The server's own agent is seen as 127.0.0.1; engines that
+                // listen on the LAN need this machine's real address.
+                if address == "127.0.0.1" {
+                    lan_address().unwrap_or(address)
+                } else {
+                    address
+                }
             }
             Msg::Reject { reason } => return Ok(End::Rejected(reason)),
             other => bail!("unexpected reply {other:?}"),
@@ -277,7 +283,7 @@ impl Agent {
         self.stop(&key);
         let pid = Arc::new(Mutex::new(None));
         let me = self.clone();
-        let pid2 = pid.clone();
+        let (pid2, pid3) = (pid.clone(), pid.clone());
         let task = tokio::spawn(async move {
             let report = {
                 let (out, ev) = (out.clone(), me.ev.clone());
@@ -315,6 +321,12 @@ impl Agent {
             let key = format!("{}/{}", ctx.deployment, ctx.role.id);
             let r = ctx.run().await;
             me.targets.remove(&key);
+            // The process is gone (or failed): stop what it started, then
+            // forget its id so a later stop can't signal a reused one.
+            let gone = pid3.lock().unwrap().take();
+            if let (Some(p), true) = (gone, r.is_err()) {
+                kill_group(p);
+            }
             let tail = log.lock().unwrap().iter().cloned().collect::<Vec<_>>();
             match r {
                 Ok(code) => report(RoleState::Exited { code, log: tail }),
@@ -348,6 +360,15 @@ impl Agent {
             self.stop(&k);
         }
     }
+}
+
+/// This machine's address on its LAN (the source address of the default
+/// route; nothing is sent).
+fn lan_address() -> Option<String> {
+    let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    s.connect("192.0.2.1:9").ok()?;
+    let ip = s.local_addr().ok()?.ip();
+    (!ip.is_loopback() && !ip.is_unspecified()).then(|| ip.to_string())
 }
 
 /// Stop an engine process and everything it started.

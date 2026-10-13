@@ -30,7 +30,7 @@ impl Engine for Exo {
                 risk: "exo's traffic between machines is not encrypted, and a namespace only keeps honest clusters apart — it is not a password. Use only on a private network you trust.".into(),
             },
             platforms: "macOS on Apple Silicon (Linux runs on the CPU)".into(),
-            model_hint: "An exo model id (llama-3.2-1b) or an MLX repo (mlx-community/…)".into(),
+            model_hint: "An MLX model repo on HuggingFace (mlx-community/…)".into(),
             example_model: "mlx-community/Llama-3.2-3B-Instruct-4bit".into(),
             requirements: vec![Requirement::new(
                 "exo",
@@ -115,24 +115,26 @@ impl Engine for Exo {
         if m.is_empty() {
             bail!("empty model name");
         }
-        let (size, note) = if hf::is_repo_id(&m) {
-            let (repo, rev) = hf::split_repo(&m);
-            let files = hf::list_files(&repo, &rev).await?;
-            let s: u64 = files
-                .iter()
-                .filter(|f| f.path.ends_with(".safetensors"))
-                .map(|f| f.size)
-                .sum();
-            if s == 0 {
-                bail!("{repo} has no safetensors weights (exo runs MLX models, e.g. from mlx-community)");
-            }
-            (s, format!("{} of weights", gib(s)))
-        } else {
-            (
-                0,
-                "Size unknown until exo places it (exo model card)".into(),
-            )
-        };
+        // The size must be known to reserve memory next to other models, so
+        // exo models are named by their HuggingFace repo.
+        if !hf::is_repo_id(&m) {
+            bail!(
+                "give exo the model's HuggingFace repo (e.g. mlx-community/Llama-3.2-1B-Instruct-4bit) rather than a model-card name, so Tendril can reserve its memory"
+            );
+        }
+        let (repo, rev) = hf::split_repo(&m);
+        let files = hf::list_files(&repo, &rev).await?;
+        let size: u64 = files
+            .iter()
+            .filter(|f| f.path.ends_with(".safetensors"))
+            .map(|f| f.size)
+            .sum();
+        if size == 0 {
+            bail!(
+                "{repo} has no safetensors weights (exo runs MLX models, e.g. from mlx-community)"
+            );
+        }
+        let note = format!("{} of weights", gib(size));
         Ok(ResolvedModel {
             engine: ID.into(),
             id: m.clone(),
@@ -140,7 +142,7 @@ impl Engine for Exo {
             task: Task::Chat,
             vision: false,
             layered: false,
-            spec: spec::opaque(&m, "exo", size, 0),
+            spec: spec::opaque(&m, "exo", size, spec::working_memory(size)),
             files: vec![],
             local_path: None,
             params: serde_json::json!({ "size": size }),

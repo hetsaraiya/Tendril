@@ -386,6 +386,12 @@ pub trait Engine: Send + Sync {
         d.ready && d.roles.iter().any(|r| r == "split-worker")
     }
 
+    /// Can a model that is a path on the server span machines? Only when
+    /// the engine moves the weights to the other machines itself.
+    fn local_path_spans(&self) -> bool {
+        false
+    }
+
     /// Reorder or adjust Tendril's placement to how the engine actually
     /// lays layers out, so the plan shown is the plan that runs.
     fn arrange(

@@ -43,18 +43,29 @@ struct Piece {
     len: u64,
 }
 
-/// Download `url` (`size` bytes) to `dest`. A complete file of the right
-/// size is kept as is. `progress(done, total)` is called as bytes arrive.
+/// Where the URL a cached file came from is recorded.
+fn source_path(dest: &Path) -> std::path::PathBuf {
+    let mut s = dest.as_os_str().to_owned();
+    s.push(".source");
+    s.into()
+}
+
+/// Download `url` (`size` bytes) to `dest`. A complete file of the right size
+/// downloaded from the same URL (which names the revision) is kept as is.
+/// `progress(done, total)` is called as bytes arrive.
 pub fn download_file(
     url: &str,
     size: u64,
     dest: &Path,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<()> {
-    if std::fs::metadata(dest).is_ok_and(|m| m.len() == size && size > 0) {
+    let source = source_path(dest);
+    let same_source = std::fs::read_to_string(&source).is_ok_and(|s| s == url);
+    if same_source && std::fs::metadata(dest).is_ok_and(|m| m.len() == size && size > 0) {
         progress(size, size);
         return Ok(());
     }
+    let _ = std::fs::remove_file(&source);
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
     }
@@ -77,6 +88,7 @@ pub fn download_file(
         progress(n, n);
         drop(out);
         std::fs::rename(&part, dest)?;
+        std::fs::write(&source, url)?;
         return Ok(());
     }
     {
@@ -151,6 +163,7 @@ pub fn download_file(
     }
     progress(done.load(Ordering::Relaxed), size);
     std::fs::rename(&part, dest).with_context(|| format!("save {}", dest.display()))?;
+    std::fs::write(&source, url)?;
     Ok(())
 }
 
@@ -274,13 +287,15 @@ mod tests {
         assert!(peak.load(Ordering::SeqCst) > 1, "requests ran in parallel");
         assert_eq!(std::fs::read(&dest).unwrap(), file);
         assert!(!dir.path().join("org/m.gguf.part").exists());
-        // Already there: nothing is fetched again.
-        download_file(
-            "http://127.0.0.1:1/never",
+        // Already there from the same URL: nothing is fetched again.
+        download_file(&url, file.len() as u64, &dest, &mut |_, _| {}).unwrap();
+        // Same name and size from another URL (another revision): fetched again.
+        let other = download_file(
+            "http://127.0.0.1:1/other",
             file.len() as u64,
             &dest,
             &mut |_, _| {},
-        )
-        .unwrap();
+        );
+        assert!(other.is_err());
     }
 }
