@@ -5,7 +5,7 @@ use tendril_core::NodeProfile;
 use tendril_engine::model::StageSpec;
 use tendril_engine::sampler::SamplingParams;
 
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 /// Activation tensors on the wire (raw little-endian bytes).
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -175,8 +175,12 @@ pub enum Msg {
     Unload {
         epoch: u64,
     },
+    /// End a session. `leave`: the whole cluster is going away (or this
+    /// machine was removed) and the agent process should exit; otherwise only
+    /// this model stopped and the machine stays in the pool.
     Bye {
         reason: String,
+        leave: bool,
     },
 
     // ---- data plane -----------------------------------------------------

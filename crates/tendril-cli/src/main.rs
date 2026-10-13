@@ -13,6 +13,7 @@ mod node;
 mod plan;
 mod run;
 mod serve;
+mod speed;
 mod ui;
 mod verify;
 

@@ -233,6 +233,23 @@ impl ShardWriter {
         self.written
     }
 
+    /// Where `name`'s bytes live in the file: (absolute offset, length).
+    pub fn region(&self, name: &str) -> Option<(u64, u64)> {
+        self.offsets
+            .get(name)
+            .map(|&(start, len)| (self.data_start + start, len))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Account for bytes written straight into [`ShardWriter::region`]s by
+    /// other file handles (parallel downloads).
+    pub fn add_written(&mut self, n: u64) {
+        self.written += n;
+    }
+
     /// Forget bytes written since `written` (a tensor is being re-fetched).
     pub fn rewind(&mut self, written: u64) {
         self.written = written;

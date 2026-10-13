@@ -47,25 +47,25 @@ pub struct LoadArgs {
     /// Cluster token (default: the one `tendril serve` saved on this machine).
     #[arg(long, env = "TENDRIL_TOKEN")]
     pub token: Option<String>,
+    /// Weight format: native, q8_0, q6_k, q4_k (default: the server's).
+    #[arg(long, short = 'q')]
+    pub quantize: Option<String>,
+    /// Tokens per conversation, e.g. 8k (default: the server's).
+    #[arg(long, short = 'c')]
+    pub context: Option<String>,
+    /// Load without asking.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
-/// `tendril load`: ask a running server to serve another model.
-pub fn load(a: LoadArgs) -> Result<()> {
-    let token = match a.token {
-        Some(t) => t,
-        None => tendril_cluster::token::load_or_create()?,
-    };
+/// POST `path` with the cluster token; the server's error message on failure.
+fn control(url: &str, token: &str, path: &str, body: &Value) -> Result<Value> {
     let r = client()?
-        .post(format!("{}/api/models", a.url.trim_end_matches('/')))
+        .post(format!("{}{path}", url.trim_end_matches('/')))
         .bearer_auth(token)
-        .json(&json!({"model": a.model}))
+        .json(body)
         .send()
-        .with_context(|| {
-            format!(
-                "no Tendril server at {} — start one with `tendril serve`",
-                a.url
-            )
-        })?;
+        .with_context(|| format!("no Tendril server at {url} — start one with `tendril serve`"))?;
     let ok = r.status().is_success();
     let v: Value = r.json()?;
     if !ok {
@@ -74,12 +74,175 @@ pub fn load(a: LoadArgs) -> Result<()> {
             v["error"]["message"].as_str().unwrap_or("request failed")
         );
     }
+    Ok(v)
+}
+
+/// `tendril load`: plan a model across the pool, show what each machine
+/// gets, and load it once confirmed. Each machine then downloads only its
+/// own layers.
+pub fn load(a: LoadArgs) -> Result<()> {
+    let token = match &a.token {
+        Some(t) => t.clone(),
+        None => tendril_cluster::token::load_or_create()?,
+    };
+    let mut req = json!({"model": a.model});
+    if let Some(q) = &a.quantize {
+        req["quantize"] = json!(q);
+    }
+    if let Some(c) = &a.context {
+        let n = tendril_core::units::parse_tokens(c)
+            .with_context(|| format!("cannot parse --context '{c}'"))?;
+        req["context"] = json!(n);
+    }
+    eprintln!("{} Planning {} across the pool…", dim("·"), bold(&a.model));
+    let v = loop {
+        let p = control(&a.url, &token, "/api/plan", &req)?;
+        print_plan(&p);
+        if p["fits"] != json!(true) {
+            bail!("not loading: it doesn't fit on the machines in the pool");
+        }
+        if !a.yes {
+            print!("\n  Load it? Each machine downloads only its share. [Y/n] ");
+            std::io::stdout().flush()?;
+            let mut line = String::new();
+            std::io::stdin().lock().read_line(&mut line)?;
+            if line.trim().eq_ignore_ascii_case("n") || line.trim().eq_ignore_ascii_case("no") {
+                println!("{}", dim("  Not loaded."));
+                return Ok(());
+            }
+        }
+        // Load exactly this plan: refused if the pool changed meanwhile.
+        let mut confirmed = req.clone();
+        confirmed["expect_version"] = p["pool_version"].clone();
+        match control(&a.url, &token, "/api/models", &confirmed) {
+            Ok(v) => break v,
+            Err(e) if e.to_string().contains("plan again") && !a.yes => {
+                println!(
+                    "\n{} The machines changed while you were deciding — here is the new plan:",
+                    warn_mark()
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    };
     println!(
-        "{} Loading {} — the server plans it across the pool; watch with `tendril status`",
+        "{} Loading {} — machines are downloading their shares; watch with `tendril status` or the dashboard",
         ok_mark(),
         bold(v["loaded"].as_str().unwrap_or(&a.model))
     );
     Ok(())
+}
+
+fn fmt_params(n: u64) -> String {
+    let n = n as f64;
+    if n >= 1e9 {
+        format!("{:.1}B", n / 1e9)
+    } else if n >= 1e6 {
+        format!("{:.0}M", n / 1e6)
+    } else {
+        format!("{:.0}K", n / 1e3)
+    }
+}
+
+fn print_plan(p: &Value) {
+    let b = |v: &Value| tendril_core::Bytes(v.as_u64().unwrap_or(0));
+    println!();
+    println!(
+        "{} {} {}",
+        bold("Plan ·"),
+        bold(cyan(p["model"].as_str().unwrap_or(""))),
+        dim(format!(
+            "{} · {} params · {} layers · {} weights ({}) · {} ctx",
+            p["architecture"].as_str().unwrap_or(""),
+            fmt_params(p["params"].as_u64().unwrap_or(0)),
+            p["layers"],
+            b(&p["weight_bytes"]),
+            p["format"].as_str().unwrap_or(""),
+            p["context"]
+        ))
+    );
+    let shares = p["shares"].as_array().cloned().unwrap_or_default();
+    if !shares.is_empty() {
+        let mut t = Table::new(&[
+            "MACHINE",
+            "GETS",
+            "WEIGHTS",
+            "SHARE",
+            "MEMORY NEEDED",
+            "DOWNLOADS",
+        ]);
+        for s in &shares {
+            t.row(vec![
+                bold(format!(
+                    "{} {}",
+                    s["machine"].as_str().unwrap_or(""),
+                    dim(format!("({})", s["backend"].as_str().unwrap_or("")))
+                )),
+                s["components"].as_str().unwrap_or("").to_string(),
+                b(&s["weight_bytes"]).to_string(),
+                format!("{:.0}%", s["weight_pct"].as_f64().unwrap_or(0.0)),
+                format!("{} of {}", b(&s["memory_needed"]), b(&s["memory_budget"])),
+                b(&s["weight_bytes"]).to_string(),
+            ]);
+        }
+        t.print();
+        println!(
+            "  {} ~{:.1} tok/s · first token ~{}",
+            ok_mark(),
+            p["tokens_per_sec"].as_f64().unwrap_or(0.0),
+            tendril_core::units::fmt_ms(p["ttft_ms"].as_f64().unwrap_or(0.0))
+        );
+    } else {
+        println!(
+            "  {} doesn't fit: {}",
+            bad_mark(),
+            p["reason"].as_str().unwrap_or("not enough memory")
+        );
+    }
+    let displaced: Vec<&str> = p["displaces"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    if !displaced.is_empty() {
+        println!(
+            "  {} loading it leaves no room for: {}",
+            warn_mark(),
+            displaced.join(", ")
+        );
+    }
+    let fits_other: Vec<String> = p["alternatives"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|x| x["fits"] == json!(true))
+                .map(|x| {
+                    format!(
+                        "{} ({}, ~{:.1} tok/s)",
+                        x["format"].as_str().unwrap_or(""),
+                        b(&x["weight_bytes"]),
+                        x["tokens_per_sec"].as_f64().unwrap_or(0.0)
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !fits_other.is_empty() {
+        println!(
+            "  {} other formats that fit: {}  {}",
+            cyan("→"),
+            fits_other.join(" · "),
+            dim("(--quantize <format>)")
+        );
+    }
+    for adv in p["advice"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .take(3)
+    {
+        println!("  {} {}", cyan("→"), dim(adv.as_str().unwrap_or("")));
+    }
 }
 
 fn client() -> Result<reqwest::blocking::Client> {

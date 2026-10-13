@@ -60,14 +60,65 @@ Nobody downloads the whole model: each machine fetches only its own layers.
 ```bash
 tendril serve                                  # 1. you: open an empty pool
 tendril join --token XXXX-XXXX-XXXX-XXXX       # 2. each friend: join (same network)
-tendril load Qwen/Qwen2.5-14B-Instruct         # 3. you: pick the model
+tendril load Qwen/Qwen2.5-14B-Instruct         # 3. you: pick the model (or use the dashboard)
 ```
 
-`load` fetches only the model's config, tokenizer and tensor headers, plans the split
-over the machines present, and then every machine (yours too) downloads just the byte
-ranges of its own layers from HuggingFace. `load` must run with the cluster token (it
-reads the one `serve` saved, or `--token`). For gated models (Llama, Gemma) every
-machine needs its own `HF_TOKEN`; yours is never sent to anyone.
+1. **Every machine benchmarks itself** the first time `serve` or `join` runs on it. That
+   means about 10 s measuring how fast Tendril's own kernels stream weights (decode) and
+   multiply matrices (prefill). The result is saved and reused until the hardware changes:
+   another chip, more memory, a different backend. `tendril node --probe` measures again.
+   The planner uses these measured speeds instead of spec-sheet numbers.
+2. **Plan first.** `load` (or **Add a model** in the dashboard) reads only the model's
+   config, tokenizer and tensor headers. It shows exactly what each machine would get:
+   which layers, how many GB of weights (and what % of the model), and how much memory it
+   needs out of its budget. It also gives the predicted speed, other weight formats that
+   fit, and what to change if it doesn't fit. Nothing is downloaded yet.
+3. **Confirm, and each machine downloads only its share**, straight from HuggingFace, over
+   8 parallel connections (big tensors in 32 MiB ranges, each retried on its own). The split
+   that loads is the one you were shown.
+
+```text
+$ tendril load Qwen/Qwen2.5-14B-Instruct
+Plan · Qwen/Qwen2.5-14B-Instruct  Qwen2 · 14.8B params · 48 layers · 27.5 GiB weights (native) · 8192 ctx
+  MACHINE        GETS                          WEIGHTS   SHARE  MEMORY NEEDED         DOWNLOADS
+  studio (Metal) embeddings, layers 0–29       17.4 GiB  63%    19.9 GiB of 21.0 GiB  17.4 GiB
+  laptop (Metal) layers 30–47, final norm + …  10.1 GiB  37%    10.6 GiB of 10.7 GiB  10.1 GiB
+  ✓ ~6.1 tok/s · first token ~1.4 s
+  → other formats that fit: q8_0 (14.6 GiB, ~11.0 tok/s) · q4_k (8.4 GiB, ~17.9 tok/s)  (--quantize <format>)
+
+  Load it? Each machine downloads only its share. [Y/n]
+```
+
+(Illustrative numbers; `load` must run with the cluster token: it reads the one `serve` saved,
+or `--token`.) For gated models (Llama, Gemma) every machine needs its own `HF_TOKEN`; yours is
+never sent to anyone.
+
+### The dashboard
+
+`tendril serve` prints the dashboard address. It shows every machine with its chip,
+backend, measured decode and prefill speed, link, how its memory is shared between models,
+and which layers it runs. Controls unlock with the cluster token:
+
+- add a model (plan → review the split → load),
+- unload a model (its machines stay in the pool),
+- remove a machine (it unloads and its `tendril join` exits),
+- stop the cluster.
+
+![The dashboard: models, machines and what each one runs](docs/images/dashboard.png)
+
+![Plan preview: how the weights are split across the machines before anything downloads](docs/images/plan-preview.png)
+
+**Stopping:** Ctrl+C on the server (or **Stop cluster**) unloads everything, and every
+joined machine says why and exits. Ctrl+C on a joined machine makes only that machine leave.
+
+The same controls are an HTTP API, with `Authorization: Bearer <cluster token>`:
+- `POST /api/plan` and `POST /api/models`, with `{"model", "quantize"?, "context"?}`;
+- `POST /api/models/unload` with `{"model"}`;
+- `POST /api/machines/remove` with `{"id"}`;
+- `POST /api/stop`;
+- `GET /api/auth`.
+
+`GET /api/status` lists the machines and models without a token.
 
 ### Model first
 

@@ -91,6 +91,34 @@ batching, prefix cache and recovery. A `Pool` sits in front of them:
 - **Events** carry an optional `model` tag. Machine join and leave events come only from
   the first model, so a machine is reported once.
 
+## Plan first, one planner
+
+The pool is the only planner. It builds one view of the machines from:
+- each machine's profile, including its saved benchmark;
+- the links it measures when a machine joins (five sequential pings, then a 4 MiB
+  transfer, before any model is loaded).
+
+From that view it computes:
+- `POST /api/plan`: the preview, which places the candidate next to the loaded models with
+  `tendril_core::pool::allocate` and reports each machine's layers, weight bytes, %
+  of the model, memory needed versus its budget, and alternatives in other weight formats;
+- each model's share and exact split after loading (the same allocation).
+
+A model's coordinator runs the split the pool hands it (`PoolLink::plan`, matched to its
+sessions by machine id) instead of planning on its own. So the split that loads is the one
+the preview showed, as long as the machines didn't change in between.
+
+**Benchmarks:** `tendril_engine::hwbench` times a bf16 matrix-vector product over a weight
+far larger than any cache (decode: GB/s of weights streamed) and a 512-token matrix
+multiply (prefill: TFLOP/s) on the device the machine will use. Results are keyed by a
+hardware fingerprint (chip, cores, memory, backend, OS) in
+`~/.config/tendril/benchmarks.json` and replace the spec-sheet estimates in
+`NodeProfile::effective_*`.
+
+**Leaving:** `Bye { leave: true }` (the host stopping, or removing the machine) makes the
+agent process exit. `Bye { leave: false }` (a model unloaded) ends only that model's
+session.
+
 ## Security
 
 - One cluster token (generated on first `serve`, stored with 0600 permissions). Every

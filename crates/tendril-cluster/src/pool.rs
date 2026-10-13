@@ -6,23 +6,166 @@
 //! memory between the models with `tendril_core::pool::allocate`. A model's
 //! coordinator then plans inside its share like it would on a smaller machine.
 
-use crate::coordinator::{read_hello, Coordinator, Event, PoolLink, ServeOptions, Status};
+use crate::coordinator::{
+    model_spec, read_hello, Coordinator, Event, PoolLink, ServeOptions, Status, LOCAL_MACHINE,
+};
 use crate::proto::Msg;
 use crate::{token, wire};
 use anyhow::{bail, Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::Duration;
-use tendril_core::cluster::Cluster;
+use std::time::{Duration, Instant};
+use tendril_core::cluster::{Cluster, Link};
 use tendril_core::hardware::NodeProfile;
+use tendril_core::model::ModelSpec;
+use tendril_core::planner::{Plan, PlanOptions, Workload};
 use tendril_core::pool::{allocate, PoolModel};
 use tendril_core::units::Bytes;
+use tendril_engine::linear::WeightFormat;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc, Notify};
 
-/// Turns what a user typed into serve options (fetching the model's config).
-pub type Resolver = Arc<dyn Fn(&str) -> Result<ServeOptions> + Send + Sync>;
+/// What to load: a model plus optional overrides of the server's defaults.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LoadRequest {
+    pub model: String,
+    /// native, q8_0, q6_k or q4_k.
+    #[serde(default)]
+    pub quantize: Option<String>,
+    /// Tokens per conversation.
+    #[serde(default)]
+    pub context: Option<usize>,
+    /// Load only if the pool is still as it was when this plan was shown
+    /// (`PlanPreview::pool_version`); otherwise the request is refused so the
+    /// user can look at the new plan first.
+    #[serde(default)]
+    pub expect_version: Option<u64>,
+}
+
+/// The pool changed between showing a plan and confirming it.
+#[derive(Debug)]
+pub struct PoolChanged;
+
+impl std::fmt::Display for PoolChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the machines or models changed since this plan was made — plan again to see the new split")
+    }
+}
+
+impl std::error::Error for PoolChanged {}
+
+/// Turns a load request into serve options (fetching the model's config
+/// and tensor table, not its weights).
+pub type Resolver = Arc<dyn Fn(&LoadRequest) -> Result<ServeOptions> + Send + Sync>;
+
+/// A machine waiting in the pool (its first session).
+struct LobbyEntry {
+    profile: NodeProfile,
+    tx: mpsc::UnboundedSender<Msg>,
+    peer: IpAddr,
+    rtt_ms: Option<f64>,
+    gbps: Option<f64>,
+}
+
+/// One machine of the pool, for the dashboard.
+#[derive(Clone, Debug, Serialize)]
+pub struct MachineView {
+    /// Stable id for control requests ("local" for this server).
+    pub id: String,
+    pub name: String,
+    pub chip: String,
+    pub backend: String,
+    pub os: String,
+    pub cpu_cores: u32,
+    pub gpu_cores: Option<u32>,
+    pub total_memory: u64,
+    pub usable_memory: u64,
+    pub available_memory: Option<u64>,
+    /// Measured by the startup benchmark (None: spec-sheet estimate below).
+    pub weight_gbs: Option<f64>,
+    pub tflops: Option<f64>,
+    pub spec_bandwidth_gbs: f64,
+    pub spec_tflops: f64,
+    pub local: bool,
+    pub address: String,
+    pub rtt_ms: Option<f64>,
+    pub bandwidth_gbps: Option<f64>,
+    pub on_battery: Option<bool>,
+    /// What each model runs here.
+    pub roles: Vec<MachineRole>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct MachineRole {
+    pub model: String,
+    /// "layers 0–15 + embeddings", "idle", …
+    pub role: String,
+    /// Memory this model may use here.
+    pub budget: u64,
+}
+
+/// What loading a model would do, before anything is downloaded.
+#[derive(Clone, Debug, Serialize)]
+pub struct PlanPreview {
+    /// Pass back as `expect_version` to load exactly this plan.
+    pub pool_version: u64,
+    pub model: String,
+    pub architecture: String,
+    pub params: u64,
+    pub layers: u64,
+    pub format: String,
+    pub weight_bytes: u64,
+    pub context: usize,
+    pub concurrency: usize,
+    pub machines: usize,
+    pub fits: bool,
+    pub reason: Option<String>,
+    /// What each machine gets, in pipeline order.
+    pub shares: Vec<DeviceShare>,
+    /// Predicted speed of the split (None if it doesn't fit).
+    pub tokens_per_sec: Option<f64>,
+    pub ttft_ms: Option<f64>,
+    /// The full plan (node indices refer to `machine_names`).
+    pub plan: Option<Plan>,
+    pub machine_names: Vec<String>,
+    /// Loaded models that would no longer fit next to this one.
+    pub displaces: Vec<String>,
+    /// Same model in other weight formats.
+    pub alternatives: Vec<Alternative>,
+    pub advice: Vec<String>,
+}
+
+/// One machine's part of a planned model.
+#[derive(Clone, Debug, Serialize)]
+pub struct DeviceShare {
+    pub machine: String,
+    pub backend: String,
+    /// Transformer layers [start, end).
+    pub layers: (u64, u64),
+    /// "embeddings, layers 0–15", …
+    pub components: String,
+    /// Weights this machine holds — and downloads, only these byte ranges.
+    pub weight_bytes: u64,
+    /// Share of the model's weights, 0–100.
+    pub weight_pct: f64,
+    /// Peak memory it needs (weights + KV + buffers) and what it may use.
+    pub memory_needed: u64,
+    pub memory_budget: u64,
+    pub kv_bytes: u64,
+    /// Its part of each decode step, ms.
+    pub decode_ms: f64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct Alternative {
+    pub format: String,
+    pub weight_bytes: u64,
+    pub fits: bool,
+    pub tokens_per_sec: Option<f64>,
+}
 
 /// One model's slice of the pool, for status pages.
 #[derive(Clone, Debug, Serialize)]
@@ -32,6 +175,9 @@ pub struct Share {
     pub reason: Option<String>,
     /// (machine name, memory this model may use there).
     pub machines: Vec<(String, u64)>,
+    /// The same by machine id (names can repeat).
+    #[serde(skip)]
+    pub by_machine: Vec<(u64, u64)>,
 }
 
 pub struct Pool {
@@ -43,8 +189,16 @@ pub struct Pool {
     changed: Arc<Notify>,
     /// Each joined machine's first session, by machine id: machines wait
     /// here for models and hear about new ones.
-    lobby: StdMutex<HashMap<u64, (NodeProfile, mpsc::UnboundedSender<Msg>)>>,
+    lobby: StdMutex<HashMap<u64, LobbyEntry>>,
     adding: tokio::sync::Mutex<()>,
+    /// This server's own machine, when it shares its compute.
+    local: Option<NodeProfile>,
+    /// Recently planned requests, so confirming doesn't fetch them again.
+    resolved: StdMutex<HashMap<String, (Instant, ServeOptions)>>,
+    /// Set by the dashboard's "Stop cluster".
+    stop: Notify,
+    /// See [`Pool::version`].
+    version: AtomicU64,
     control_port: u16,
     /// The cluster token (also guards the model-loading API).
     pub token: String,
@@ -56,7 +210,16 @@ impl Pool {
     /// token and machine settings apply to the pool).
     pub async fn start(opts: Vec<ServeOptions>) -> Result<Arc<Pool>> {
         let first = opts.first().context("no model to serve")?;
-        let pool = Pool::open(first.control_port, first.token.clone(), None).await?;
+        let local = if first.use_local {
+            Some(crate::coordinator::this_machine(
+                first.name.as_deref(),
+                &first.device,
+                first.max_memory,
+            )?)
+        } else {
+            None
+        };
+        let pool = Pool::open(first.control_port, first.token.clone(), None, local).await?;
         for o in opts {
             pool.add(o).await?;
         }
@@ -68,6 +231,7 @@ impl Pool {
         control_port: u16,
         token: String,
         resolve: Option<Resolver>,
+        local: Option<NodeProfile>,
     ) -> Result<Arc<Pool>> {
         let control = TcpListener::bind(("0.0.0.0", control_port))
             .await
@@ -88,20 +252,55 @@ impl Pool {
             control_port,
             token: token.clone(),
             resolve,
+            local,
+            resolved: StdMutex::new(HashMap::new()),
+            stop: Notify::new(),
+            version: AtomicU64::new(0),
         });
         tokio::spawn(pool.clone().control_loop(control, token::psk(&token)));
         tokio::spawn(pool.clone().allocator_loop(changed));
         Ok(pool)
     }
 
-    /// Resolve `name` (downloading its config, not its weights) and serve it.
-    pub async fn load(&self, name: &str) -> Result<String> {
+    /// Resolve a request (config and tensor table, no weights), reusing a
+    /// resolution from a recent plan preview.
+    async fn resolve(&self, req: &LoadRequest) -> Result<ServeOptions> {
+        let key = serde_json::to_string(&(&req.model, &req.quantize, req.context))?;
+        {
+            let mut cache = self.resolved.lock().unwrap();
+            cache.retain(|_, (at, _)| at.elapsed() < Duration::from_secs(600));
+            if let Some((_, o)) = cache.get(&key) {
+                return Ok(o.clone());
+            }
+        }
         let resolve = self
             .resolve
             .clone()
             .context("this server can't load models on request")?;
-        let name = name.to_string();
-        let opts = tokio::task::spawn_blocking(move || resolve(&name)).await??;
+        let r = req.clone();
+        let opts = tokio::task::spawn_blocking(move || resolve(&r)).await??;
+        self.resolved
+            .lock()
+            .unwrap()
+            .insert(key, (Instant::now(), opts.clone()));
+        Ok(opts)
+    }
+
+    /// Resolve `name` with the server's defaults and serve it.
+    pub async fn load(&self, name: &str) -> Result<String> {
+        self.load_with(&LoadRequest {
+            model: name.to_string(),
+            ..Default::default()
+        })
+        .await
+    }
+
+    /// Resolve a request and serve it on the pool's machines.
+    pub async fn load_with(&self, req: &LoadRequest) -> Result<String> {
+        let opts = self.resolve(req).await?;
+        if req.expect_version.is_some_and(|v| v != self.version()) {
+            return Err(PoolChanged.into());
+        }
         let model = opts.model_name.clone();
         self.add(opts).await?;
         Ok(model)
@@ -117,9 +316,10 @@ impl Pool {
         names.push(opts.model_name.clone());
         opts.control_port = self.control_port;
         let link = Arc::new(PoolLink {
-            index: names.len() - 1,
-            models: names.clone(),
+            index: AtomicUsize::new(names.len() - 1),
+            models: StdMutex::new(names.clone()),
             budgets: StdMutex::new(None),
+            plan: StdMutex::new(None),
             note: StdMutex::new(None),
             changed: self.changed.clone(),
         });
@@ -130,17 +330,92 @@ impl Pool {
             placed: false,
             reason: None,
             machines: vec![],
+            by_machine: vec![],
         });
         self.models.lock().unwrap().push(c);
         self.links.lock().unwrap().push(link);
-        // Joined machines open a session for the new model.
-        for (_, tx) in self.lobby.lock().unwrap().values() {
-            let _ = tx.send(Msg::Models {
+        self.announce_models();
+        self.bump();
+        self.changed.notify_one();
+        Ok(())
+    }
+
+    /// Tell every model's coordinator and every joined machine which models
+    /// the pool serves (machines open a session for each new one).
+    fn announce_models(&self) {
+        let names = self.names();
+        for (i, l) in self.links.lock().unwrap().iter().enumerate() {
+            l.index.store(i, Ordering::Relaxed);
+            *l.models.lock().unwrap() = names.clone();
+        }
+        for e in self.lobby.lock().unwrap().values() {
+            let _ = e.tx.send(Msg::Models {
                 models: names.clone(),
             });
         }
+    }
+
+    /// Stop serving a model; machines keep its memory free for others.
+    pub async fn unload(&self, name: &str) -> Result<String> {
+        let _one_at_a_time = self.adding.lock().await;
+        // Exactly a loaded model: a typo must not unload the only one.
+        let c = self
+            .models()
+            .into_iter()
+            .find(|c| c.inner.opts.model_name == name.trim())
+            .with_context(|| {
+                format!("{name} is not loaded; loaded: {}", self.names().join(", "))
+            })?;
+        let model = c.inner.opts.model_name.clone();
+        {
+            let mut models = self.models.lock().unwrap();
+            let i = models
+                .iter()
+                .position(|m| m.inner.opts.model_name == model)
+                .context("not loaded")?;
+            models.remove(i);
+            self.links.lock().unwrap().remove(i);
+            self.shares.lock().unwrap().retain(|s| s.model != model);
+        }
+        c.shutdown(false).await;
+        self.announce_models();
+        self.bump();
+        self.event("info", format!("Unloaded {model}"));
         self.changed.notify_one();
-        Ok(())
+        Ok(model)
+    }
+
+    /// Remove a joined machine: it unloads everything and exits.
+    pub fn remove_machine(&self, id: &str) -> Result<String> {
+        let machine = u64::from_str_radix(id, 16).context("unknown machine")?;
+        if machine == LOCAL_MACHINE {
+            bail!("this server can't remove itself — stop it, or start it with --no-local");
+        }
+        let reason = "the host removed this machine from the cluster";
+        let name = {
+            let lobby = self.lobby.lock().unwrap();
+            let e = lobby.get(&machine).context("no such machine in the pool")?;
+            let _ = e.tx.send(Msg::Bye {
+                reason: reason.into(),
+                leave: true,
+            });
+            e.profile.name.clone()
+        };
+        for c in self.models() {
+            c.kick(machine, reason);
+        }
+        self.event("warn", format!("Removed {name} from the cluster"));
+        Ok(name)
+    }
+
+    /// Ask the server to stop (the dashboard's "Stop cluster").
+    pub fn request_stop(&self) {
+        self.stop.notify_one();
+    }
+
+    /// Resolves when someone asked the server to stop.
+    pub async fn stopped(&self) {
+        self.stop.notified().await
     }
 
     pub fn models(&self) -> Vec<Coordinator> {
@@ -160,8 +435,224 @@ impl Pool {
             .lock()
             .unwrap()
             .values()
-            .map(|(p, _)| p.clone())
+            .map(|e| e.profile.clone())
             .collect()
+    }
+
+    /// Every machine of the pool (this server first) with its compute,
+    /// links and what each model runs on it.
+    pub fn machine_views(&self) -> Vec<MachineView> {
+        let models = self.models();
+        let shares = self.shares();
+        // Per model: machine id → role, from each coordinator's view.
+        let roles: Vec<(String, HashMap<String, String>)> = models
+            .iter()
+            .map(|c| {
+                let map = c
+                    .nodes()
+                    .into_iter()
+                    .map(|n| (n.machine.clone(), n.role))
+                    .collect();
+                (c.inner.opts.model_name.clone(), map)
+            })
+            .collect();
+        let view = |id: String,
+                    p: &NodeProfile,
+                    local: bool,
+                    address: String,
+                    rtt_ms: Option<f64>,
+                    gbps: Option<f64>| {
+            let roles = roles
+                .iter()
+                .map(|(model, map)| MachineRole {
+                    model: model.clone(),
+                    role: map.get(&id).cloned().unwrap_or_else(|| "not used".into()),
+                    budget: shares
+                        .iter()
+                        .find(|s| &s.model == model)
+                        .and_then(|s| s.by_machine.iter().find(|(m, _)| machine_key(*m) == id))
+                        .map(|(_, b)| *b)
+                        .unwrap_or(0),
+                })
+                .collect();
+            MachineView {
+                id,
+                name: p.name.clone(),
+                chip: p.chip.clone(),
+                backend: p.backend.label().into(),
+                os: p.os.clone(),
+                cpu_cores: p.cpu_cores,
+                gpu_cores: p.gpu_cores,
+                total_memory: p.accel_memory.unwrap_or(p.total_memory).0,
+                usable_memory: p.usable_memory.0,
+                available_memory: p.available_memory.map(|b| b.0),
+                weight_gbs: p.measured_bandwidth_gbs,
+                tflops: p.measured_tflops,
+                spec_bandwidth_gbs: p.bandwidth_gbs,
+                spec_tflops: p.tflops,
+                local,
+                address,
+                rtt_ms,
+                bandwidth_gbps: gbps,
+                on_battery: p.on_battery,
+                roles,
+            }
+        };
+        let mut out = Vec::new();
+        if let Some(p) = &self.local {
+            out.push(view(
+                machine_key(LOCAL_MACHINE),
+                p,
+                true,
+                "this server".into(),
+                None,
+                None,
+            ));
+        }
+        let lobby = self.lobby.lock().unwrap();
+        let mut ids: Vec<&u64> = lobby.keys().collect();
+        ids.sort_by_key(|id| lobby[id].profile.name.clone());
+        for id in ids {
+            let e = &lobby[id];
+            out.push(view(
+                machine_key(*id),
+                &e.profile,
+                false,
+                e.peer.to_string(),
+                e.rtt_ms,
+                e.gbps,
+            ));
+        }
+        out
+    }
+
+    /// Every machine of the pool as one cluster for planning, with each
+    /// machine's id. Links are measured to this server; a hop between two
+    /// joined machines is estimated from the slower of their links.
+    fn pool_cluster(&self, link: Option<Link>) -> (Cluster, Vec<u64>) {
+        let default = link.clone().unwrap_or_else(|| Link::preset("gbe").unwrap());
+        let mut nodes = Vec::new();
+        let mut ids = Vec::new();
+        let mut links: Vec<Option<Link>> = Vec::new();
+        // Speeds learned while serving refine the benchmarks.
+        let cal = crate::calibration::Calibration::load();
+        if let Some(p) = &self.local {
+            let mut p = p.clone();
+            cal.apply(&mut p);
+            nodes.push(p);
+            ids.push(LOCAL_MACHINE);
+            links.push(Link::preset("local"));
+        }
+        let lobby = self.lobby.lock().unwrap();
+        let mut order: Vec<&u64> = lobby.keys().collect();
+        order.sort_by_key(|id| lobby[id].profile.name.clone());
+        for id in order {
+            let e = &lobby[id];
+            let mut p = e.profile.clone();
+            cal.apply(&mut p);
+            nodes.push(p);
+            ids.push(*id);
+            links.push(match (e.rtt_ms, e.gbps) {
+                (Some(rtt), Some(bw)) => Some(Link {
+                    name: "measured".into(),
+                    bandwidth_gbps: bw,
+                    rtt_ms: rtt,
+                    measured: true,
+                }),
+                _ => None,
+            });
+        }
+        let mut c = Cluster::new(nodes, default);
+        c.dedupe_names();
+        if link.is_none() {
+            let local = ids.first() == Some(&LOCAL_MACHINE);
+            for i in 0..ids.len() {
+                for j in i + 1..ids.len() {
+                    let l = if local && i == 0 {
+                        links[j].clone()
+                    } else {
+                        match (&links[i], &links[j]) {
+                            (Some(x), Some(y)) => Some(Link {
+                                name: "estimated".into(),
+                                bandwidth_gbps: x.bandwidth_gbps.min(y.bandwidth_gbps),
+                                rtt_ms: x.rtt_ms.max(y.rtt_ms),
+                                measured: false,
+                            }),
+                            _ => None,
+                        }
+                    };
+                    if let Some(l) = l {
+                        let (a, b) = (c.nodes[i].name.clone(), c.nodes[j].name.clone());
+                        c.set_link(&a, &b, l);
+                    }
+                }
+            }
+        }
+        (c, ids)
+    }
+
+    /// Plan a model across the pool's machines (next to the models already
+    /// loaded) without loading or downloading anything.
+    pub async fn plan(&self, req: &LoadRequest) -> Result<PlanPreview> {
+        let version = self.version();
+        let opts = self.resolve(req).await?;
+        if self.names().contains(&opts.model_name) {
+            bail!("{} is already loaded", opts.model_name);
+        }
+        let spec = model_spec(&opts)?;
+        let (cluster, ids) = self.pool_cluster(opts.link.clone());
+        // Loaded models keep their machines where they can.
+        let loaded: Vec<(ModelSpec, Workload, PlanOptions, Vec<usize>)> = self
+            .models()
+            .iter()
+            .map(|c| {
+                let share = self
+                    .shares()
+                    .into_iter()
+                    .find(|s| s.model == c.inner.opts.model_name);
+                let current = cluster
+                    .nodes
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, n)| {
+                        share
+                            .as_ref()
+                            .is_some_and(|s| s.machines.iter().any(|(m, _)| m == &n.name))
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                (
+                    c.inner.spec.clone(),
+                    c.workload(),
+                    c.plan_options(),
+                    current,
+                )
+            })
+            .collect();
+        let names: Vec<String> = self.names();
+        let w = crate::coordinator::workload_for(&opts);
+        let po = crate::coordinator::plan_options_for(&opts);
+        // The same model in every weight format, to offer alternatives.
+        let mut formats = Vec::new();
+        for f in [
+            WeightFormat::Native,
+            WeightFormat::Q8_0,
+            WeightFormat::Q6K,
+            WeightFormat::Q4K,
+        ] {
+            if f != opts.format {
+                let mut o = opts.clone();
+                o.format = f;
+                formats.push((f, model_spec(&o)?));
+            }
+        }
+        let mut preview = tokio::task::spawn_blocking(move || {
+            preview(&spec, &opts, w, po, &loaded, &names, &cluster, &formats)
+        })
+        .await?;
+        preview.pool_version = version;
+        let _ = ids;
+        Ok(preview)
     }
 
     pub fn is_multi(&self) -> bool {
@@ -298,11 +789,12 @@ impl Pool {
 
     pub async fn shutdown(&self) {
         for c in self.models() {
-            c.shutdown().await;
+            c.shutdown(true).await;
         }
-        for (_, tx) in self.lobby.lock().unwrap().values() {
-            let _ = tx.send(Msg::Bye {
-                reason: "coordinator shutting down".into(),
+        for e in self.lobby.lock().unwrap().values() {
+            let _ = e.tx.send(Msg::Bye {
+                reason: "the host stopped the cluster".into(),
+                leave: true,
             });
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -338,7 +830,7 @@ impl Pool {
         let (hello, model) = read_hello(&mut reader, &mut writer).await?;
         let models = self.models();
         let coord = match &model {
-            None => return self.lobby_session(reader, writer, hello).await,
+            None => return self.lobby_session(reader, writer, hello, peer_ip).await,
             Some(m) => match models.iter().find(|c| &c.inner.opts.model_name == m) {
                 Some(c) => c,
                 None => {
@@ -363,6 +855,7 @@ impl Pool {
         mut reader: wire::Reader,
         mut writer: wire::Writer,
         hello: crate::coordinator::HelloInfo,
+        peer: IpAddr,
     ) -> Result<()> {
         let name = hello.profile.name.clone();
         writer
@@ -374,19 +867,40 @@ impl Pool {
             })
             .await?;
         let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
-        self.lobby
-            .lock()
-            .unwrap()
-            .insert(hello.machine, (hello.profile.clone(), tx.clone()));
-        if self.models().is_empty() {
-            self.event(
-                "ok",
-                format!(
-                    "{name} joined — {} · {} for models. Waiting for a model: `tendril load <model>`",
-                    hello.profile.chip, hello.profile.usable_memory
-                ),
-            );
-        }
+        self.lobby.lock().unwrap().insert(
+            hello.machine,
+            LobbyEntry {
+                profile: hello.profile.clone(),
+                tx: tx.clone(),
+                peer,
+                rtt_ms: None,
+                gbps: None,
+            },
+        );
+        // Measure the link to this server, so plans made before any model
+        // is loaded already know it: five pings one after another, then a
+        // 4 MiB transfer.
+        let _ = tx.send(Msg::Ping { t: 1 });
+        let mut sent = Instant::now();
+        self.bump();
+        let speed = match hello.profile.measured_bandwidth_gbs {
+            Some(g) => format!(" · decode {g:.0} GB/s measured"),
+            None => String::new(),
+        };
+        self.event(
+            "ok",
+            format!(
+                "{name} joined — {} · {} · {} for models{speed}{}",
+                hello.profile.chip,
+                hello.profile.backend.label(),
+                hello.profile.usable_memory,
+                if self.models().is_empty() {
+                    ". Pick a model in the dashboard or with `tendril load <model>`"
+                } else {
+                    ""
+                }
+            ),
+        );
         let pump = tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(5));
             loop {
@@ -400,77 +914,72 @@ impl Pool {
             }
         });
         // Pongs keep the session alive; silence means the machine is gone.
-        while let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(20), reader.recv()).await {}
+        let mut rtts = Vec::new();
+        while let Ok(Ok(m)) = tokio::time::timeout(Duration::from_secs(20), reader.recv()).await {
+            let mut lobby = self.lobby.lock().unwrap();
+            let Some(e) = lobby.get_mut(&hello.machine) else {
+                continue;
+            };
+            match m {
+                Msg::Pong { t } if (1..=5).contains(&t) => {
+                    rtts.push(sent.elapsed().as_secs_f64() * 1000.0);
+                    let mut s = rtts.clone();
+                    s.sort_by(f64::total_cmp);
+                    e.rtt_ms = Some(s[s.len() / 2]);
+                    let _ = tx.send(if t < 5 {
+                        Msg::Ping { t: t + 1 }
+                    } else {
+                        Msg::Probe {
+                            data: vec![0x5a; 4 << 20],
+                        }
+                    });
+                    sent = Instant::now();
+                }
+                Msg::ProbeAck { len } => {
+                    let rtt = e.rtt_ms.unwrap_or(0.0) / 1000.0;
+                    let secs = (sent.elapsed().as_secs_f64() - rtt / 2.0).max(1e-4);
+                    e.gbps = Some(len as f64 * 8.0 / secs / 1e9);
+                    // Links feed plans: a plan made before this is stale.
+                    self.bump();
+                }
+                _ => {}
+            }
+        }
         pump.abort();
         let mut lobby = self.lobby.lock().unwrap();
         if lobby
             .get(&hello.machine)
-            .is_some_and(|(_, t)| t.same_channel(&tx))
+            .is_some_and(|e| e.tx.same_channel(&tx))
         {
             lobby.remove(&hello.machine);
         }
         drop(lobby);
-        if self.models().is_empty() {
-            self.event("warn", format!("{name} left the pool"));
-        }
+        self.bump();
+        self.event("warn", format!("{name} left the cluster"));
         Ok(())
     }
 
-    /// Every machine any model sees, with the best-known links between them.
-    fn merged_cluster(&self, models: &[Coordinator]) -> (Cluster, Vec<u64>) {
-        let snaps: Vec<(Cluster, Vec<u32>, Vec<u64>)> =
-            models.iter().map(|c| c.raw_snapshot()).collect();
-        let mut machines: Vec<u64> = Vec::new();
-        let mut nodes: Vec<NodeProfile> = Vec::new();
-        for (c, _, ms) in &snaps {
-            for (i, m) in ms.iter().enumerate() {
-                if !machines.contains(m) {
-                    machines.push(*m);
-                    nodes.push(c.nodes[i].clone());
-                }
-            }
-        }
-        let default = snaps[0].0.default_link.clone();
-        let mut merged = Cluster::new(nodes, default);
-        merged.dedupe_names();
-        for a in 0..machines.len() {
-            for b in a + 1..machines.len() {
-                let link = snaps.iter().find_map(|(c, _, ms)| {
-                    let ia = ms.iter().position(|m| *m == machines[a])?;
-                    let ib = ms.iter().position(|m| *m == machines[b])?;
-                    Some(c.link(ia, ib).clone())
-                });
-                if let Some(l) = link {
-                    let (na, nb) = (merged.nodes[a].name.clone(), merged.nodes[b].name.clone());
-                    merged.set_link(&na, &nb, l);
-                }
-            }
-        }
-        (merged, machines)
-    }
-
     async fn allocator_loop(self: Arc<Self>, changed: Arc<Notify>) {
-        let mut last: Vec<HashMap<u64, Bytes>> = vec![];
-        let mut first = true;
+        // What each model was last given, by model name (models come and go).
+        let mut last: HashMap<String, Decision> = HashMap::new();
         loop {
             changed.notified().await;
             // Let a machine's sessions for every model arrive.
             tokio::time::sleep(Duration::from_millis(600)).await;
-            let models = self.models();
-            let links = self.links.lock().unwrap().clone();
+            let (models, links) = self.models_and_links();
+            last.retain(|name, _| models.iter().any(|c| &c.inner.opts.model_name == name));
             if models.is_empty() {
                 continue;
             }
-            // A model added since the last round starts with no share.
-            let grew = last.len() < models.len();
-            last.resize(models.len(), HashMap::new());
-            let (cluster, machines) = self.merged_cluster(&models);
+            // One view of the machines for everything the pool decides: the
+            // plan preview, every model's share and the split it runs.
+            let (cluster, machines) = self.pool_cluster(models[0].inner.opts.link.clone());
             let specs: Vec<_> = models
                 .iter()
-                .zip(&last)
-                .map(|(c, prev)| {
+                .map(|c| {
+                    let prev = last.get(&c.inner.opts.model_name);
                     let current: Vec<usize> = (0..machines.len())
-                        .filter(|&j| prev.contains_key(&machines[j]))
+                        .filter(|&j| prev.is_some_and(|d| d.budgets.contains_key(&machines[j])))
                         .collect();
                     (
                         c.inner.spec.clone(),
@@ -498,31 +1007,46 @@ impl Pool {
                 Ok(a) => a,
                 Err(_) => continue,
             };
-            let names = self.names();
-            let mut next: Vec<HashMap<u64, Bytes>> = Vec::new();
+            let mut next: Vec<Decision> = Vec::new();
             let mut shares = Vec::new();
-            for (i, p) in alloc.placements.iter().enumerate() {
-                let mut map = HashMap::new();
+            for (c, p) in models.iter().zip(&alloc.placements) {
+                let mut budgets = HashMap::new();
                 let mut list = Vec::new();
+                let mut by_machine = Vec::new();
                 for (j, b) in p.budgets.iter().enumerate() {
                     if b.0 > 0 {
-                        map.insert(machines[j], *b);
+                        budgets.insert(machines[j], *b);
                         list.push((cluster.nodes[j].name.clone(), b.0));
+                        by_machine.push((machines[j], b.0));
                     }
                 }
-                next.push(map);
+                let split = p
+                    .plan
+                    .as_ref()
+                    .map(|pl| {
+                        pl.stages
+                            .iter()
+                            .map(|st| (machines[st.node], st.layer_start, st.layer_end))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                next.push(Decision { budgets, split });
                 shares.push(Share {
-                    model: names[i].clone(),
+                    model: c.inner.opts.model_name.clone(),
                     placed: p.plan.is_some(),
                     reason: p.reason.clone(),
                     machines: list,
+                    by_machine,
                 });
             }
             *self.shares.lock().unwrap() = shares.clone();
-            if next == last && !first && !grew {
+            // Tell only models whose share or split changed (or that are new).
+            let changed_models: Vec<usize> = (0..models.len())
+                .filter(|&i| last.get(&models[i].inner.opts.model_name) != Some(&next[i]))
+                .collect();
+            if changed_models.is_empty() {
                 continue;
             }
-            first = false;
             if !cluster.nodes.is_empty() {
                 let parts: Vec<String> = shares
                     .iter()
@@ -561,12 +1085,14 @@ impl Pool {
             }
             // Shrink first so memory is free before another model loads into it.
             let shrinks = |i: usize| {
-                last[i]
-                    .iter()
-                    .any(|(m, b)| next[i].get(m).is_none_or(|nb| nb < b))
+                last.get(&models[i].inner.opts.model_name).is_some_and(|d| {
+                    d.budgets
+                        .iter()
+                        .any(|(m, b)| next[i].budgets.get(m).is_none_or(|nb| nb < b))
+                })
             };
             let (shrinking, rest): (Vec<usize>, Vec<usize>) =
-                (0..models.len()).partition(|&i| shrinks(i));
+                changed_models.into_iter().partition(|&i| shrinks(i));
             let apply = |i: usize| {
                 let placed = alloc.placements[i].plan.is_some();
                 *links[i].note.lock().unwrap() = if placed {
@@ -579,7 +1105,11 @@ impl Pool {
                             .unwrap_or_else(|| "not enough memory in the pool".into()),
                     )
                 };
-                *links[i].budgets.lock().unwrap() = Some(next[i].clone());
+                *links[i].budgets.lock().unwrap() = Some(next[i].budgets.clone());
+                *links[i].plan.lock().unwrap() = alloc.placements[i].plan.clone().map(|p| {
+                    let ms = p.stages.iter().map(|st| machines[st.node]).collect();
+                    (p, ms)
+                });
                 models[i].replan();
             };
             for &i in &shrinking {
@@ -591,7 +1121,151 @@ impl Pool {
             for &i in &rest {
                 apply(i);
             }
-            last = next;
+            for (c, d) in models.iter().zip(next) {
+                last.insert(c.inner.opts.model_name.clone(), d);
+            }
         }
     }
+
+    /// The models and their pool links, taken together so they line up.
+    fn models_and_links(&self) -> (Vec<Coordinator>, Vec<Arc<PoolLink>>) {
+        let models = self.models.lock().unwrap();
+        let links = self.links.lock().unwrap();
+        (models.clone(), links.clone())
+    }
+
+    /// Bumped whenever the pool changes in a way that changes plans
+    /// (machines, links, models), so a confirmed plan can be checked.
+    pub fn version(&self) -> u64 {
+        self.version.load(Ordering::Relaxed)
+    }
+
+    fn bump(&self) {
+        self.version.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// What the allocator gave one model: its memory per machine and its split
+/// (machine, first layer, end layer per stage).
+#[derive(Clone, Debug, PartialEq)]
+struct Decision {
+    budgets: HashMap<u64, Bytes>,
+    split: Vec<(u64, u64, u64)>,
+}
+
+/// How the dashboard and control requests name a machine.
+pub fn machine_key(machine: u64) -> String {
+    format!("{machine:x}")
+}
+
+/// The plan preview: place the candidate next to the loaded models.
+#[allow(clippy::too_many_arguments)]
+fn preview(
+    spec: &ModelSpec,
+    opts: &ServeOptions,
+    w: Workload,
+    po: PlanOptions,
+    loaded: &[(ModelSpec, Workload, PlanOptions, Vec<usize>)],
+    names: &[String],
+    cluster: &Cluster,
+    formats: &[(WeightFormat, ModelSpec)],
+) -> PlanPreview {
+    let place = |cand: &ModelSpec| {
+        let mut pm: Vec<PoolModel> = loaded
+            .iter()
+            .map(|(s, w, o, cur)| PoolModel {
+                spec: s,
+                workload: w.clone(),
+                opts: o.clone(),
+                current: cur.clone(),
+            })
+            .collect();
+        pm.push(PoolModel {
+            spec: cand,
+            workload: w.clone(),
+            opts: po.clone(),
+            current: vec![],
+        });
+        allocate(&pm, cluster)
+    };
+    let machine_names: Vec<String> = cluster.nodes.iter().map(|n| n.name.clone()).collect();
+    let mut out = PlanPreview {
+        pool_version: 0,
+        model: opts.model_name.clone(),
+        architecture: spec.arch.label().to_string(),
+        params: spec.total_params(),
+        layers: spec.num_layers,
+        format: opts.format.label().to_string(),
+        weight_bytes: spec.weight_bytes().0,
+        context: opts.context,
+        concurrency: opts.concurrency,
+        machines: cluster.nodes.len(),
+        fits: false,
+        reason: None,
+        shares: vec![],
+        tokens_per_sec: None,
+        ttft_ms: None,
+        plan: None,
+        machine_names,
+        displaces: vec![],
+        alternatives: vec![],
+        advice: vec![],
+    };
+    if cluster.nodes.is_empty() {
+        out.reason = Some(
+            "No machines in the pool yet — run `tendril join` on a machine (this server was started with --no-local)".into(),
+        );
+        return out;
+    }
+    let a = place(spec);
+    let mine = a.placements.last().expect("candidate placed last");
+    out.fits = mine.plan.is_some();
+    out.reason = mine.reason.clone();
+    out.displaces = a
+        .placements
+        .iter()
+        .zip(names)
+        .filter(|(p, _)| p.plan.is_none())
+        .map(|(_, n)| n.clone())
+        .collect();
+    if let Some(p) = &mine.plan {
+        let total: u64 = p.stages.iter().map(|s| s.mem.weights.0).sum::<u64>().max(1);
+        out.tokens_per_sec = Some(p.tokens_per_sec);
+        out.ttft_ms = Some(p.ttft_ms);
+        out.shares = p
+            .stages
+            .iter()
+            .map(|s| DeviceShare {
+                machine: cluster.nodes[s.node].name.clone(),
+                backend: s.backend.label().to_string(),
+                layers: (s.layer_start, s.layer_end),
+                components: s.describe_components(),
+                weight_bytes: s.mem.weights.0,
+                weight_pct: s.mem.weights.0 as f64 / total as f64 * 100.0,
+                memory_needed: s.mem.peak.0,
+                memory_budget: mine.budgets[s.node].0,
+                kv_bytes: s.mem.kv.0,
+                decode_ms: s.decode_ms,
+            })
+            .collect();
+    } else {
+        // Advice for the model on its own (what would make it fit).
+        let alone = tendril_core::planner::plan(spec, cluster, &w, &po);
+        out.advice = tendril_core::advice::advise(spec, cluster, &w, &po, &alone, "tendril load")
+            .iter()
+            .map(|a| format!("{} — {}", a.title, a.detail))
+            .collect();
+    }
+    out.plan = mine.plan.clone();
+    for (f, s) in formats {
+        let a = place(s);
+        let p = a.placements.last().expect("candidate placed last");
+        out.alternatives.push(Alternative {
+            format: f.label().to_string(),
+            weight_bytes: s.weight_bytes().0,
+            fits: p.plan.is_some(),
+            tokens_per_sec: p.plan.as_ref().map(|p| p.tokens_per_sec),
+        });
+    }
+    out
 }
